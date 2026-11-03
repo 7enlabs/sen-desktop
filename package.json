@@ -1,0 +1,1 @@
+{"description":"Sen Desktop scaffold B-2 - khung chua build, chua chay, chua kiem chung","name":"sen-desktop","packageManager":"pnpm@10.0.0","private":true,"scripts":{"build":"echo CHUA CHAY DUOC: scaffold chua cai package, chua chot version Tauri, xem build-notes.md"},"type":"module","version":"0.0.0"}

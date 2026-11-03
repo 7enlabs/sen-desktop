@@ -1,0 +1,11 @@
+# STUB - CHUA BUILD DUOC. Tauri version 2 CHOT theo tin Telegram 4070 ngay 03/11/2026 (ZC Leader).
+# Major chot la 2, cung major voi tuyen Desktop. Patch exact + Cargo.lock se dien o luot lap SDK that
+# sau khi Leader review cau truc, theo trinh tu tin 4070. Khong tu chon patch o day.
+# Dependencies that CHUA DIEN cho toi luot lap do.
+[package]
+name = "sen-desktop"
+version = "0.0.0"
+edition = "2021"
+
+# [dependencies]
+# CHUA DIEN: cho luot lap SDK that sau review cau truc, kem ghim exact + lockfile.
