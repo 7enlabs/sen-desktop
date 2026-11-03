@@ -1,11 +1,12 @@
-// STUB - Renderer cho tool call va result, themes cap qua ResourceLoader, theo prep muc 1.
-// CHUA LAP DAY: khong co renderer that, khong co theme that, khong co noi dung gia.
+// STUB - Renderer for tool calls and results, themes served via
+// ResourceLoader, per prep section 1.
+// NOT FILLED IN YET: no real renderer, no real theme, no fake content.
 export interface ToolRenderInput {
   toolName: string;
   result: unknown;
 }
 
-// CHUA CO: ham render that.
+// NOT HERE YET: real render function.
 export function renderToolCall(_input: ToolRenderInput): string {
-  throw new Error("Renderer CHUA LAP DAY.");
+  throw new Error("Renderer NOT FILLED IN YET.");
 }

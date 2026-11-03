@@ -1,5 +1,7 @@
-// Hop dong goi IPC, theo diem 888 va prep B-2 muc 2. Day la kieu that, chua co chay that.
-// Moi lan goi tool phai mang du hop dong nay. Thieu truong thi FAIL, khong goi tiep.
+// IPC call contract, per point 888 and prep B-2 section 2. These are real
+// types; no real call runs yet.
+// Every tool call must carry this full contract. A missing field means FAIL,
+// and the call does not proceed.
 
 export type ToolKind = "model-tool" | "registered-tool" | "authorized-execution-tool";
 

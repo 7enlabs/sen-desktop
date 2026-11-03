@@ -1,6 +1,6 @@
-// Mot bien duong dan duy nhat o packages/core, theo prep B-2 muc 1.
-// Khong ghep duong dan bang chuoi, khong gia dinh thu muc nha la ~/.pi,
-// khong gia dinh shell POSIX, khong dung lenh phu thuoc shell.
+// Single path variable in packages/core, per prep B-2 section 1.
+// No path joining by string, no assumption that the home directory is ~/.pi,
+// no POSIX shell assumption, no shell-dependent command.
 import { join } from "node:path";
 
 let rootDir = "";
@@ -11,7 +11,7 @@ export function setRootDir(dir: string): void {
 
 export function resolveUnderRoot(...parts: string[]): string {
   if (!rootDir) {
-    throw new Error("CHUA DAT rootDir: khong ghep duong dan khi chua co mot bien duong dan.");
+    throw new Error("rootDir NOT SET: no path joining before the single path variable is set.");
   }
   return join(rootDir, ...parts);
 }

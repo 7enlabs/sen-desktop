@@ -1,4 +1,6 @@
-// STUB - CHUA CO TRIEN KHAI THAT.
-// sen_tool_call: goi tool duy nhat qua cong thuc thi trong packages/core.
-// Khong goi thang tu frontend xuong he thong. Moi lan goi phai mang hop dong hanh dong diem 888
-// (xem apps/desktop/src/ipc/types.ts) va di qua lop permission o packages/tools.
+// STUB - NO REAL IMPLEMENTATION YET.
+// sen_tool_call: call a tool only through the execution gate in packages/core.
+// Never call straight from the frontend down to the system. Every call must
+// carry the action contract from point 888
+// (see apps/desktop/src/ipc/types.ts) and pass the permission layer in
+// packages/tools.

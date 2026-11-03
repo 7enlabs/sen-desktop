@@ -1,1 +1,1 @@
-{"description":"customTools, extension cua Sen, lop permission qua hook su kien tool_call.","license":"MIT","name":"@sen/tools","private":true,"type":"module","version":"0.0.0"}
+{"description":"customTools, Sen extensions, permission layer via the tool_call event hook.","license":"MIT","name":"@sen/tools","private":true,"type":"module","version":"0.0.0"}

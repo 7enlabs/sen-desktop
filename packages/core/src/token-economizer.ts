@@ -1,8 +1,10 @@
-// TokenEconomizer, theo diem 856 qua prep B-2 muc 4.
-// Tieu chi turn ket: cung loi lap lai qua cac lan goi tool, hoac turn dai qua 2,5 lan muc
-// thuong trong khi churn cung mot edit, thi redirect toi da 1 lan, sau do chi bao dung.
-// Bang chung (chu ky loi + do dai turn) ghi vao log tho.
-// STUB: ham phat hien that CHUA LAP DAY, hang so duoi day chi ghi tieu chi tu prep.
+// TokenEconomizer, per point 856 via prep B-2 section 4.
+// Stop-turn rule: the same error repeated across tool calls, or a turn longer
+// than 2.5 times the typical length while churning the same edit, redirects
+// at most 1 time, then only reports a stop.
+// Evidence (error signature + turn length) goes into the raw log.
+// STUB: the real detection function is NOT FILLED IN YET; the constants below
+// only record the rule from the prep.
 export const TOKEN_ECONOMIZER_MAX_REDIRECT = 1;
 export const TOKEN_ECONOMIZER_LONG_TURN_RATIO = 2.5;
 

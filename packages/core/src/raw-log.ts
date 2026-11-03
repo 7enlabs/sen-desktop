@@ -1,6 +1,9 @@
-// Log su kien tho: nguon su that, tach khoi lop suy ra, theo prep B-2 muc 1 va diem 855.
-// Tom tat compaction chi la khung nhin dan xuat, phai dung lai duoc tu log tho.
-// Suy ra mac dinh HUY tru khi qua cong kiem chung. Xoa phai dong kin hau due (AfterDeleteBench).
+// Raw event log: source of truth, separate from the derived layer, per prep
+// B-2 section 1 and point 855.
+// A compaction summary is only a derived view; it must be rebuildable from the
+// raw log.
+// Derived output defaults to DISCARD unless it passes the verification gate.
+// Deletion must close the post-delete bench (AfterDeleteBench).
 export interface RawEvent {
   seq: number;
   sessionId: string;
@@ -23,6 +26,7 @@ export class RawLog {
     return this.events.filter((e) => e.sessionId === sessionId);
   }
 
-  // CHUA CO: dong kin hau due AfterDeleteBench khi xoa. Ham xoa khong duoc them truoc khi co thiet ke do.
-  // Khong co ham xoa o day la co y, de tranh xoa khong dong kin.
+  // NOT HERE YET: post-delete bench closure AfterDeleteBench on delete. No
+  // delete function may be added before that design exists.
+  // Having no delete function here is intentional, to avoid unclosed deletes.
 }

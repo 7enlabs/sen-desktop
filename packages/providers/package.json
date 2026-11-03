@@ -1,1 +1,1 @@
-{"description":"Khoa version Pi tai day: ModelRuntime, model mac dinh, provider tuy bien. Version Pi chi xuat hien mot cho khoa o day, theo prep B-2 muc 3 diem 5.","license":"MIT","name":"@sen/providers","private":true,"type":"module","version":"0.0.0"}
+{"description":"Pi version locked here: ModelRuntime, default model, custom providers. The Pi version appears in exactly one locked place here, per prep B-2 section 3 point 5.","license":"MIT","name":"@sen/providers","private":true,"type":"module","version":"0.0.0"}

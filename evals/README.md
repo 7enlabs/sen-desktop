@@ -1,7 +1,9 @@
 # Evals
 
-Quy tac theo prep B-2 muc 1: moi su co bo sung mot ca kiem tra co dinh.
+Rule per prep B-2 section 1: every incident adds one fixed test case.
 
-Trang thai: CHUA CO ca eval that nao. Thu muc nay chi giu cho.
+Status: NO REAL EVAL CASE YET. This directory only reserves the place.
 
-Diem 857: mo ta PR va ban giao phai liet ke claim theo duong dan; nguoi ra doi chieu git diff --stat; file ngoai claim ma khong kem dong ly do thi FAIL.
+Point 857: a PR description and handover must list claims per file path;
+the reviewer cross-checks with git diff --stat; a file outside the claims
+with no accompanying reason line means FAIL.

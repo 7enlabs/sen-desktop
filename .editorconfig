@@ -1,4 +1,4 @@
-# Thong nhat thut le tu commit dau, theo prep B-2 muc 1.
+# Shared indentation rules from the first commit, per prep B-2 section 1.
 root = true
 
 [*]

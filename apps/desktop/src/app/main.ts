@@ -1,9 +1,11 @@
-// STUB - Vo giao dien Sen CHUA LAP DAY.
-// Cong nghe vo desktop la DIEM MO tu ghi chu kha thi, theo prep B-2 muc 5 diem 8.
-// File nay chi giu cho cho app, khong chua noi dung gia, khong goi thang SDK, chi goi qua ipc/bridge.ts.
+// STUB - Sen UI shell NOT FILLED IN YET.
+// The desktop shell technology is decided: Tauri 2, per Telegram message 4070
+// (ZC Leader, 03/11/2026). This file only reserves the place for the app;
+// it holds no fake content, never calls the SDK directly, only calls via
+// ipc/bridge.ts.
 import { invoke } from "../ipc/bridge.ts";
 
 export async function startApp(): Promise<void> {
-  // CHUA CO: khoi tao giao dien that. Khong goi invoke o day cho toi khi co phien that.
+  // NOT HERE YET: real UI init. No invoke call here until a real session exists.
   void invoke;
 }

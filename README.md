@@ -1,27 +1,89 @@
 # Sen Desktop - scaffold B-2
 
-Trang thai: KHUNG CHUA BUILD. Day la bundle local, chua day len remote, chua mo PR, chua merge.
+Status: FRAME, NOT BUILT. This is a local bundle, not pushed to a remote,
+no PR opened, no merge.
 
-Can cu: file prep da duyet `b2-scaffold-kickoff-prep-2026-11-03.md`, cong dung SD Leader tin Telegram 4064 ngay 03/11/2026, xac nhan head cua ZC Leader tin 4055, chot tham so ZC Leader tin 4070 ngay 03/11/2026.
+Basis: the approved prep file `b2-scaffold-kickoff-prep-2026-11-03.md`,
+the build gate from SD Leader in Telegram message 4064 dated 03/11/2026,
+the head confirmation from ZC Leader in message 4055, and the parameter
+decisions from ZC Leader in message 4070 dated 03/11/2026.
 
-Tham so chot tin 4070, da dien vao bundle o muc cau truc:
+Decided parameters from message 4070, already applied to this bundle at the
+structural level:
 
-- Tauri version 2 (major chot, cung major voi tuyen Desktop); patch exact + Cargo.lock dien o luot lap SDK that sau review cau truc.
-- Identifier: dev.7enlab.sen-desktop (tam, doi duoc truoc khi phat hanh).
-- Quyen toi thieu: chi core Tauri, chua them plugin nao.
-- Vo desktop: cua so chinh rong, 1200x800, tieu de tam Pi Desktop toi 10/11 xac minh ten Sen theo B-1, khong UI tinh nang, khong noi dung gia.
-- Model mac dinh: KHONG CO; packages/providers chi la vo khai bao kenh, chua gan model, chua key, chua goi mang.
+- Tauri version 2 (major version decided, same major as the Desktop line);
+  exact patch + Cargo.lock come in the real SDK install round after the
+  structural review.
+- Identifier: dev.7enlab.sen-desktop (temporary, changeable before release).
+- Minimum permissions: core Tauri only, no plugin added yet.
+- Desktop shell: main window 1200x800, temporary title Pi Desktop until the
+  10/11 Sen-name verification per B-1, no feature UI, no fake content.
+- Default model: NONE; packages/providers is only a channel-declaration
+  shell, no model attached, no key, no network call.
 
-Khung repo: pnpm workspace, ESM-only. `apps/desktop` khong chua logic loi dung chung.
+Repo frame: pnpm workspace, ESM-only. `apps/desktop` holds no shared
+business logic.
 
-Cac rang buoc giu nguyen tu prep:
+## Package scope: PROPOSAL, pending confirmation
 
-- Pi SDK ghim 1.3.0, khong nang len 1.4.0.
-- Khong dua cua-driver vao truoc cong Z Red 10/11. Khong co muc iOS trong scaffold nay.
-- F8 MCP cho doi chieu toan van, khong co trong scaffold nay.
-- Khong bundle font khi chua mo file license. Khong co thu muc font trong scaffold nay.
-- Khong co TrustBoost, NVISO, agent-memory-guard Python, Decepticon lam dependency.
-- Khong co `require()` goi SDK. Khong co lenh shell phu thuoc he dieu hanh o tang khung.
-- Moi hanh dong thay doi the gioi ben ngoai chi qua cong thuc thi duy nhat 6 chang trong `packages/core/src/execution-gate.ts`.
+The `@sen/*` scope on the package names (`@sen/desktop`, `@sen/core`,
+`@sen/providers`, `@sen/tools`, `@sen/prompts`, `@sen/ui`) is ONLY A
+PROPOSAL. It is NOT decided here and waits for SD Leader confirmation at
+review time. If the scope is not agreed, the fallback is to rename to
+unscoped names (`desktop`, `core`, `providers`, `tools`, `prompts`, `ui`)
+before merge. No package is published under the scope until that
+confirmation exists.
 
-Xem chi tiet trang thai that cua tung file trong `build-notes.md`. File nao ghi STUB thi chua co code that chay duoc, du van ban trong file la that.
+## Names: DECISION PENDING 10/11
+
+Three names are all temporary pre-release names, and their unification is NOT
+decided here:
+
+- Window title: Pi Desktop (temporary, until the 10/11 Sen-name
+  verification per B-1).
+- productName: Sen Desktop (temporary pre-release name).
+- Identifier: dev.7enlab.sen-desktop (temporary, changeable before
+  release).
+
+The 10/11 decision point settles the single final name. Until then, every
+file keeps the temporary names above and marks them as temporary.
+
+## Constraints kept from the prep
+
+- Pi SDK pinned at 1.3.0, never raised to 1.4.0.
+- No cua-driver before the Z Red gate on 10/11. No iOS target in this
+  scaffold.
+- F8 MCP waits for the full-text cross-check; it is not in this scaffold.
+- No font bundled before the license file is opened. No font directory in
+  this scaffold.
+- No TrustBoost, NVISO, agent-memory-guard Python, or Decepticon as a
+  dependency.
+- No `require()` call to the SDK. No OS-dependent shell command at the
+  frame layer.
+- Every world-changing action goes only through the single 6-step execution
+  gate in `packages/core/src/execution-gate.ts`.
+
+## Pre-merge condition round (Leader structural review, message 4077)
+
+Status after this round; full evidence is in `build-notes.md` section 8:
+
+1. Stale "Tauri version undecided" strings: FIXED (root build script,
+   bridge.ts, app main.ts, plus the same stale string in the Rust main.rs
+   found in the same sweep). Tauri 2 is recorded as decided everywhere.
+2. `@sen/*` scope: PROPOSAL ONLY, kept as-is, pending SD Leader
+   confirmation at review; fallback to unscoped names documented above.
+3. Section 1 frame files: ADDED (.gitignore, LICENSE, CONTRIBUTING,
+   CODE_OF_CONDUCT, SECURITY, CHANGELOG, one README per package).
+4. Lockfiles: pnpm-lock.yaml COMMITTED (generated by a real install in a
+   scratch copy, verified with install --frozen-lockfile). Cargo.lock:
+   BLOCKED, no Rust toolchain on this machine; no lockfile fabricated.
+5. Tests for the 4 real logic files: ADDED and RUN GREEN with node
+   (packages/core/tests/logic.test.ts). Producer-run evidence only, NOT
+   independent verification.
+6. Name unification: PENDING DECISION 10/11, not decided here; temporary
+   names kept and marked as temporary.
+7. English only on GitHub: DONE for the 35 PR files (comments and
+   descriptions translated; new frame files written in English directly).
+
+See `build-notes.md` for the real state of every file. A file marked STUB
+has no real runnable code, even though the text inside the file is real.

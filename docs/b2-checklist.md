@@ -1,18 +1,52 @@
-# Checklist wiring Pi SDK 1.3.0 - trang thai scaffold B-2
+# Checklist for wiring Pi SDK 1.3.0 - scaffold B-2 status
 
-Nguon: prep B-2 muc 3. Trang thai duoi day la trang thai that cua bundle local nay, khong phai trang thai mong muon.
+Source: prep B-2 section 3. The status below is the real status of this
+local bundle, not the desired status.
 
-- [ ] 1. Ghim dung 1.3.0 cho ca hai package: DA GHI trong packages/core/package.json, CHUA CAI, CHUA DOI CHIEU lai npm registry trong luot build nay.
-- [ ] 2. License MIT cho ca hai package: DA GHI trong package.json, CHUA DOI CHIEU lai npm registry trong luot build nay. Scaffold mang thong bao MIT o cac package.json.
-- [ ] 3. apps/desktop ESM-only: DA GHI type module, CHUA KIEM TRA bang build vi chua cai package.
-- [ ] 4. packages/core boc createAgentSession: CHUA CO import SDK that. Chi co khung SessionManager va statechart diem 854.
-- [ ] 5. packages/providers khoa version Pi: DA GHI hang so 1.3.0, ModelRuntime CHUA LAP DAY, model mac dinh KHONG CO theo chot tin 4070, providers chi la vo khai bao kenh.
-- [ ] 6. packages/tools lop permission: DA CO khung hook tool_call, logic xet quyen that CHUA LAP DAY.
-- [ ] 7. Tauri invoke + IPC bridge: DA CO kieu hop dong va ham kiem tra hop dong, invoke that CHUA CO; Tauri version 2 chot major theo tin 4070, patch exact + lockfile dien o luot lap sau review cau truc.
-- [ ] 8. Log su kien tho: DA CO lop RawLog that ve cau truc, CHUA CO du lieu that, CHUA CO dong kin AfterDeleteBench.
-- [ ] 9. Cong thuc thi duy nhat 6 chang: DA CO thu tu va ham kiem tra thu tu, cac chang that CHUA LAP DAY.
-- [ ] 10. Khong ap cac che do bi cam: DA GHI cam trong code tools, CHUA KIEM TRA bang grep tu dong trong luot nay.
+- [ ] 1. Pin exactly 1.3.0 for both packages: RECORDED in
+  packages/core/package.json AND in pnpm-lock.yaml (specifier 1.3.0,
+  resolved 1.3.0). Installed in a scratch copy only for the lockfile;
+  node_modules is NOT part of the bundle. Registry re-checked during the
+  install round: both packages exist at 1.3.0.
+- [ ] 2. MIT license for both packages: RECORDED in package.json;
+  CONFIRMED on the npm registry and in the installed package.json files
+  (both packages: version 1.3.0, license MIT) during the install round.
+- [ ] 3. apps/desktop ESM-only: type module RECORDED; NOT CHECKED by a
+  build yet because the Tauri app is still a stub.
+- [ ] 4. packages/core wraps createAgentSession: NO REAL SDK IMPORT yet.
+  Only the SessionManager frame and the point-854 statechart exist.
+  VERIFIED in the install round: createAgentSession is exported by
+  @earendil-works/pi-coding-agent (function), NOT by
+  @earendil-works/pi-agent-core. The fill-in round must import it from
+  pi-coding-agent.
+- [ ] 5. packages/providers locks the Pi version: constant 1.3.0
+  RECORDED; ModelRuntime NOT FILLED IN; default model NONE per decision
+  message 4070; providers is only a channel-declaration shell.
+- [ ] 6. packages/tools permission layer: tool_call hook frame EXISTS;
+  the real permission logic is NOT FILLED IN.
+- [ ] 7. Tauri invoke + IPC bridge: contract types and contract-check
+  function EXIST; the real invoke is NOT HERE; Tauri version 2 decided
+  major per message 4070; exact patch + Cargo.lock still PENDING (no Rust
+  toolchain on this machine, see build-notes.md section 8).
+- [ ] 8. Raw event log: RawLog class EXISTS as real structure; NO REAL
+  DATA yet; NO AfterDeleteBench closing line yet.
+- [ ] 9. Single 6-step execution gate: order and order-check function
+  EXIST; the real steps are NOT FILLED IN.
+- [ ] 10. No banned modes applied: RECORDED as bans in code comments;
+  CHECKED by grep in the condition round: no banned name appears as a
+  dependency (core dependencies are only the two Pi packages); mentions in
+  docs and comments are prohibitions, not usage.
 
-Dieu kien dung, theo prep muc 3: dung ngay neu version SDK khac 1.3.0, license khac MIT, duong goi tat ngoai cong, thieu log tho, yeu cau cua-driver truoc cong Z Red 10/11, yeu cau iOS truoc quyet moi. Sau hai lan that bai o cung mot buoc thi dung va lap lai ke hoach.
+Stop conditions, per prep section 3: stop at once if the SDK version is
+not 1.3.0, the license is not MIT, a shortcut path outside the gate
+exists, the raw log is missing, cua-driver is requested before the Z Red
+gate on 10/11, or iOS is requested before a new decision. After two
+failures at the same step, stop and re-plan.
 
-Diem A1-A4: A1 thieu log thi FAIL, da ghi trong bridge. A2 loi goi model chi phuc vu hien thi mac dinh TAT, CHUA CO co che tat that. A3 cam cong va runtime ben thu ba, CHUA KIEM TRA. A4 bao cao ngan sach token theo ca tach rieng cot loi goi phu, CHUA CO. Dieu kien mo A1-A4: Pi SDK 1.3.0 co loi goi phu dang nay hay khong CHUA XAC MINH.
+Points A1-A4: A1 missing log means FAIL, recorded in the bridge. A2 model
+calls only serve the default display, switched OFF; NO REAL off-switch
+mechanism yet. A3 third-party gates and runtimes banned, NOT CHECKED. A4
+per-shift token budget report with a separate auxiliary-call column, NOT
+HERE. Open condition A1-A4: whether Pi SDK 1.3.0 has auxiliary calls of
+this kind is NOT VERIFIED (the install round verified exports only, not
+call behavior).

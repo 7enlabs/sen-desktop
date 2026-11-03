@@ -1,5 +1,7 @@
-// Diem vao packages/core. Chi package nay duoc import Pi SDK, theo prep B-2 muc 3 diem 4.
-// CHUA CO import SDK that: package CHUA CAI, dossier SDK CHUA DOI CHIEU.
+// Entry point of packages/core. Only this package may import the Pi SDK, per
+// prep B-2 section 3 point 4.
+// NO REAL SDK IMPORT YET: the package is NOT INSTALLED, the SDK dossier is
+// NOT CROSS-CHECKED.
 export { SessionManager, canTransition } from "./session.ts";
 export type { SessionState } from "./session.ts";
 export { RawLog } from "./raw-log.ts";

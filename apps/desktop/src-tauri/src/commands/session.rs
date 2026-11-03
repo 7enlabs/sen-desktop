@@ -1,7 +1,10 @@
-// STUB - CHUA CO TRIEN KHAI THAT.
-// Cac command nay chi duoc goi qua IPC bridge tu frontend, khong goi thang SDK.
-// Khi lap day, moi command phai chuyen tiep sang packages/core, khong tu xu ly logic phien o day.
-// sen_session_create: tao phien moi qua packages/core boc createAgentSession.
-// sen_session_steer: dieu huong phien dang chay.
-// sen_session_follow_up: gui follow-up vao phien.
-// sen_session_abort: huy phien.
+// STUB - NO REAL IMPLEMENTATION YET.
+// These commands may only be called through the IPC bridge from the frontend,
+// never straight to the SDK.
+// When filled in, every command must forward to packages/core, never handle
+// session logic here on its own.
+// sen_session_create: create a new session via the packages/core wrapper
+//   around createAgentSession.
+// sen_session_steer: steer a running session.
+// sen_session_follow_up: send a follow-up into a session.
+// sen_session_abort: cancel a session.
