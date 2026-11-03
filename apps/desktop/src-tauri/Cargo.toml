@@ -1,14 +1,13 @@
-# STUB - NOT BUILDABLE YET. Tauri version 2 DECIDED per Telegram message 4070
-# dated 03/11/2026 (ZC Leader). Major version 2 is decided, same major as the
-# Desktop line. Exact patch + Cargo.lock are deferred to the real SDK install
-# round on a machine with a Rust toolchain, after the structural review, per the
-# sequence in message 4070. Do not choose a patch here.
-# Real dependencies are NOT FILLED IN until that install round.
+# Tauri version 2 DECIDED per Telegram message 4070 dated 03/11/2026 (ZC Leader).
+# Exact patch pinned per Telegram message 4086 dated 03/11/2026 (ZC Leader):
+# Exact patch resolved 03/11/2026 by cargo generate-lockfile: 2.12.5.
+# Code is still a STUB (main.rs does not wire the Tauri Builder yet); the real
+# SDK fill-in round follows the structural review. This file only records the
+# decided dependency + exact pin + lockfile so PR #2 can merge.
 [package]
 name = "sen-desktop"
 version = "0.0.0"
 edition = "2021"
 
-# [dependencies]
-# NOT FILLED IN: reserved for the real SDK install round after structural
-# review, with exact pin + lockfile.
+[dependencies]
+tauri = "=2.12.5"

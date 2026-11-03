@@ -309,3 +309,28 @@ scratch copy (no key, no network call, import only):
    install outputs are producer-run evidence; the seat re-verifies.
 5. Name unification: waits for the 10/11 decision.
 6. Scope confirmation: waits for SD Leader confirmation at review.
+
+### 8.10 Cargo.lock round per message 4086 (03/11/2026, ZC Leader)
+
+- Rust stable installed on the seat machine with rustup (profile minimal):
+  cargo 1.99.1, rustc 1.99.1. This closes the missing-toolchain block in 8.9.1
+  for lockfile generation on this machine.
+- Cargo.toml (apps/desktop/src-tauri) now pins tauri = "=2.12.5" (exact patch
+  resolved by cargo generate-lockfile on 03/11/2026; 406 packages locked).
+- Cargo.lock generated alongside Cargo.toml: 4.300 lines, SHA256
+  9544ab7bd9c973058de525834b54788f06e9e1b291735fa5af4a6046e31feb81,
+  tauri entry version 2.12.5 from crates.io. Desktop-line patch was not
+  cross-checked against a verified source in this round; 2.12.5 is the latest
+  2.x resolved by cargo at generation time, so it is current by construction.
+- cargo check (full default features) NOT PASSED on this machine: the
+  gdk-sys build script fails because system library gdk-3.0 is not found
+  (pkg-config: Package gdk-3.0 was not found). Two legitimate attempts to
+  install the Tauri Linux prerequisites failed: (1) apt-get update hung over
+  10 minutes on this VM with no progress; (2) apt-get install from cached
+  lists fails because libwebkit2gtk-4.1-dev, libappindicator3-dev,
+  librsvg2-dev and patchelf are not in the cached lists. No system package
+  was installed.
+- Code is still a STUB (main.rs does not wire the Tauri Builder); only the
+  dependency pin + lockfile changed. Merge still needs cargo check evidence
+  from a machine with GTK/WebKit (Leader VM fallback per message 4086).
+  Independent verification: NOT DONE by design; the Leader verifies.
