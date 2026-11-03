@@ -1,93 +1,89 @@
-# Sen Desktop
+# Sen Desktop - scaffold B-2
 
+Status: FRAME, NOT BUILT. This is a local bundle, not pushed to a remote,
+no PR opened, no merge.
 
+Basis: the approved prep file `b2-scaffold-kickoff-prep-2026-11-03.md`,
+the build gate from SD Leader in Telegram message 4064 dated 03/11/2026,
+the head confirmation from ZC Leader in message 4055, and the parameter
+decisions from ZC Leader in message 4070 dated 03/11/2026.
 
-## Getting started
+Decided parameters from message 4070, already applied to this bundle at the
+structural level:
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- Tauri version 2 (major version decided, same major as the Desktop line);
+  exact patch + Cargo.lock come in the real SDK install round after the
+  structural review.
+- Identifier: dev.7enlab.sen-desktop (temporary, changeable before release).
+- Minimum permissions: core Tauri only, no plugin added yet.
+- Desktop shell: main window 1200x800, temporary title Pi Desktop until the
+  10/11 Sen-name verification per B-1, no feature UI, no fake content.
+- Default model: NONE; packages/providers is only a channel-declaration
+  shell, no model attached, no key, no network call.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+Repo frame: pnpm workspace, ESM-only. `apps/desktop` holds no shared
+business logic.
 
-## Add your files
+## Package scope: PROPOSAL, pending confirmation
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+The `@sen/*` scope on the package names (`@sen/desktop`, `@sen/core`,
+`@sen/providers`, `@sen/tools`, `@sen/prompts`, `@sen/ui`) is ONLY A
+PROPOSAL. It is NOT decided here and waits for SD Leader confirmation at
+review time. If the scope is not agreed, the fallback is to rename to
+unscoped names (`desktop`, `core`, `providers`, `tools`, `prompts`, `ui`)
+before merge. No package is published under the scope until that
+confirmation exists.
 
-```
-cd existing_repo
-git remote add origin https://gitlab.com/7enlab/sen-desktop.git
-git branch -M main
-git push -uf origin main
-```
+## Names: DECISION PENDING 10/11
 
-## Integrate with your tools
+Three names are all temporary pre-release names, and their unification is NOT
+decided here:
 
-* [Set up project integrations](https://gitlab.com/7enlab/sen-desktop/-/settings/integrations)
+- Window title: Pi Desktop (temporary, until the 10/11 Sen-name
+  verification per B-1).
+- productName: Sen Desktop (temporary pre-release name).
+- Identifier: dev.7enlab.sen-desktop (temporary, changeable before
+  release).
 
-## Collaborate with your team
+The 10/11 decision point settles the single final name. Until then, every
+file keeps the temporary names above and marks them as temporary.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Constraints kept from the prep
 
-## Test and Deploy
+- Pi SDK pinned at 1.3.0, never raised to 1.4.0.
+- No cua-driver before the Z Red gate on 10/11. No iOS target in this
+  scaffold.
+- F8 MCP waits for the full-text cross-check; it is not in this scaffold.
+- No font bundled before the license file is opened. No font directory in
+  this scaffold.
+- No TrustBoost, NVISO, agent-memory-guard Python, or Decepticon as a
+  dependency.
+- No `require()` call to the SDK. No OS-dependent shell command at the
+  frame layer.
+- Every world-changing action goes only through the single 6-step execution
+  gate in `packages/core/src/execution-gate.ts`.
 
-Use the built-in continuous integration in GitLab.
+## Pre-merge condition round (Leader structural review, message 4077)
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+Status after this round; full evidence is in `build-notes.md` section 8:
 
-***
+1. Stale "Tauri version undecided" strings: FIXED (root build script,
+   bridge.ts, app main.ts, plus the same stale string in the Rust main.rs
+   found in the same sweep). Tauri 2 is recorded as decided everywhere.
+2. `@sen/*` scope: PROPOSAL ONLY, kept as-is, pending SD Leader
+   confirmation at review; fallback to unscoped names documented above.
+3. Section 1 frame files: ADDED (.gitignore, LICENSE, CONTRIBUTING,
+   CODE_OF_CONDUCT, SECURITY, CHANGELOG, one README per package).
+4. Lockfiles: pnpm-lock.yaml COMMITTED (generated by a real install in a
+   scratch copy, verified with install --frozen-lockfile). Cargo.lock:
+   BLOCKED, no Rust toolchain on this machine; no lockfile fabricated.
+5. Tests for the 4 real logic files: ADDED and RUN GREEN with node
+   (packages/core/tests/logic.test.ts). Producer-run evidence only, NOT
+   independent verification.
+6. Name unification: PENDING DECISION 10/11, not decided here; temporary
+   names kept and marked as temporary.
+7. English only on GitHub: DONE for the 35 PR files (comments and
+   descriptions translated; new frame files written in English directly).
 
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+See `build-notes.md` for the real state of every file. A file marked STUB
+has no real runnable code, even though the text inside the file is real.

@@ -1,0 +1,13 @@
+# Tauri version 2 DECIDED per Telegram message 4070 dated 03/11/2026 (ZC Leader).
+# Exact patch pinned per Telegram message 4086 dated 03/11/2026 (ZC Leader):
+# Exact patch resolved 03/11/2026 by cargo generate-lockfile: 2.12.5.
+# Code is still a STUB (main.rs does not wire the Tauri Builder yet); the real
+# SDK fill-in round follows the structural review. This file only records the
+# decided dependency + exact pin + lockfile so PR #2 can merge.
+[package]
+name = "sen-desktop"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+tauri = "=2.12.5"

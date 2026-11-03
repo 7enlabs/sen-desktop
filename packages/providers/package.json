@@ -1,0 +1,1 @@
+{"description":"Pi version locked here: ModelRuntime, default model, custom providers. The Pi version appears in exactly one locked place here, per prep B-2 section 3 point 5.","license":"MIT","name":"@sen/providers","private":true,"type":"module","version":"0.0.0"}
