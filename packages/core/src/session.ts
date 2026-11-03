@@ -1,7 +1,7 @@
 // SessionManager and AgentSessionRuntime: session lifecycle, per prep B-2
 // section 1 and point 854.
 // SDK PART, fill-in round (messages 4128/4138): the real createAgentSession
-// import lives in ./agent-session.ts (pi-coding-agent 1.3.0). This file keeps
+// import lives in ./agent-session.ts (pi-coding-agent 1.5.0). This file keeps
 // the local statechart frame; create() below still records local state only
 // and makes no SDK call. An SDK-backed session attaches through
 // bindSdkSession(), which needs an explicitly provided model runtime (see
