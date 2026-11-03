@@ -14,7 +14,7 @@ import the Pi SDK.
 - `token-economizer.ts`: the point-856 stop-turn rule (at most 1 redirect,
   long-turn ratio 2.5).
 - `paths.ts`: the single path variable; no path joining by string.
-- Pi SDK pinned at 1.3.0 (`@earendil-works/pi-agent-core` and
+- Pi SDK pinned at 1.5.0 (`@earendil-works/pi-agent-core` and
   `@earendil-works/pi-coding-agent`), MIT license on both.
 
 ## Status

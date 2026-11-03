@@ -2,8 +2,9 @@
 // Only packages/core may import the Pi SDK, per prep B-2 section 3 point 4.
 // This module imports createAgentSession from @earendil-works/pi-coding-agent
 // for real. Verified in the install round: pi-coding-agent 1.5.0 (MIT, tin 4178 bump)
-// exports createAgentSession as a function; pi-agent-core 1.3.0 does NOT
-// export it, so the import must come from pi-coding-agent.
+// exports createAgentSession as a function; pi-agent-core 1.5.0 does NOT
+// export it (re-checked in the installed 1.5.0 types), so the import
+// must come from pi-coding-agent.
 // NO DEFAULT MODEL: per message 4070 the frame has no default model, no key,
 // no network call. The SDK's own defaults would resolve a model from the
 // user's ~/.pi/agent settings and auth files, so this wrapper REFUSES to call
