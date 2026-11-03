@@ -1,10 +1,17 @@
 // SessionManager and AgentSessionRuntime: session lifecycle, per prep B-2
 // section 1 and point 854.
-// STUB, SDK PART: createAgentSession from Pi SDK 1.3.0 is NOT IMPORTED FOR
-// REAL yet because the package is NOT INSTALLED yet.
-// The statechart below is real logic per point 854; no automated test ran on
-// it before this round (see packages/core/tests/logic.test.ts).
+// SDK PART, fill-in round (messages 4128/4138): the real createAgentSession
+// import lives in ./agent-session.ts (pi-coding-agent 1.3.0). This file keeps
+// the local statechart frame; create() below still records local state only
+// and makes no SDK call. An SDK-backed session attaches through
+// bindSdkSession(), which needs an explicitly provided model runtime (see
+// agent-session.ts); without one, no live session exists, by design.
+// The type-only import below is erased at runtime, so this file stays
+// loadable without node_modules installed.
+// The statechart below is real logic per point 854 (see
+// packages/core/tests/logic.test.ts).
 import { RawLog } from "./raw-log.ts";
+import type { SenAgentSession } from "./agent-session.ts";
 
 export type SessionState =
   | "Running"
@@ -34,14 +41,32 @@ export function canTransition(from: SessionState, to: SessionState): boolean {
 
 export class SessionManager {
   private states = new Map<string, SessionState>();
+  private sdkSessions = new Map<string, SenAgentSession>();
   readonly rawLog = new RawLog();
 
   create(sessionId: string): SessionState {
-    // NOT HERE YET: call the real createAgentSession from Pi SDK 1.3.0 here
-    // after installing the package and cross-checking the dossier.
+    // Local statechart frame only: no SDK call here. An SDK-backed session
+    // attaches through bindSdkSession() with an explicit model runtime.
     this.states.set(sessionId, "Running");
-    this.rawLog.append(sessionId, "session_create_stub", { note: "REAL SDK CALL NOT MADE YET" });
+    this.rawLog.append(sessionId, "session_create_stub", { note: "LOCAL STATE ONLY, NO SDK CALL" });
     return "Running";
+  }
+
+  // Binds a real SDK session handle (created via createSenAgentSession in
+  // ./agent-session.ts with an explicit model runtime) to a local session id.
+  // Binding alone makes no model call; it only records the link and the log.
+  bindSdkSession(sessionId: string, handle: SenAgentSession): SessionState {
+    const state = this.states.get(sessionId);
+    if (!state) {
+      throw new Error("Session does not exist: " + sessionId);
+    }
+    this.sdkSessions.set(sessionId, handle);
+    this.rawLog.append(sessionId, "session_sdk_bound", { note: "SDK session bound; binding alone makes no model call" });
+    return state;
+  }
+
+  getSdkSession(sessionId: string): SenAgentSession | undefined {
+    return this.sdkSessions.get(sessionId);
   }
 
   transition(sessionId: string, to: SessionState): SessionState {

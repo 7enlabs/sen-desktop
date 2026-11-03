@@ -31,8 +31,11 @@ export function requireRawLog(rawLogRef: string): void {
 
 export async function invoke(command: string, request: SessionRequest | ToolCallRequest): Promise<unknown> {
   assertContract(request.contract);
-  // NOT HERE YET: call the real Tauri invoke here once the real SDK install
-  // round fills this in.
+  // NOT HERE YET: call the real Tauri invoke here. The core-side SDK wiring
+  // is real since the fill-in round (packages/core/src/agent-session.ts),
+  // but the frontend Tauri runtime binding (@tauri-apps/api plus the app
+  // bundler) is still missing, so this bridge still throws instead of
+  // calling through. That binding belongs to the app-build step.
   const err: IpcError = {
     code: "NOT_IMPLEMENTED",
     message: "Tauri invoke NOT HERE YET: not implemented, no real call made.",

@@ -1,19 +1,25 @@
 # Sen Desktop - scaffold B-2
 
-Status: FRAME, NOT BUILT. This is a local bundle, not pushed to a remote,
-no PR opened, no merge.
+Status: FILL-IN ROUND. The scaffold merged into dev/scaffold (PR #2,
+merge squash 20:15 on 03/11/2026, merge commit a868774). This local bundle
+is the fill-in working copy on top of the merged scaffold: Pi SDK 1.3.0 is
+imported and wired in packages/core (no default model, no key, no network
+call); Tauri command handlers are still stubs; the full app is not built;
+cargo check evidence for the new branch comes from the Leader VM, as in the
+lockfile round.
 
 Basis: the approved prep file `b2-scaffold-kickoff-prep-2026-11-03.md`,
 the build gate from SD Leader in Telegram message 4064 dated 03/11/2026,
-the head confirmation from ZC Leader in message 4055, and the parameter
-decisions from ZC Leader in message 4070 dated 03/11/2026.
+the head confirmation from ZC Leader in message 4055, the parameter
+decisions from ZC Leader in message 4070 dated 03/11/2026, and the
+fill-in decision from ZC Leader in messages 4128/4138 dated 03/11/2026.
 
 Decided parameters from message 4070, already applied to this bundle at the
 structural level:
 
 - Tauri version 2 (major version decided, same major as the Desktop line);
-  exact patch + Cargo.lock come in the real SDK install round after the
-  structural review.
+  exact patch 2.12.5 + Cargo.lock (4300 lines) done in the lockfile round
+  and merged with PR #2.
 - Identifier: dev.7enlab.sen-desktop (temporary, changeable before release).
 - Minimum permissions: core Tauri only, no plugin added yet.
 - Desktop shell: main window 1200x800, temporary title Pi Desktop until the
@@ -24,15 +30,12 @@ structural level:
 Repo frame: pnpm workspace, ESM-only. `apps/desktop` holds no shared
 business logic.
 
-## Package scope: PROPOSAL, pending confirmation
+## Package scope: CONFIRMED
 
 The `@sen/*` scope on the package names (`@sen/desktop`, `@sen/core`,
-`@sen/providers`, `@sen/tools`, `@sen/prompts`, `@sen/ui`) is ONLY A
-PROPOSAL. It is NOT decided here and waits for SD Leader confirmation at
-review time. If the scope is not agreed, the fallback is to rename to
-unscoped names (`desktop`, `core`, `providers`, `tools`, `prompts`, `ui`)
-before merge. No package is published under the scope until that
-confirmation exists.
+`@sen/providers`, `@sen/tools`, `@sen/prompts`, `@sen/ui`) is CONFIRMED
+per message 4080 (SD Leader): internal package names only, not a brand or
+release-name decision. No package is published under the scope.
 
 ## Names: DECISION PENDING 10/11
 
