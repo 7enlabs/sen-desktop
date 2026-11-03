@@ -334,3 +334,49 @@ scratch copy (no key, no network call, import only):
   dependency pin + lockfile changed. Merge still needs cargo check evidence
   from a machine with GTK/WebKit (Leader VM fallback per message 4086).
   Independent verification: NOT DONE by design; the Leader verifies.
+
+### 8.11 Fill-in round per messages 4128/4138 (03/11/2026, evening)
+
+- Scope: real SDK import + createAgentSession wiring on top of merged
+  scaffold (dev/scaffold head a868774, PR #2 merged). No push, no merge,
+  no PR action by the seat; delivery goes through the Leader as before.
+- API findings from pi-coding-agent 1.3.0 (MIT), read from the installed
+  package types: createAgentSession(options?) takes all-optional options,
+  BUT its defaults resolve a model from the user's ~/.pi/agent settings and
+  auth files, and ModelRuntime.create() would read auth the same way. The
+  wrapper therefore REFUSES to call the SDK without an explicitly provided
+  model runtime: no default model per message 4070, no key, no network call,
+  no live session in this round. AgentSession methods steer / followUp /
+  abort / subscribe map exactly to the Tauri commands sen_session_steer,
+  sen_session_follow_up, sen_session_abort, sen_events_subscribe.
+- Changes: 2 new files (packages/core/src/agent-session.ts,
+  packages/core/tests/sdk-wiring.test.ts), 5 modified files (session.ts,
+  bridge.ts comment, root package.json, docs/b2-checklist.md, README.md).
+  Zero Rust changes: the Rust code is byte-identical to the VM-green head
+  9e5ef82, so the VM check result for that head still applies to it.
+- Design decisions: core index.ts does NOT re-export agent-session.ts, so
+  the install-free smoke import keeps working; SDK wiring loads by direct
+  import after pnpm install. Session start default is noTools "all": tools
+  attach later explicitly through the execution gate, never at creation.
+- Verification run in this round (all real runs, no fabricated result):
+  pnpm install --frozen-lockfile in a scratch copy (8.3s first, 1.7s
+  re-check on the final bundle); sdk-wiring tests 4 pass 0 fail (real SDK
+  import resolves, no-runtime guard throws, method mapping delegates,
+  SessionManager binding keeps the statechart); logic tests 6 pass 0 fail
+  in the scratch copy AND in the bundle dir without node_modules;
+  install-free smoke import of core index, providers, tools, prompts, ui,
+  bridge, main all clean; cargo metadata --locked exit 0 (tauri 2.12.5,
+  407 nodes including the root package); scans clean (no long dash, no
+  credential value in new/changed files).
+- Still blocked / still open, stated plainly: full cargo check on this box
+  was NOT re-run (Rust unchanged; the known gdk-sys / missing system lib
+  block stands) - the new branch still needs cargo check --locked green on
+  the Leader VM per message 4138 acceptance. Rust command handlers
+  (session.rs, tools.rs, events.rs, main.rs) are still stubs and are the
+  next wiring step after this TS-side round. The frontend Tauri runtime
+  binding (@tauri-apps/api plus the app bundler) is still missing, so
+  bridge.invoke() still throws NOT_IMPLEMENTED. No live session exists by
+  design: no model channel attached yet per message 4070. Name unification
+  at 10/11 is still open and does not block this round.
+- Independent verification: NOT DONE by design; the seat verifies before
+  any group handover, and the Leader verifies before any PR.
