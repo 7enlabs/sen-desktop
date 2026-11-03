@@ -16,9 +16,10 @@ Tauri desktop app shell for Sen Desktop.
 
 ## Status
 
-STUB. The UI shell is not filled in, the Tauri Builder is not wired, and
-the real invoke call is not implemented. Tauri version 2 is decided per
-Telegram message 4070; the stub status is about missing implementation,
+PARTIAL. The UI shell is not filled in and the frontend bundler is still
+missing, but the Tauri Builder is wired and the real invoke call is
+implemented (bridge round). Tauri version 2 is decided per Telegram
+message 4070; the remaining stub status is about missing UI and bundler,
 not about an undecided version.
 
 ## Names: temporary until the 10/11 decision
