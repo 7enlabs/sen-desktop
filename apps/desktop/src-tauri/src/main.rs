@@ -1,21 +1,28 @@
-// STUB - NOT COMPILED, NOT RUN.
-// Tauri init, invoke command registration. Command names per prep B-2 section 2.
-// Real APIs are filled in during the real SDK install round. Tauri version 2 is
-// decided per Telegram message 4070; the remaining stub status is about missing
-// implementation, not about an undecided version.
+// Tauri app entry (bridge round): real Builder, real command registration.
+// Window size, title and identifier come from tauri.conf.json (1200x800,
+// temporary title Pi Desktop until the 10/11 Sen-name decision, identifier
+// dev.7enlab.sen-desktop, core Tauri permissions only, no plugin).
+// No live session exists yet by design: session creation needs an
+// explicitly provided model runtime in the frontend, which this phase
+// deliberately has none. The frontend bundler is still missing, so there
+// is no distributable build yet even though the backend wires up.
 mod commands;
 
+use std::sync::Mutex;
+
+use commands::registry::Registry;
+
 fn main() {
-    // NOT HERE YET: real Tauri Builder.
-    // Commands registered when filled in:
-    // sen_session_create, sen_session_steer, sen_session_follow_up,
-    // sen_session_abort, sen_tool_call, sen_events_subscribe.
-    let _registered: &[&str] = &[
-        "sen_session_create",
-        "sen_session_steer",
-        "sen_session_follow_up",
-        "sen_session_abort",
-        "sen_tool_call",
-        "sen_events_subscribe",
-    ];
+    tauri::Builder::default()
+        .manage(Mutex::new(Registry::new()))
+        .invoke_handler(tauri::generate_handler![
+            commands::session::sen_session_create,
+            commands::session::sen_session_steer,
+            commands::session::sen_session_follow_up,
+            commands::session::sen_session_abort,
+            commands::tools::sen_tool_call,
+            commands::events::sen_events_subscribe,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }

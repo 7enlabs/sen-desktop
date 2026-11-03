@@ -1,9 +1,12 @@
 # Tauri version 2 DECIDED per Telegram message 4070 dated 03/11/2026 (ZC Leader).
 # Exact patch pinned per Telegram message 4086 dated 03/11/2026 (ZC Leader):
 # Exact patch resolved 03/11/2026 by cargo generate-lockfile: 2.12.5.
-# Code is still a STUB (main.rs does not wire the Tauri Builder yet); the real
-# SDK fill-in round follows the structural review. This file only records the
-# decided dependency + exact pin + lockfile so PR #2 can merge.
+# Bridge round (04/11/2026): main.rs wires the real Tauri Builder and the
+# six commands are real handlers delegating to commands/registry.rs.
+# serde is added for the command wire structs only; the backend still holds
+# no model, no key, no network call. Full cargo check still needs the
+# Leader VM (system libraries gdk-3.0 / webkit2gtk are missing on the seat
+# box); registry.rs logic is test-verified standalone with rustc --test.
 [package]
 name = "sen-desktop"
 version = "0.0.0"
@@ -11,3 +14,7 @@ edition = "2021"
 
 [dependencies]
 tauri = "=2.12.5"
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+tauri-build = "2"

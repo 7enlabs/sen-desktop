@@ -1,11 +1,18 @@
 // IPC bridge wrapper - the only layer the frontend may call, per prep B-2 section 2.
-// STUB, EXECUTION PART: the real Tauri invoke function is NOT HERE yet because
-// the real implementation is not filled in yet. Tauri version 2 is decided per
-// Telegram message 4070 (ZC Leader, 03/11/2026); the stub status is about
-// missing implementation, not about an undecided version.
-// Functions here only validate the contract and block shortcut call paths;
-// they never execute a tool on their own.
-import type { ActionContract, IpcError, SessionRequest, ToolCallRequest } from "./types.ts";
+// BRIDGE ROUND: invoke() now calls the real Tauri invoke from
+// @tauri-apps/api/core (Tauri 2, decided per Telegram message 4070).
+// The NOT_IMPLEMENTED stub is gone. Outside a Tauri webview (for example
+// under node in tests) the real invoke throws a runtime error
+// ("window is not defined") instead of a stub error; that is proof the
+// binding is attempted, not proof of a running app.
+// Contract validation runs BEFORE the transport call: a bad contract never
+// reaches the backend. Transport errors propagate untouched, never mapped
+// to a fake success and never swallowed.
+// The transport is injectable ONLY for tests (setBridgeTransport): the app
+// path always uses the real Tauri invoke. A test transport stands in for
+// the Rust handlers, which cannot run under node.
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import type { ActionContract } from "./types.ts";
 
 export function assertContract(contract: ActionContract): void {
   const missing: string[] = [];
@@ -29,17 +36,30 @@ export function requireRawLog(rawLogRef: string): void {
   }
 }
 
-export async function invoke(command: string, request: SessionRequest | ToolCallRequest): Promise<unknown> {
-  assertContract(request.contract);
-  // NOT HERE YET: call the real Tauri invoke here. The core-side SDK wiring
-  // is real since the fill-in round (packages/core/src/agent-session.ts),
-  // but the frontend Tauri runtime binding (@tauri-apps/api plus the app
-  // bundler) is still missing, so this bridge still throws instead of
-  // calling through. That binding belongs to the app-build step.
-  const err: IpcError = {
-    code: "NOT_IMPLEMENTED",
-    message: "Tauri invoke NOT HERE YET: not implemented, no real call made.",
-    rawLogRef: "",
-  };
-  throw new Error(err.code + ": " + err.message);
+// Args for one Tauri command: the full action contract plus the command's
+// own parameters. Wire names are snake_case for the Rust parameters
+// (session_id, text, tool_name); the contract object itself stays camelCase
+// and the Rust side renames it with serde rename_all camelCase.
+export interface BridgeArgs {
+  contract: ActionContract;
+  [key: string]: unknown;
+}
+
+export type BridgeTransport = (command: string, args: BridgeArgs) => Promise<unknown>;
+
+const realTransport: BridgeTransport = (command, args) =>
+  tauriInvoke(command, args);
+
+let transport: BridgeTransport = realTransport;
+
+// Test-only injection point. Pass null to restore the real Tauri invoke.
+// Production code never calls this; tests use it to stand in for the Rust
+// handlers, which cannot run under node.
+export function setBridgeTransport(next: BridgeTransport | null): void {
+  transport = next ?? realTransport;
+}
+
+export async function invoke(command: string, args: BridgeArgs): Promise<unknown> {
+  assertContract(args.contract);
+  return transport(command, args);
 }

@@ -1,7 +1,7 @@
 // Entry point of packages/core. Only this package may import the Pi SDK, per
-// prep B-2 section 3 point 4.
-// NO REAL SDK IMPORT YET: the package is NOT INSTALLED, the SDK dossier is
-// NOT CROSS-CHECKED.
+// prep B-2 section 3 point 4. The real SDK import lives in
+// ./agent-session.ts (not re-exported here, so the install-free smoke
+// import keeps working); it loads by direct import after pnpm install.
 export { SessionManager, canTransition } from "./session.ts";
 export type { SessionState } from "./session.ts";
 export { RawLog } from "./raw-log.ts";

@@ -1,12 +1,13 @@
 # Sen Desktop - scaffold B-2
 
-Status: PI-BUMP ROUND (tin 4178). The scaffold merged into dev/scaffold (PR #2,
-merge squash 20:15 on 03/11/2026, merge commit a868774). This local bundle
-is the Pi-bump working copy on top of merged PR #3 (fd0d3e0, 21:26 03/11): pi-coding-agent 1.5.0 is
-imported and wired in packages/core (no default model, no key, no network
-call); Tauri command handlers are still stubs; the full app is not built;
-cargo check evidence for the new branch comes from the Leader VM, as in the
-lockfile round.
+Status: BRIDGE ROUND (tin 4255, PR #5 merged). This local bundle is the
+bridge working copy on top of merged PR #5 (bd720d0, 23:47 03/11): whole
+Pi stack 1.5.0; Tauri command handlers are real (commands/registry.rs plus
+the Builder in main.rs); the frontend bridge calls the real
+@tauri-apps/api invoke; no live session yet (no model channel, no key,
+no network call); the frontend bundler is still missing, so the full app
+is not built; cargo check evidence for the new branch comes from the
+Leader VM, as in the lockfile round.
 
 Basis: the approved prep file `b2-scaffold-kickoff-prep-2026-11-03.md`,
 the build gate from SD Leader in Telegram message 4064 dated 03/11/2026,
