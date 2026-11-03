@@ -53,7 +53,7 @@ file keeps the temporary names above and marks them as temporary.
 
 ## Constraints kept from the prep
 
-- Pi coding agent 1.5.0 per tin 4178 (1.3.0 pin dropped); pi-agent-core stays 1.3.0 until ordered otherwise.
+- Pi coding agent 1.5.0 per tin 4178 (1.3.0 pin dropped); pi-agent-core 1.5.0 per tin 4212.
 - No cua-driver before the Z Red gate on 10/11. No iOS target in this
   scaffold.
 - F8 MCP waits for the full-text cross-check; it is not in this scaffold.

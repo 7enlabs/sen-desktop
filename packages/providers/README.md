@@ -4,7 +4,7 @@ Pi version lock and model channel declarations for Sen Desktop.
 
 ## Role
 
-- Holds the single locked Pi version: `PINNED_PI_VERSION = "1.3.0"`.
+- Holds the single locked Pi version: `PINNED_PI_VERSION = "1.5.0"`.
 - Declares the ModelRuntime shape and custom provider channels.
 - Default model: NONE, per decision message 4070. This package is only a
   channel-declaration shell; no model is attached, no key is stored, no
