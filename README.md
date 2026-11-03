@@ -1,8 +1,8 @@
 # Sen Desktop - scaffold B-2
 
-Status: FILL-IN ROUND. The scaffold merged into dev/scaffold (PR #2,
+Status: PI-BUMP ROUND (tin 4178). The scaffold merged into dev/scaffold (PR #2,
 merge squash 20:15 on 03/11/2026, merge commit a868774). This local bundle
-is the fill-in working copy on top of the merged scaffold: Pi SDK 1.3.0 is
+is the Pi-bump working copy on top of merged PR #3 (fd0d3e0, 21:26 03/11): pi-coding-agent 1.5.0 is
 imported and wired in packages/core (no default model, no key, no network
 call); Tauri command handlers are still stubs; the full app is not built;
 cargo check evidence for the new branch comes from the Leader VM, as in the
@@ -53,7 +53,7 @@ file keeps the temporary names above and marks them as temporary.
 
 ## Constraints kept from the prep
 
-- Pi SDK pinned at 1.3.0, never raised to 1.4.0.
+- Pi coding agent 1.5.0 per tin 4178 (1.3.0 pin dropped); pi-agent-core stays 1.3.0 until ordered otherwise.
 - No cua-driver before the Z Red gate on 10/11. No iOS target in this
   scaffold.
 - F8 MCP waits for the full-text cross-check; it is not in this scaffold.

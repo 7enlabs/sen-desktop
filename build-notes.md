@@ -380,3 +380,45 @@ scratch copy (no key, no network call, import only):
   at 10/11 is still open and does not block this round.
 - Independent verification: NOT DONE by design; the seat verifies before
   any group handover, and the Leader verifies before any PR.
+
+### 8.12 Pi bump round per message 4178 (03/11/2026, night, Zen order)
+- Order: drop the pi-coding-agent 1.3.0 pin; Sen follows newest upstream Pi
+  like the CLI line (currently 1.5.0). Separate PR into dev/scaffold,
+  SD Leader review, no self-merge. If createAgentSession changes signature,
+  report at once, do not force-fit.
+- Verified from npm registry: newest @earendil-works/pi-coding-agent is
+  1.5.0, license MIT. packages/core/package.json now pins pi-coding-agent
+  1.5.0; pnpm-lock.yaml regenerated (install "Done in 16.6s", specifier
+  1.5.0, resolved 1.5.0).
+- pi-agent-core: direct pin UNCHANGED at 1.3.0 (tin 4178 names only
+  pi-coding-agent; no order to move core). Registry newest for core is
+  also 1.5.0, reported for a later Leader decision. Note: pi-coding-agent
+  1.5.0 pulls pi-agent-core 1.5.0 as its own transitive dependency, so
+  the lockfile lists both core 1.3.0 (direct) and 1.5.0 (transitive); the
+  direct import in packages/core still resolves to core 1.3.0.
+- Signature verdict: NO CHANGE affecting the wrapper. Checked against the
+  installed 1.5.0 type declarations: createAgentSession still exported
+  from pi-coding-agent, still takes CreateAgentSessionOptions (cwd?,
+  modelRuntime?, noTools "all" | "builtin") and still returns
+  { session: AgentSession }; AgentSession still has steer, followUp,
+  abort, subscribe, dispose; ModelRuntime and AgentSessionEventListener
+  still exported. The wrapper call (modelRuntime, cwd, noTools "all")
+  and the no-default-model guard are untouched.
+- Files changed vs merged PR #3 state (7 modified, 0 added, 0 deleted):
+  packages/core/package.json, pnpm-lock.yaml,
+  packages/core/src/agent-session.ts (SDK_PINNED_VERSION 1.5.0),
+  packages/core/src/session.ts (version comment),
+  packages/core/tests/sdk-wiring.test.ts (pin assertions 1.5.0),
+  README.md (status + pin lines), build-notes.md (this section).
+  docs/b2-checklist.md left untouched as the 1.3.0 fill-in round record.
+- Evidence: logic tests 6 pass 0 fail installed AND install-free;
+  sdk-wiring tests 4 pass 0 fail after install (real 1.5.0 import
+  resolves, probe reports 1.5.0, no-runtime guard throws, method mapping
+  delegates, SessionManager binding keeps the statechart); cargo metadata
+  --locked exit 0 (tauri 2.12.5, 407 packages).
+- Still open, stated plainly: full cargo check on this box NOT re-run
+  (Rust code unchanged; known gdk-sys / missing system lib block stands)
+  - the new branch still needs cargo check --locked green on the Leader
+  VM. Rust handlers still stubs, bridge still NOT_IMPLEMENTED, no live
+  session by design, name decision 10/11 still open. No PR opened from
+  here; the Leader pushes and opens the separate PR.

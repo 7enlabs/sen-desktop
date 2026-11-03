@@ -20,10 +20,10 @@ import { SessionManager } from "../src/session.ts";
 test("SDK wiring probe: real import resolves, pinned version", () => {
   const probe = probeSdkWiring();
   assert.equal(probe.sdkPackage, "@earendil-works/pi-coding-agent");
-  assert.equal(probe.sdkVersion, "1.3.0");
+  assert.equal(probe.sdkVersion, "1.5.0");
   assert.equal(probe.createAgentSession, "function");
   assert.equal(SDK_PACKAGE, "@earendil-works/pi-coding-agent");
-  assert.equal(SDK_PINNED_VERSION, "1.3.0");
+  assert.equal(SDK_PINNED_VERSION, "1.5.0");
 });
 
 test("createSenAgentSession refuses without an explicit model runtime", async () => {

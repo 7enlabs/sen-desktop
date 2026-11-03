@@ -1,7 +1,7 @@
 // Real Pi SDK wiring for the Sen Desktop fill-in round (messages 4128/4138).
 // Only packages/core may import the Pi SDK, per prep B-2 section 3 point 4.
 // This module imports createAgentSession from @earendil-works/pi-coding-agent
-// for real. Verified in the install round: pi-coding-agent 1.3.0 (MIT)
+// for real. Verified in the install round: pi-coding-agent 1.5.0 (MIT, tin 4178 bump)
 // exports createAgentSession as a function; pi-agent-core 1.3.0 does NOT
 // export it, so the import must come from pi-coding-agent.
 // NO DEFAULT MODEL: per message 4070 the frame has no default model, no key,
@@ -20,7 +20,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 export const SDK_PACKAGE = "@earendil-works/pi-coding-agent";
-export const SDK_PINNED_VERSION = "1.3.0";
+export const SDK_PINNED_VERSION = "1.5.0";
 
 // Proves the real import resolves, without calling the SDK, without a key,
 // without a network call. Throws if the import ever stops being a function.
