@@ -1,13 +1,16 @@
 # Sen Desktop - scaffold B-2
 
-Status: BRIDGE ROUND (tin 4255, PR #5 merged). This local bundle is the
-bridge working copy on top of merged PR #5 (bd720d0, 23:47 03/11): whole
-Pi stack 1.5.0; Tauri command handlers are real (commands/registry.rs plus
+Status: LIVE SESSION ROUND (tin 4528/4542). This local bundle is the
+live-session working copy on top of merged PR #6 (9ed6981, 06:06 04/11):
+whole Pi stack 1.5.0; Tauri command handlers are real (commands/registry.rs plus
 the Builder in main.rs); the frontend bridge calls the real
-@tauri-apps/api invoke; no live session yet (no model channel, no key,
-no network call); the frontend bundler is still missing, so the full app
-is not built; cargo check evidence for the new branch comes from the
-Leader VM, as in the lockfile round.
+@tauri-apps/api invoke; the live session channel is wired
+(packages/core model-channel + live-session, OpenRouter free route, explicit
+model only, key only from OPENROUTER_API_KEY at runtime; live attach real
+via apps/desktop ipc/live-client.ts; stream events flow through the SDK
+handle subscribe); tool execution is still refused; the frontend bundler
+is still missing, so the full app is not built; cargo check evidence for
+the new branch comes from the Leader VM, as in the lockfile round.
 
 Basis: the approved prep file `b2-scaffold-kickoff-prep-2026-11-03.md`,
 the build gate from SD Leader in Telegram message 4064 dated 03/11/2026,
@@ -26,7 +29,9 @@ structural level:
 - Desktop shell: main window 1200x800, temporary title Pi Desktop until the
   10/11 Sen-name verification per B-1, no feature UI, no fake content.
 - Default model: NONE; packages/providers is only a channel-declaration
-  shell, no model attached, no key, no network call.
+  shell, no model attached, no key, no network call. Live sessions name
+  their model explicitly at call time (OpenRouter free route, tin 4528/4542);
+  no default model id is stored anywhere in this bundle.
 
 Repo frame: pnpm workspace, ESM-only. `apps/desktop` holds no shared
 business logic.

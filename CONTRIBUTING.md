@@ -16,7 +16,7 @@ and docs in this repo are written in English.
 
 ## Rules that already bind this scaffold
 
-- Pi SDK versions follow the latest upstream release (Sen tracks newest Pi, same rule as the CLI line). Do not re-pin to an old version without a new decision.
+- Pi SDK versions follow the latest upstream release (currently 1.5.0; Sen tracks newest Pi, same rule as the CLI line). Do not re-pin to an old version without a new decision.
 - No credentials, keys, or tokens in code, docs, or messages.
 - No paid-tier fallback: if no verified free path exists, stop and report.
 - No fake content: stubs stay marked STUB, unmet conditions stay listed in

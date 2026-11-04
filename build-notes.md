@@ -550,3 +550,113 @@ scratch copy (no key, no network call, import only):
 Nội dung sau đây được chuyển nguyên văn từ khóa `tauri.note` trong `apps/desktop/src-tauri/tauri.conf.json`, vì Tauri v2 không chấp nhận khóa `tauri` trong config (Config chỉ nhận productName ở cấp cao nhất, app, build, bundle, identifier, plugins; xem tauri-utils 2.10.2, deny_unknown_fields). Khóa `tauri` đã bị xóa khỏi config, không mất nội dung. Icon trong patch này là icon tạm cho scaffold, chờ thiết kế chính thức trước phát hành, không phải logo cuối.
 
 > Decided parameters, message 4070: Tauri version 2; identifier dev.7enlab.sen-desktop (temporary, changeable before release); main window 1200x800, temporary title Pi Desktop until the 10/11 Sen-name verification per B-1, no feature UI, no fake content; minimum permissions: core Tauri only, no plugin added yet (no fs, shell, http, dialog, notification, updater); invoke + IPC bridge is the only gate. NAME DECISION PENDING 10/11: productName Sen Desktop, window title Pi Desktop, and identifier are all temporary pre-release names; their unification is NOT decided here and waits for the 10/11 decision. BRIDGE ROUND: Builder wired in main.rs and handlers real, but the frontend bundler is not added yet, so no distributable build exists yet.
+
+
+## Live session round 2026-11-04 (OpenRouter free channel, tin 4528/4542)
+
+Channel decision: ZC Leader tin 4528, SD Leader tin 4542 confirmed: the
+live session phase uses the OpenRouter free route as in the CLI, unless SD
+Leader proposes a separate channel with reasons. No separate channel was
+proposed, so this round uses OpenRouter only. The Sen name decision stays
+on the 10/11 milestone: window title stays "Pi Desktop" (temporary) and
+productName stays "Sen Desktop", both untouched in this round.
+
+What was built (core owns the SDK, bridge owns transport, client owns
+order + guards; only packages/core imports the Pi SDK, per prep B-2
+section 3 point 4):
+- packages/core/src/model-channel.ts (new): OpenRouter channel. Provider
+  always "openrouter". Model id always caller-supplied, exact catalog
+  lookup, empty or unknown id refuses, no fuzzy match, no
+  first-available, no default id stored anywhere. Key only from the
+  OPENROUTER_API_KEY environment variable at runtime (or an explicit
+  caller key in tests); credential store is in-memory, so the runtime
+  never reads ~/.pi/agent/auth.json and never writes a credential file.
+  Runtime creation makes no network call (builtin static catalog only,
+  refreshOnCreate false, allowModelNetwork false). A listing helper
+  returns :free ids for inspection only, never for selection.
+- packages/core/src/agent-session.ts (extended): createLiveSenAgentSession
+  requires BOTH an explicit model runtime AND an explicitly resolved
+  model, then calls createAgentSession with model + noTools "all".
+  Missing either refuses. The older createSenAgentSession is untouched.
+- packages/core/src/live-session.ts (new): startOpenRouterLiveSession.
+  Local Running record first, then runtime + explicit model, then SDK
+  session creation (no model call at creation), then bind, then a raw-log
+  line carrying provider + model id only (key never logged). On failure
+  after the local record, the local state moves to Failed (allowed
+  Running transition) and the error rethrows untouched, so no fake
+  Running-with-handle record survives.
+- apps/desktop/src/ipc/live-client.ts (new): attachLiveSession and
+  closeLiveSession. Handle factory first (a factory failure refuses
+  before any backend call and before any local record), then backend +
+  local record via createSession, then bind, then backend subscribe,
+  then event subscribe (message_start / message_update / message_end
+  pass through untouched to onEvent). Close unsubscribes first, then
+  the existing abort path (backend Cancelled + SDK abort + dispose +
+  local Cancelled).
+- Tests: packages/core/tests/live-session.test.ts (8 tests),
+  packages/core/tests/live-smoke.test.ts (env-gated, see below),
+  apps/desktop/tests/live-client.test.ts (5 tests). Root package.json
+  gains test:live, test:live-client, test:live-smoke scripts and a
+  live-round description. READMEs updated to the live-round status.
+  packages/core/src/index.ts is untouched on purpose: the live modules
+  are imported directly, like agent-session.ts, so the install-free logic
+  test keeps working. packages/providers is untouched on purpose: it
+  stays a declaration shell, and the live channel lives in core because
+  only core may import the SDK.
+
+Evidence, producer-run (independent verification still owed):
+- logic: 6 pass, 0 fail (node --test packages/core/tests/logic.test.ts).
+- sdk-wiring: 4 pass, 0 fail (node --test
+  packages/core/tests/sdk-wiring.test.ts, import real 1.5.0, guard intact).
+- bridge: 11 pass, 0 fail (node --test apps/desktop/tests/bridge.test.ts).
+- live-session: 8 pass, 0 fail (node --test
+  packages/core/tests/live-session.test.ts: key refusal, offline runtime
+  build, exact model resolution, creation refusal without runtime/model,
+  real SDK session creation with an explicit model and temp agentDir
+  (subscribe + dispose only, no steer, so no network call), bind +
+  key-never-logged, failure leaves Failed with no bound handle, stream
+  event order passthrough).
+- live-client: 5 pass, 0 fail (node --test
+  apps/desktop/tests/live-client.test.ts: factory failure before
+  transport, success binds + streams in order, close unsubscribes then
+  aborts to Cancelled, backend failure disposes the handle, tool call
+  still refused).
+- live smoke: SKIPPED with reason (node --test
+  packages/core/tests/live-smoke.test.ts prints the skip line and passes
+  1/1 as a skip marker): OPENROUTER_API_KEY is not set in this
+  environment and SEN_LIVE_SMOKE_MODEL is not set either, so no network
+  call was made, no result was faked, no key was borrowed or created.
+  This skip must be reported as skipped in the handover, never as a
+  passed live run. The smoke runs for real only when the operator sets
+  both variables at runtime.
+- registry Rust: 8 pass, 0 fail (rustc --test standalone, unchanged
+  from the bridge round); all 6 .rs files parse via rustfmt --emit
+  stdout; cargo metadata --locked exit 0 (tauri 2.12.5).
+- Before this round, a probe (not part of the bundle) verified against
+  the installed SDK 1.5.0: ModelRuntime.create with an in-memory store
+  + modelsPath null + refreshOnCreate false works with no network;
+  openrouter provider present with 388 catalog models, 13 :free ids
+  including cohere/north-mini-code:free; unknown model id resolves to
+  undefined (exact lookup, no fuzzy fallback); a real session creates
+  headless with an explicit model + temp agentDir and disposes cleanly.
+
+Still open, stated plainly: full cargo check was NOT run on this box
+in this round (only cargo metadata --locked + rustfmt parse, both
+above). The known blocker from earlier rounds is the system-library
+block (gdk-sys build script: gdk-3.0 not found), and the new branch
+still needs cargo check --locked green on the Leader VM before merge.
+The tauri wrapper files are parse-checked only here, not
+compile-checked; the registry logic IS test-verified. Live smoke with a real free model is still unrun (no key
+in this environment) and belongs to the verification step on a box where
+the operator supplies OPENROUTER_API_KEY + an explicit model id at
+runtime. Frontend bundler still missing, so no distributable build
+exists yet. UI shell (main.ts, index.html) still a stub shell. Gate
+execute step and permission layer still stubs, so no tool runs for real
+even on a live session. The known abort edge from the bridge round is
+unchanged: if the SDK abort throws after the backend already cancelled,
+the local transition is skipped, and reconciling that still needs the
+status query command from a later phase. Temp icon still in place,
+rustfmt formatting cleanup still deferred (files parse, not
+format-clean), Sen name decision still on 10/11. No PR opened from here;
+the Leader pushes and opens the separate PR after independent
+verification. This is producer evidence only, NOT independent verification.
