@@ -8,9 +8,13 @@
 // NO DEFAULT MODEL: per message 4070 the frame has no default model, no key,
 // no network call. The SDK's own defaults would resolve a model from the
 // user's ~/.pi/agent settings and auth files, so this wrapper REFUSES to call
-// the SDK without an explicitly provided model runtime. A live session
-// therefore needs a feature-time free channel decision; this round wires the
-// call path and proves the import, it does not open a live session.
+// the SDK without an explicitly provided model runtime. LIVE SESSION ROUND
+// (tin 4528/4542): the free channel decision is now OpenRouter free; the
+// channel is built in ./model-channel.ts (in-memory credential store, key
+// only from the OPENROUTER_API_KEY environment variable) and live sessions
+// are started in ./live-session.ts. The guard below is unchanged, and a
+// live session additionally requires an explicitly resolved model: no
+// runtime, no model, no session.
 // Session start default: no tools enabled (noTools "all"). Tools attach later
 // explicitly through the execution gate, never at session creation.
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
@@ -62,6 +66,52 @@ export async function createSenAgentSession(
   const result = await createAgentSession({
     modelRuntime: options.modelRuntime,
     cwd: options.cwd,
+    noTools: "all",
+  });
+  return new SenAgentSession(result.session);
+}
+
+export interface LiveSenAgentSessionOptions {
+  modelRuntime: ModelRuntime;
+  // An SDK catalog model resolved explicitly (see ./model-channel.ts).
+  // Unknown to this module by id on purpose: this wrapper never picks
+  // one, it only refuses when none is given.
+  model: unknown;
+  cwd?: string;
+  // Agent directory for the SDK session managers. When omitted, the SDK
+  // default applies; the desktop app must pass Sen's own directory at
+  // wiring time so a live session never depends on Pi defaults.
+  agentDir?: string;
+}
+
+// Creates a real live SDK session ONLY with an explicitly provided model
+// runtime AND an explicitly resolved model. Missing either refuses, so
+// the SDK can never silently resolve a model from settings, auth files,
+// or a first-available list. No tools are enabled at creation
+// (noTools "all"); the gate execute step and permission layer are later
+// phases, so no tool runs for real even on a live session.
+export async function createLiveSenAgentSession(
+  options: LiveSenAgentSessionOptions,
+): Promise<SenAgentSession> {
+  if (!options || !options.modelRuntime) {
+    throw new Error(
+      "No model channel attached: refusing to call createAgentSession " +
+        "without an explicitly provided model runtime (no default model per " +
+        "message 4070; SDK defaults would read user settings/auth files).",
+    );
+  }
+  if (!options.model) {
+    throw new Error(
+      "No model specified: refusing to create a live session without an " +
+        "explicitly resolved model (no default model per message 4070, no " +
+        "first-available fallback). Resolve a model through ./model-channel.ts first.",
+    );
+  }
+  const result = await createAgentSession({
+    modelRuntime: options.modelRuntime,
+    model: options.model as never,
+    cwd: options.cwd,
+    agentDir: options.agentDir,
     noTools: "all",
   });
   return new SenAgentSession(result.session);

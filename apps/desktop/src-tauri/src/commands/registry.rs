@@ -222,7 +222,10 @@ impl Registry {
         self.sessions.get(session_id)
     }
 
-    fn get_mut_or_unknown(&mut self, session_id: &str) -> Result<&mut SessionRecord, CommandError> {
+    fn get_mut_or_unknown(
+        &mut self,
+        session_id: &str,
+    ) -> Result<&mut SessionRecord, CommandError> {
         self.sessions.get_mut(session_id).ok_or_else(|| {
             CommandError::new(
                 ERR_UNKNOWN_SESSION,
@@ -393,14 +396,7 @@ mod tests {
         assert!(can_transition(Error, Failed));
         assert!(!can_transition(Error, Cancelled));
         for terminal in [Completed, Cancelled, Failed] {
-            for to in [
-                Running,
-                AwaitingApproval,
-                Error,
-                Completed,
-                Cancelled,
-                Failed,
-            ] {
+            for to in [Running, AwaitingApproval, Error, Completed, Cancelled, Failed] {
                 assert!(!can_transition(terminal, to));
             }
         }

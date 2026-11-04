@@ -18,9 +18,12 @@ Tauri desktop app shell for Sen Desktop.
 
 PARTIAL. The UI shell is not filled in and the frontend bundler is still
 missing, but the Tauri Builder is wired and the real invoke call is
-implemented (bridge round). Tauri version 2 is decided per Telegram
+implemented (bridge round), and the live session attach is implemented
+(live round, src/ipc/live-client.ts): a core-built handle binds through
+the bridge, stream events flow through the handle subscribe, and close
+unsubscribes then aborts. Tauri version 2 is decided per Telegram
 message 4070; the remaining stub status is about missing UI and bundler,
-not about an undecided version.
+not about an undecided version. Tool execution is still refused.
 
 ## Names: temporary until the 10/11 decision
 
