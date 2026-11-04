@@ -1,28 +1,28 @@
-# Checklist for wiring Pi SDK 1.3.0 - scaffold B-2 status
+# Checklist for wiring Pi SDK latest-upstream (1.5.0) - scaffold B-2 status
 
 Source: prep B-2 section 3. The status below is the real status of this
 local bundle, not the desired status.
 
-- [ ] 1. Pin exactly 1.3.0 for both packages: RECORDED in
+- [ ] 1. Follow latest-upstream (1.5.0) for both packages: RECORDED in
   packages/core/package.json AND in pnpm-lock.yaml (specifier 1.3.0,
-  resolved 1.3.0). Installed in a scratch copy only for the lockfile;
+  resolved 1.3.0; bản ghi: vòng này dùng 1.3.0; quy tắc hiện tại là latest-upstream). Installed in a scratch copy only for the lockfile;
   node_modules is NOT part of the bundle. Registry re-checked during the
-  install round: both packages exist at 1.3.0.
+  install round: both packages exist at 1.3.0 (bản ghi: vòng này dùng 1.3.0; quy tắc hiện tại là latest-upstream).
 - [ ] 2. MIT license for both packages: RECORDED in package.json;
   CONFIRMED on the npm registry and in the installed package.json files
-  (both packages: version 1.3.0, license MIT) during the install round.
+  (both packages: version 1.3.0, license MIT; bản ghi: vòng này dùng 1.3.0; quy tắc hiện tại là latest-upstream) during the install round.
 - [ ] 3. apps/desktop ESM-only: type module RECORDED; NOT CHECKED by a
   build yet because the Tauri app is still a stub.
 - [x] 4. packages/core wraps createAgentSession: DONE in the fill-in round
   (messages 4128/4138). packages/core/src/agent-session.ts imports
-  createAgentSession from @earendil-works/pi-coding-agent 1.3.0 for real
+  createAgentSession from @earendil-works/pi-coding-agent 1.3.0 (bản ghi: vòng này dùng 1.3.0; quy tắc hiện tại là latest-upstream) for real
   (NOT from pi-agent-core, which does not export it). The wrapper requires
   an explicitly provided model runtime and refuses without one: no default
   model per message 4070, no key, no network call, no live session yet.
   SessionManager binds an SDK handle through bindSdkSession(); the local
   statechart is unchanged. Wiring test: packages/core/tests/sdk-wiring.test.ts
   (runs after pnpm install; the default test script stays install-free).
-- [ ] 5. packages/providers locks the Pi version: constant 1.3.0
+- [ ] 5. packages/providers locks the Pi version: constant 1.3.0 (bản ghi: vòng này dùng 1.3.0; quy tắc hiện tại là latest-upstream)
   RECORDED; ModelRuntime NOT FILLED IN; default model NONE per decision
   message 4070; providers is only a channel-declaration shell.
 - [ ] 6. packages/tools permission layer: tool_call hook frame EXISTS;
@@ -44,7 +44,7 @@ local bundle, not the desired status.
   docs and comments are prohibitions, not usage.
 
 Stop conditions, per prep section 3: stop at once if the SDK version is
-not 1.3.0, the license is not MIT, a shortcut path outside the gate
+not latest-upstream (1.5.0), the license is not MIT, a shortcut path outside the gate
 exists, the raw log is missing, cua-driver is requested before the Z Red
 gate on 10/11, or iOS is requested before a new decision. After two
 failures at the same step, stop and re-plan.
@@ -53,6 +53,6 @@ Points A1-A4: A1 missing log means FAIL, recorded in the bridge. A2 model
 calls only serve the default display, switched OFF; NO REAL off-switch
 mechanism yet. A3 third-party gates and runtimes banned, NOT CHECKED. A4
 per-shift token budget report with a separate auxiliary-call column, NOT
-HERE. Open condition A1-A4: whether Pi SDK 1.3.0 has auxiliary calls of
+HERE. Open condition A1-A4: whether Pi SDK latest-upstream (1.5.0) has auxiliary calls of
 this kind is NOT VERIFIED (the install round verified exports only, not
-call behavior).
+call behavior; bản ghi: vòng này dùng 1.3.0; quy tắc hiện tại là latest-upstream).
