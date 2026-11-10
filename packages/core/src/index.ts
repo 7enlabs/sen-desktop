@@ -1,7 +1,8 @@
-// Entry point of packages/core. Only this package may import the Pi SDK, per
-// prep B-2 section 3 point 4. The real SDK import lives in
-// ./agent-session.ts (not re-exported here, so the install-free smoke
-// import keeps working); it loads by direct import after pnpm install.
+// Entry point of packages/core. SDK move (tin 9328/9459): the Pi SDK is
+// out of this package — no Pi import lives here anymore. The model runs
+// in the backend through the CLI core + stream-json bridge. This package
+// keeps the session statechart, raw log, execution gate, token
+// economizer, and paths.
 export { SessionManager, canTransition } from "./session.ts";
 export type { SessionState } from "./session.ts";
 export { RawLog } from "./raw-log.ts";

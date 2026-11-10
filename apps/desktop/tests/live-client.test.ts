@@ -1,15 +1,18 @@
-// Live client tests for the live session round (tin 4528/4542).
+// Live client tests for the SDK move (tin 9328/9459).
 // Run with: node --test apps/desktop/tests/live-client.test.ts
 // (Node 24 runs .ts files directly through type stripping; no build step.)
 // The injected transport stands in for the Rust handlers, which cannot run
-// under node, and the injected handle factory stands in for the core live
-// session builder. These tests prove the frontend half of the live round:
-// a factory failure refuses before any backend call, the success path
-// binds the handle and streams events in order, close unsubscribes then
-// aborts, a backend failure disposes the handle, and tool execution is
-// still refused. They do NOT prove the Rust handlers run or a real model
-// answers: that evidence is the core live-session suite, the standalone
-// registry tests, cargo check on the Leader VM, and the env-gated smoke.
+// under node. These tests prove the frontend half of the IPC-only live
+// round: attach creates the backend + local record and subscribes, close
+// aborts through the backend, steer/followUp are pure IPC whose backend
+// refusal (MODEL_NOT_WIRED until the CLI bridge lands) surfaces untouched
+// with the local state still Running, and tool execution is still refused.
+// The old BUG-05/BUG-06 tests (SDK abort/steer throwing after the backend
+// ack) are gone with the SDK handle they tested: there is no SDK abort or
+// steer in the webview anymore, so those failure modes have no subject.
+// They do NOT prove the Rust handlers run or a real model answers: that
+// evidence is the standalone registry tests, cargo check on the Leader VM,
+// and the CLI bridge phase.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
@@ -39,35 +42,6 @@ function contract(): ActionContract {
   };
 }
 
-function fakeHandle() {
-  const calls: string[] = [];
-  const handle = {
-    calls,
-    steer: async (text: string) => {
-      calls.push("steer:" + text);
-    },
-    followUp: async (text: string) => {
-      calls.push("followUp:" + text);
-    },
-    abort: async () => {
-      calls.push("abort");
-    },
-    subscribe: (listener: (event: unknown) => void) => {
-      calls.push("subscribe");
-      listener({ type: "message_start" });
-      listener({ type: "message_update", delta: "hi" });
-      listener({ type: "message_end" });
-      return () => {
-        calls.push("unsubscribe");
-      };
-    },
-    dispose: () => {
-      calls.push("dispose");
-    },
-  };
-  return handle;
-}
-
 function liveTransport() {
   const calls: string[] = [];
   setBridgeTransport(async (command, args) => {
@@ -87,236 +61,157 @@ function liveTransport() {
   return calls;
 }
 
-test("live-client attach: factory failure refuses before any backend call", async () => {
-  const calls: string[] = [];
-  setBridgeTransport(async (command) => {
-    calls.push(command);
-    return {};
-  });
-  const manager = new SessionManager();
-  await assert.rejects(
-    () =>
-      attachLiveSession(manager, contract(), "s1", {
-        createHandle: async () => {
-          throw new Error("No model channel attached: no live session");
-        },
-      }),
-    /No model channel attached/,
-  );
-  assert.deepEqual(calls, []);
-  assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
-  setBridgeTransport(null);
-});
-
-test("live-client attach: success binds the handle and streams events in order", async () => {
+test("live-client attach: success creates the backend + local record and subscribes", async () => {
   const transportCalls = liveTransport();
-  const events: unknown[] = [];
   const manager = new SessionManager();
-  const handle = fakeHandle();
-  const attached = await attachLiveSession(manager, contract(), "s1", {
-    createHandle: async () => handle as never,
-    onEvent: (event) => {
-      events.push(event);
-    },
-  });
+  const attached = await attachLiveSession(manager, contract(), "s1");
   assert.equal(attached.sessionId, "s1");
   assert.equal(attached.state, "Running");
   assert.equal(attached.subscriberId, 7);
-  assert.equal(manager.getSdkSession("s1"), handle);
   assert.deepEqual(transportCalls, [
     "sen_session_create",
     "sen_events_subscribe",
   ]);
-  assert.deepEqual(events, [
-    { type: "message_start" },
-    { type: "message_update", delta: "hi" },
-    { type: "message_end" },
-  ]);
-  assert.deepEqual(handle.calls, ["subscribe"]);
+  // The local record is the create only: no SDK bind, no live start.
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub"],
+  );
+  // The session is Running and accepts the Cancelled transition.
+  assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
   setBridgeTransport(null);
 });
 
-test("live-client close: unsubscribe first, then backend + SDK abort + local Cancelled", async () => {
+test("live-client attach: backend failure leaves no local record", async () => {
+  setBridgeTransport(async () => {
+    throw new Error("backend down");
+  });
+  const manager = new SessionManager();
+  await assert.rejects(
+    () => attachLiveSession(manager, contract(), "s1"),
+    /backend down/,
+  );
+  assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
+  setBridgeTransport(null);
+});
+
+test("live-client close: backend + local Cancelled through the IPC bridge", async () => {
   const transportCalls = liveTransport();
   const manager = new SessionManager();
-  const handle = fakeHandle();
-  const attached = await attachLiveSession(manager, contract(), "s1", {
-    createHandle: async () => handle as never,
-  });
-  const res = await closeLiveSession(manager, attached, contract(), "s1");
+  const attached = await attachLiveSession(manager, contract(), "s1");
+  const res = await closeLiveSession(manager, contract(), "s1");
   assert.deepEqual(res, { sessionId: "s1", state: "Cancelled" });
   assert.deepEqual(transportCalls, [
     "sen_session_create",
     "sen_events_subscribe",
     "sen_session_abort",
   ]);
-  assert.deepEqual(handle.calls, [
-    "subscribe",
-    "unsubscribe",
-    "abort",
-    "dispose",
+  assert.equal(attached.sessionId, "s1");
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  setBridgeTransport(null);
+});
+
+test("live-client close: a session that was never created refuses, no local record invented", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  await assert.rejects(
+    () => closeLiveSession(manager, contract(), "s1"),
+    /does not exist/,
+  );
+  assert.deepEqual(transportCalls, ["sen_session_abort"]);
+  assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
+  setBridgeTransport(null);
+});
+
+test("live-client steer/followUp: pure IPC, backend ack returned, local stays Running", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  await attachLiveSession(manager, contract(), "s1");
+  const steered = await steerSession(contract(), "s1", "hi");
+  assert.deepEqual(steered, { sessionId: "s1", state: "Running" });
+  const followed = await followUpSession(contract(), "s1", "again");
+  assert.deepEqual(followed, { sessionId: "s1", state: "Running" });
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "sen_session_steer",
+    "sen_session_follow_up",
+  ]);
+  // No local state was recorded for the steers: the session is still
+  // Running and accepts the Cancelled transition.
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub"],
+  );
+  assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
+  setBridgeTransport(null);
+});
+
+test("live-client steer: backend MODEL_NOT_WIRED refusal surfaces, local stays Running", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  await attachLiveSession(manager, contract(), "s1");
+  // The backend refuses until the CLI bridge lands. The refusal must
+  // surface untouched — never a fake success — and the local session
+  // must stay Running: no steer ran, so no Failed transition is recorded
+  // and no steer intent sits in the backend log.
+  setBridgeTransport(async (command, args) => {
+    transportCalls.push(command);
+    const a = args as { session_id?: string };
+    if (command === "sen_session_steer") {
+      throw new Error(
+        "MODEL_NOT_WIRED: the CLI core + stream-json bridge lands in a later phase, no model call ran.",
+      );
+    }
+    return { sessionId: a.session_id, state: "Running" };
+  });
+  await assert.rejects(
+    () => steerSession(contract(), "s1", "hi"),
+    /MODEL_NOT_WIRED/,
+  );
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub"],
+  );
+  assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
+  setBridgeTransport(null);
+});
+
+test("live-client abort: pure IPC, backend + local Cancelled", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  await attachLiveSession(manager, contract(), "s1");
+  const res = await abortSession(manager, contract(), "s1");
+  assert.deepEqual(res, { sessionId: "s1", state: "Cancelled" });
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "sen_session_abort",
   ]);
   assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
   setBridgeTransport(null);
 });
 
-test("live-client attach: backend failure disposes the handle, no local record", async () => {
-  setBridgeTransport(async () => {
-    throw new Error("backend down");
-  });
+test("live-client abort: backend refusal surfaces, local stays Running", async () => {
+  const transportCalls = liveTransport();
   const manager = new SessionManager();
-  const handle = fakeHandle();
+  await attachLiveSession(manager, contract(), "s1");
+  setBridgeTransport(async (command, args) => {
+    transportCalls.push(command);
+    const a = args as { session_id?: string };
+    if (command === "sen_session_abort") {
+      throw new Error("backend down");
+    }
+    return { sessionId: a.session_id, state: "Running" };
+  });
   await assert.rejects(
-    () =>
-      attachLiveSession(manager, contract(), "s1", {
-        createHandle: async () => handle as never,
-      }),
+    () => abortSession(manager, contract(), "s1"),
     /backend down/,
   );
-  assert.deepEqual(handle.calls, ["dispose"]);
-  assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
-  setBridgeTransport(null);
-});
-
-test("live-client abort: SDK abort throws, dispose still runs and local still Cancelled, error surfaces (BUG-05)", async () => {
-  const transportCalls = liveTransport();
-  const manager = new SessionManager();
-  manager.create("s1");
-  const calls: string[] = [];
-  const handle = {
-    abort: async () => {
-      calls.push("abort");
-      throw new Error("SDK abort exploded");
-    },
-    dispose: () => {
-      calls.push("dispose");
-    },
-  };
-  manager.bindSdkSession("s1", handle as never);
-  await assert.rejects(
-    () => abortSession(manager, handle as never, contract(), "s1"),
-    /SDK abort exploded/,
-  );
-  // Dispose ran despite the throwing abort, and local followed the
-  // backend ack to Cancelled instead of staying Running.
-  assert.deepEqual(calls, ["abort", "dispose"]);
-  assert.deepEqual(
-    manager.rawLog.eventsFor("s1").map((event) => event.kind),
-    ["session_create_stub", "session_sdk_bound", "session_transition"],
-  );
-  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
-  assert.deepEqual(transportCalls, ["sen_session_abort"]);
-  setBridgeTransport(null);
-});
-
-test("live-client abort: dispose throws after a clean abort, local still Cancelled, error surfaces (BUG-05)", async () => {
-  const transportCalls = liveTransport();
-  const manager = new SessionManager();
-  manager.create("s1");
-  const calls: string[] = [];
-  const handle = {
-    abort: async () => {
-      calls.push("abort");
-    },
-    dispose: () => {
-      calls.push("dispose");
-      throw new Error("SDK dispose exploded");
-    },
-  };
-  manager.bindSdkSession("s1", handle as never);
-  await assert.rejects(
-    () => abortSession(manager, handle as never, contract(), "s1"),
-    /SDK dispose exploded/,
-  );
-  assert.deepEqual(calls, ["abort", "dispose"]);
-  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
-  assert.deepEqual(transportCalls, ["sen_session_abort"]);
-  setBridgeTransport(null);
-});
-
-
-test("live-client steer: SDK steer throws after backend ack, local goes Failed, error surfaces (BUG-06)", async () => {
-  const transportCalls = liveTransport();
-  const manager = new SessionManager();
-  manager.create("s1");
-  const calls: string[] = [];
-  const handle = {
-    steer: async () => {
-      calls.push("steer");
-      throw new Error("model call failed");
-    },
-    followUp: async () => {
-      calls.push("followUp");
-    },
-    abort: async () => {
-      calls.push("abort");
-    },
-    dispose: () => {
-      calls.push("dispose");
-    },
-  };
-  manager.bindSdkSession("s1", handle as never);
-  await assert.rejects(
-    () => steerSession(manager, handle as never, contract(), "s1", "hi"),
-    /model call failed/,
-  );
-  // The backend acked first, so the SDK error is the only signal the
-  // steer did not run: local must record it as Failed, not stay Running.
-  assert.deepEqual(calls, ["steer"]);
-  assert.deepEqual(
-    manager.rawLog.eventsFor("s1").map((event) => event.kind),
-    ["session_create_stub", "session_sdk_bound", "session_transition"],
-  );
-  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
-  assert.deepEqual(transportCalls, ["sen_session_steer"]);
-  setBridgeTransport(null);
-});
-
-test("live-client followUp: SDK followUp throws after backend ack, local goes Failed, error surfaces (BUG-06)", async () => {
-  const transportCalls = liveTransport();
-  const manager = new SessionManager();
-  manager.create("s1");
-  const handle = {
-    steer: async () => {},
-    followUp: async () => {
-      throw new Error("model call failed");
-    },
-    abort: async () => {},
-    dispose: () => {},
-  };
-  manager.bindSdkSession("s1", handle as never);
-  await assert.rejects(
-    () => followUpSession(manager, handle as never, contract(), "s1", "hi"),
-    /model call failed/,
-  );
-  assert.deepEqual(
-    manager.rawLog.eventsFor("s1").map((event) => event.kind),
-    ["session_create_stub", "session_sdk_bound", "session_transition"],
-  );
-  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
-  assert.deepEqual(transportCalls, ["sen_session_follow_up"]);
-  setBridgeTransport(null);
-});
-
-test("live-client steer: success path unchanged, local stays Running (BUG-06)", async () => {
-  const transportCalls = liveTransport();
-  const manager = new SessionManager();
-  manager.create("s1");
-  const handle = fakeHandle();
-  manager.bindSdkSession("s1", handle as never);
-  const res = await steerSession(manager, handle as never, contract(), "s1", "hi");
-  assert.deepEqual(res, { sessionId: "s1", state: "Running" });
-  assert.deepEqual(handle.calls, ["steer:hi"]);
-  assert.deepEqual(
-    manager.rawLog.eventsFor("s1").map((event) => event.kind),
-    ["session_create_stub", "session_sdk_bound"],
-  );
-  // Local was still Running: it accepts the Cancelled transition.
+  // The refusal left the local session Running: it still transitions.
   assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
-  assert.deepEqual(transportCalls, ["sen_session_steer"]);
   setBridgeTransport(null);
 });
-
 
 test("live-client: tool execution is still refused in the live phase", async () => {
   setBridgeTransport(async () => {
@@ -326,78 +221,5 @@ test("live-client: tool execution is still refused in the live phase", async () 
     () => callTool(contract(), "my-tool"),
     /TOOL_EXECUTION_NOT_WIRED/,
   );
-  setBridgeTransport(null);
-});
-
-function fakeLiveSession(
-  manager: SessionManager,
-  handle: ReturnType<typeof fakeHandle>,
-  backendRegistered: boolean,
-) {
-  return {
-    manager,
-    handle: handle as never,
-    sessionId: "s1",
-    providerId: "openrouter",
-    modelId: "cohere/north-mini-code:free",
-    backendRegistered,
-  };
-}
-
-test("live-client attach: backend-registered LiveSession from the same manager skips sen_session_create", async () => {
-  const transportCalls = liveTransport();
-  const manager = new SessionManager();
-  const handle = fakeHandle();
-  // Mirrors what startOpenRouterLiveSession already did with its hook:
-  // local record exists and the handle is bound in this same manager.
-  manager.create("s1");
-  manager.bindSdkSession("s1", handle as never);
-  const attached = await attachLiveSession(manager, contract(), "s1", {
-    createHandle: async () => fakeLiveSession(manager, handle, true),
-  });
-  assert.equal(attached.state, "Running");
-  assert.equal(attached.subscriberId, 7);
-  assert.deepEqual(transportCalls, ["sen_events_subscribe"]);
-  assert.equal(manager.getSdkSession("s1"), handle);
-  setBridgeTransport(null);
-});
-
-test("live-client attach: LiveSession from a different manager refuses, no backend call", async () => {
-  const transportCalls: string[] = [];
-  setBridgeTransport(async (command) => {
-    transportCalls.push(command);
-    return {};
-  });
-  const managerA = new SessionManager();
-  const managerB = new SessionManager();
-  const handle = fakeHandle();
-  managerA.create("s1");
-  managerA.bindSdkSession("s1", handle as never);
-  await assert.rejects(
-    () =>
-      attachLiveSession(managerB, contract(), "s1", {
-        createHandle: async () => fakeLiveSession(managerA, handle, true),
-      }),
-    /different SessionManager/,
-  );
-  assert.deepEqual(transportCalls, []);
-  assert.deepEqual(handle.calls, ["dispose"]);
-  assert.equal(managerB.getSdkSession("s1"), undefined);
-  setBridgeTransport(null);
-});
-
-test("live-client attach: unregistered LiveSession takes the backend-first path", async () => {
-  const transportCalls = liveTransport();
-  const manager = new SessionManager();
-  const handle = fakeHandle();
-  const attached = await attachLiveSession(manager, contract(), "s1", {
-    createHandle: async () => fakeLiveSession(manager, handle, false),
-  });
-  assert.equal(attached.state, "Running");
-  assert.deepEqual(transportCalls, [
-    "sen_session_create",
-    "sen_events_subscribe",
-  ]);
-  assert.equal(manager.getSdkSession("s1"), handle);
   setBridgeTransport(null);
 });

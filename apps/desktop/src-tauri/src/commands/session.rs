@@ -2,11 +2,11 @@
 // Thin wrappers only: they convert wire args and delegate to
 // commands/registry.rs, which owns the statechart, the contract check and
 // the record. No session logic lives here.
-// The backend never calls the Pi SDK and never holds a model, a key, or a
-// network call. A backend record with no SDK session bound is the designed
-// intermediate state; the SDK session itself lives in the frontend webview
-// (packages/core) and is created only with an explicitly provided model
-// runtime, which this phase deliberately has none.
+// The backend never calls the Pi SDK and never holds a key. The model
+// runs in the backend through the CLI core + stream-json bridge (a later
+// phase); until then steer/follow_up are refused by the registry with
+// MODEL_NOT_WIRED. A backend record with no model runtime is the
+// designed intermediate state in this phase.
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::State;
@@ -82,9 +82,9 @@ pub fn sen_session_create(
     Ok(result(&session_id, next))
 }
 
-/// sen_session_steer: gates on a Running session and records the intent.
-/// The real SDK steer call happens in the frontend after this ack, only
-/// when a model runtime is bound there.
+/// sen_session_steer: gates on a Running session. The model call runs in
+/// the backend once the CLI bridge lands; until then the registry refuses
+/// with MODEL_NOT_WIRED and no intent is recorded.
 #[tauri::command]
 pub fn sen_session_steer(
     state: State<'_, Mutex<Registry>>,
@@ -99,7 +99,8 @@ pub fn sen_session_steer(
     Ok(result(&session_id, next))
 }
 
-/// sen_session_follow_up: same gate as steer, recorded as follow_up.
+/// sen_session_follow_up: same gate as steer; refused with
+/// MODEL_NOT_WIRED until the CLI bridge lands.
 #[tauri::command]
 pub fn sen_session_follow_up(
     state: State<'_, Mutex<Registry>>,

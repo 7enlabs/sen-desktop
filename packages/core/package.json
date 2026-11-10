@@ -1,12 +1,1 @@
-{
-  "dependencies": {
-    "@earendil-works/pi-agent-core": "1.5.0",
-    "@earendil-works/pi-coding-agent": "1.5.0"
-  },
-  "description": "Wraps createAgentSession, SessionManager, Sen session coordination. Pi coding agent 1.5.0 per tin 4178, pi-agent-core 1.5.0 per tin 4212, MIT license per prep B-2 section 3.",
-  "license": "MIT",
-  "name": "@sen/core",
-  "private": true,
-  "type": "module",
-  "version": "0.0.0"
-}
+{"description":"SessionManager statechart, raw log, execution gate, token economizer, Sen session coordination. No Pi SDK: the model runs in the backend through the CLI core + stream-json bridge (tin 9328/9459).","license":"MIT","name":"@sen/core","private":true,"type":"module","version":"0.0.0"}
