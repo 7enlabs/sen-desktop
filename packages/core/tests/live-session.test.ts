@@ -161,6 +161,85 @@ test("startOpenRouterLiveSession failure leaves local state Failed, never a boun
   assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
 });
 
+test("startOpenRouterLiveSession with registerBackendSession registers the backend record before binding", async () => {
+  const dirs = await tempDirs();
+  const manager = new SessionManager();
+  const hookCalls: string[] = [];
+  let boundAtHookTime: boolean | undefined;
+  const live = await startOpenRouterLiveSession({
+    sessionId: "s1",
+    modelId: TEST_MODEL_ID,
+    apiKey: "test-key-not-real-3",
+    cwd: dirs.cwd,
+    agentDir: dirs.agentDir,
+    manager,
+    // Stands in for the desktop createSession: backend ack first, then
+    // the local record in this same manager.
+    registerBackendSession: async (id) => {
+      hookCalls.push("backend:" + id);
+      boundAtHookTime = manager.getSdkSession(id) !== undefined;
+      manager.create(id);
+    },
+  });
+  assert.equal(live.backendRegistered, true);
+  assert.deepEqual(hookCalls, ["backend:s1"]);
+  // The hook ran before the bind: no handle was bound when it ran.
+  assert.equal(boundAtHookTime, false);
+  assert.equal(manager.getSdkSession("s1"), live.handle);
+  const kinds = manager.rawLog.eventsFor("s1").map((event) => event.kind);
+  assert.deepEqual(kinds, [
+    "session_create_stub",
+    "session_sdk_bound",
+    "session_live_started",
+  ]);
+  live.handle.dispose();
+});
+
+test("startOpenRouterLiveSession refuses a duplicate id before any backend call", async () => {
+  const dirs = await tempDirs();
+  const manager = new SessionManager();
+  let hookCalls = 0;
+  const start = () =>
+    startOpenRouterLiveSession({
+      sessionId: "s1",
+      modelId: TEST_MODEL_ID,
+      apiKey: "test-key-not-real",
+      cwd: dirs.cwd,
+      agentDir: dirs.agentDir,
+      manager,
+      registerBackendSession: async (id) => {
+        hookCalls += 1;
+        manager.create(id);
+      },
+    });
+  const first = await start();
+  await assert.rejects(() => start(), /Duplicate live session/);
+  assert.equal(hookCalls, 1);
+  first.handle.dispose();
+});
+
+test("startOpenRouterLiveSession backend failure binds nothing and leaves no local record", async () => {
+  const dirs = await tempDirs();
+  const manager = new SessionManager();
+  await assert.rejects(
+    () =>
+      startOpenRouterLiveSession({
+        sessionId: "s1",
+        modelId: TEST_MODEL_ID,
+        apiKey: "test-key-not-real",
+        cwd: dirs.cwd,
+        agentDir: dirs.agentDir,
+        manager,
+        registerBackendSession: async () => {
+          throw new Error("backend down");
+        },
+      }),
+    /backend down/,
+  );
+  assert.equal(manager.getSdkSession("s1"), undefined);
+  assert.equal(manager.hasSession("s1"), false);
+});
+
 test("SenAgentSession subscribe forwards stream events in order", () => {
   const received: unknown[] = [];
   const fake = {
