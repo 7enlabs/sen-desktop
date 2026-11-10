@@ -14,7 +14,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import type { ActionContract } from "../src/ipc/types.ts";
-import { abortSession, callTool } from "../src/ipc/session-client.ts";
+import { abortSession, callTool, followUpSession, steerSession } from "../src/ipc/session-client.ts";
 import {
   attachLiveSession,
   closeLiveSession,
@@ -233,6 +233,90 @@ test("live-client abort: dispose throws after a clean abort, local still Cancell
   assert.deepEqual(transportCalls, ["sen_session_abort"]);
   setBridgeTransport(null);
 });
+
+
+test("live-client steer: SDK steer throws after backend ack, local goes Failed, error surfaces (BUG-06)", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  manager.create("s1");
+  const calls: string[] = [];
+  const handle = {
+    steer: async () => {
+      calls.push("steer");
+      throw new Error("model call failed");
+    },
+    followUp: async () => {
+      calls.push("followUp");
+    },
+    abort: async () => {
+      calls.push("abort");
+    },
+    dispose: () => {
+      calls.push("dispose");
+    },
+  };
+  manager.bindSdkSession("s1", handle as never);
+  await assert.rejects(
+    () => steerSession(manager, handle as never, contract(), "s1", "hi"),
+    /model call failed/,
+  );
+  // The backend acked first, so the SDK error is the only signal the
+  // steer did not run: local must record it as Failed, not stay Running.
+  assert.deepEqual(calls, ["steer"]);
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub", "session_sdk_bound", "session_transition"],
+  );
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  assert.deepEqual(transportCalls, ["sen_session_steer"]);
+  setBridgeTransport(null);
+});
+
+test("live-client followUp: SDK followUp throws after backend ack, local goes Failed, error surfaces (BUG-06)", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  manager.create("s1");
+  const handle = {
+    steer: async () => {},
+    followUp: async () => {
+      throw new Error("model call failed");
+    },
+    abort: async () => {},
+    dispose: () => {},
+  };
+  manager.bindSdkSession("s1", handle as never);
+  await assert.rejects(
+    () => followUpSession(manager, handle as never, contract(), "s1", "hi"),
+    /model call failed/,
+  );
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub", "session_sdk_bound", "session_transition"],
+  );
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  assert.deepEqual(transportCalls, ["sen_session_follow_up"]);
+  setBridgeTransport(null);
+});
+
+test("live-client steer: success path unchanged, local stays Running (BUG-06)", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  manager.create("s1");
+  const handle = fakeHandle();
+  manager.bindSdkSession("s1", handle as never);
+  const res = await steerSession(manager, handle as never, contract(), "s1", "hi");
+  assert.deepEqual(res, { sessionId: "s1", state: "Running" });
+  assert.deepEqual(handle.calls, ["steer:hi"]);
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub", "session_sdk_bound"],
+  );
+  // Local was still Running: it accepts the Cancelled transition.
+  assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
+  assert.deepEqual(transportCalls, ["sen_session_steer"]);
+  setBridgeTransport(null);
+});
+
 
 test("live-client: tool execution is still refused in the live phase", async () => {
   setBridgeTransport(async () => {

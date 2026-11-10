@@ -12,6 +12,14 @@
 //   SessionManager the call refuses with the same message family as the
 //   core guard, and the transport is never called. With a handle: backend
 //   gate ack, then the real SDK steer/followUp call on the handle.
+//   BUG-06: if the SDK call throws after the backend ack, the local
+//   session transitions to Failed and the SDK error is rethrown, so the
+//   failure is recorded locally instead of leaving local Running while
+//   the backend log already holds the steer intent. The backend log
+//   entry stays: it records the intent, and an ack never implied a
+//   model call happened. The remaining backend-Running vs local-Failed
+//   gap still needs a status query command, which belongs to a later
+//   phase.
 // - abort: backend transition first (the record), then the SDK abort +
 //   dispose when a handle is bound, then the local state transition.
 //   BUG-05: if the SDK abort throws after the backend already
@@ -145,7 +153,7 @@ export async function steerSession(
     text,
   });
   const res = asSessionResult(raw, sessionId);
-  await bound.steer(text);
+  await runSdkCall(manager, sessionId, () => bound.steer(text));
   return res;
 }
 
@@ -163,8 +171,35 @@ export async function followUpSession(
     text,
   });
   const res = asSessionResult(raw, sessionId);
-  await bound.followUp(text);
+  await runSdkCall(manager, sessionId, () => bound.followUp(text));
   return res;
+}
+
+// BUG-06: the backend acked the steer/follow-up (its log already holds
+// the intent) before the SDK call ran, so only this side knows the model
+// call failed. When it throws, move the local session to Failed - a
+// legal Running -> Failed transition per the point-854 statechart - and
+// rethrow the original SDK error, never a replacement. The caller still
+// learns the steer did not run, and the local record no longer pretends
+// the session is healthy Running. A transition error (local already
+// terminal from a divergence that predates this fix) must not mask the
+// SDK error: the session is already recorded terminal, so the SDK error
+// stays the reported one.
+async function runSdkCall(
+  manager: SessionManager,
+  sessionId: string,
+  run: () => Promise<void>,
+): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    try {
+      manager.transition(sessionId, "Failed");
+    } catch {
+      // Local already terminal: nothing new to record, keep the SDK error.
+    }
+    throw error;
+  }
 }
 
 export async function abortSession(
