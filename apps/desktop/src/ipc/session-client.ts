@@ -14,10 +14,13 @@
 //   gate ack, then the real SDK steer/followUp call on the handle.
 // - abort: backend transition first (the record), then the SDK abort +
 //   dispose when a handle is bound, then the local state transition.
-//   Edge, stated plainly: if the SDK abort throws after the backend
-//   already cancelled, the local transition is skipped and the local
-//   record stays Running while the backend says Cancelled. Reconciling
-//   that needs a status query command, which belongs to a later phase.
+//   BUG-05: if the SDK abort throws after the backend already
+//   cancelled, dispose still runs and the local transition still runs,
+//   so local ends Cancelled like the backend and no new divergence is
+//   created; the SDK error is then rethrown so the caller still learns
+//   the abort was not clean. There is still no status query command to
+//   reconcile a divergence that predates this fix, which belongs to a
+//   later phase.
 // - tool_call: the backend validates + gates, then refuses with
 //   TOOL_EXECUTION_NOT_WIRED (gate execute step + permission layer are
 //   later phases). The error propagates, never a fake success.
@@ -175,9 +178,31 @@ export async function abortSession(
     session_id: sessionId,
   });
   const res = asSessionResult(raw, sessionId);
+  // BUG-05: the backend already said Cancelled, so a throwing SDK abort
+  // must not skip the cleanup that follows it. Run dispose even when
+  // abort throws, run the local transition even when either throws, and
+  // only then rethrow the SDK error. The caller still learns the abort
+  // was not clean (the error is not swallowed), but local state ends
+  // Cancelled, matching the backend, instead of staying Running with a
+  // leaked handle. No backend state is invented here: the Cancelled
+  // comes from the backend ack above, not from guessing.
+  let sdkError: unknown;
+  let hasSdkError = false;
   if (handle) {
-    await handle.abort();
-    handle.dispose();
+    try {
+      await handle.abort();
+    } catch (error) {
+      sdkError = error;
+      hasSdkError = true;
+    }
+    try {
+      handle.dispose();
+    } catch (error) {
+      if (!hasSdkError) {
+        sdkError = error;
+        hasSdkError = true;
+      }
+    }
   }
   const local = manager.transition(sessionId, "Cancelled");
   if (local !== res.state) {
@@ -187,6 +212,9 @@ export async function abortSession(
         ", local " +
         local,
     );
+  }
+  if (hasSdkError) {
+    throw sdkError;
   }
   return res;
 }

@@ -14,7 +14,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import type { ActionContract } from "../src/ipc/types.ts";
-import { callTool } from "../src/ipc/session-client.ts";
+import { abortSession, callTool } from "../src/ipc/session-client.ts";
 import {
   attachLiveSession,
   closeLiveSession,
@@ -175,6 +175,62 @@ test("live-client attach: backend failure disposes the handle, no local record",
   );
   assert.deepEqual(handle.calls, ["dispose"]);
   assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
+  setBridgeTransport(null);
+});
+
+test("live-client abort: SDK abort throws, dispose still runs and local still Cancelled, error surfaces (BUG-05)", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  manager.create("s1");
+  const calls: string[] = [];
+  const handle = {
+    abort: async () => {
+      calls.push("abort");
+      throw new Error("SDK abort exploded");
+    },
+    dispose: () => {
+      calls.push("dispose");
+    },
+  };
+  manager.bindSdkSession("s1", handle as never);
+  await assert.rejects(
+    () => abortSession(manager, handle as never, contract(), "s1"),
+    /SDK abort exploded/,
+  );
+  // Dispose ran despite the throwing abort, and local followed the
+  // backend ack to Cancelled instead of staying Running.
+  assert.deepEqual(calls, ["abort", "dispose"]);
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub", "session_sdk_bound", "session_transition"],
+  );
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  assert.deepEqual(transportCalls, ["sen_session_abort"]);
+  setBridgeTransport(null);
+});
+
+test("live-client abort: dispose throws after a clean abort, local still Cancelled, error surfaces (BUG-05)", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  manager.create("s1");
+  const calls: string[] = [];
+  const handle = {
+    abort: async () => {
+      calls.push("abort");
+    },
+    dispose: () => {
+      calls.push("dispose");
+      throw new Error("SDK dispose exploded");
+    },
+  };
+  manager.bindSdkSession("s1", handle as never);
+  await assert.rejects(
+    () => abortSession(manager, handle as never, contract(), "s1"),
+    /SDK dispose exploded/,
+  );
+  assert.deepEqual(calls, ["abort", "dispose"]);
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  assert.deepEqual(transportCalls, ["sen_session_abort"]);
   setBridgeTransport(null);
 });
 
