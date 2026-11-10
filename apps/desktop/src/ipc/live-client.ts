@@ -31,6 +31,15 @@
 //   abort throws after the backend already cancelled, the local transition
 //   is skipped, and reconciling that still needs the status query command
 //   from a later phase.
+// - BUG-02 fix: the factory may now return the whole LiveSession from
+//   packages/core startOpenRouterLiveSession instead of a bare handle.
+//   When it does, attach checks the live session's manager IS this
+//   manager and refuses a different one, so two managers can no longer
+//   both own one live session. When the live session is already
+//   backend-registered (backend + local record exist), attach skips its
+//   own createSession, which would otherwise hit DUPLICATE_SESSION on
+//   the backend; it only subscribes. A bare handle still takes the old
+//   path: backend + local record first, then bind.
 // - Tool execution stays refused: this file adds no tool path, and
 //   callTool still propagates TOOL_EXECUTION_NOT_WIRED from the backend.
 import {
@@ -41,11 +50,17 @@ import {
 import type { ActionContract } from "./types.ts";
 import { SessionManager } from "../../../../packages/core/src/session.ts";
 import type { SenAgentSession } from "../../../../packages/core/src/agent-session.ts";
+import type { LiveSession } from "../../../../packages/core/src/live-session.ts";
 
 export interface LiveAttachOptions {
   // Creates the SDK handle for this session id. The app passes a factory
   // built on packages/core startOpenRouterLiveSession; tests pass a fake.
-  createHandle: (sessionId: string) => Promise<SenAgentSession>;
+  // The factory may return the whole LiveSession (with its manager) or
+  // a bare handle. A LiveSession from a different manager is refused;
+  // a backend-registered one skips createSession (see below).
+  createHandle: (
+    sessionId: string,
+  ) => Promise<SenAgentSession | LiveSession>;
   // Receives model events in emission order. Events are passed through
   // untouched; this client never interprets, filters, or rewrites them.
   onEvent?: (event: unknown) => void;
@@ -67,8 +82,38 @@ export async function attachLiveSession(
 ): Promise<AttachedLiveSession> {
   // Factory first: a failure here leaves no backend call and no local
   // record, so the guard stays intact and nothing looks live that is not.
-  const handle = await options.createHandle(sessionId);
+  const produced = await options.createHandle(sessionId);
+  const handle = isLiveSession(produced) ? produced.handle : produced;
   try {
+    if (isLiveSession(produced)) {
+      // One manager owns the session: a factory that started it under
+      // a different manager is refused loudly, never silently shared.
+      if (produced.manager !== manager) {
+        throw new Error(
+          "Live session belongs to a different SessionManager, FAIL: " +
+            "start and attach must share one manager, so one session " +
+            "has exactly one owner.",
+        );
+      }
+      if (produced.backendRegistered) {
+        // Backend + local record already exist in this manager (the
+        // hook in startOpenRouterLiveSession created them); creating
+        // them again would hit DUPLICATE_SESSION on the backend.
+        // The local record is Running by construction: createSession
+        // inside the hook refused on any backend/local mismatch.
+        const sub = await subscribeSession(contract, sessionId);
+        const unsubscribe = handle.subscribe((event) => {
+          options.onEvent?.(event);
+        });
+        return {
+          sessionId,
+          state: "Running",
+          subscriberId: sub.subscriberId,
+          handle,
+          unsubscribe,
+        };
+      }
+    }
     const created = await createSession(manager, contract, sessionId);
     manager.bindSdkSession(sessionId, handle);
     const sub = await subscribeSession(contract, sessionId);
@@ -92,6 +137,22 @@ export async function attachLiveSession(
     }
     throw error;
   }
+}
+
+// A factory result is a whole LiveSession when it carries its manager,
+// its handle, and the backend-registered flag; a bare handle (real or
+// fake) carries none of those.
+function isLiveSession(
+  value: SenAgentSession | LiveSession,
+): value is LiveSession {
+  const candidate = value as LiveSession;
+  return (
+    !!candidate &&
+    typeof candidate === "object" &&
+    "manager" in candidate &&
+    "handle" in candidate &&
+    "backendRegistered" in candidate
+  );
 }
 
 // Closes a live session: stops the event stream first, then the existing

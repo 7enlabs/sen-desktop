@@ -21,6 +21,22 @@
 //   untouched. A failed live start therefore never leaves a fake
 //   Running-with-handle record behind, and the session id is terminal,
 //   so it cannot be silently reused.
+// - BUG-02 fix: the core-only order above never touched the backend, so
+//   a live session was unknown to the backend registry and a later
+//   sen_session_steer answered UNKNOWN_SESSION. The desktop layer now
+//   passes registerBackendSession (see StartLiveSessionOptions): the
+//   hook runs after the handle exists and BEFORE the bind, and it
+//   creates the backend record first, then the local record in this
+//   same manager. Core never sees the contract or the transport; the
+//   hook closes over both on the desktop side. A failure before the
+//   hook leaves no record anywhere; a failure after the handle exists
+//   disposes it. One manager owns the session: the hook and the bind
+//   both use options.manager, and attachLiveSession refuses a live
+//   session whose manager is a different instance.
+// - The duplicate-id guard below is local to this live path only:
+//   SessionManager.create still overwrites silently (BUG-04, NOT fixed
+//   here), so this file checks hasSession first and refuses before any
+//   SDK work or backend call.
 // - Tool execution stays refused: noTools "all" at creation, and the
 //   gate execute step + permission layer are later phases (see
 //   ./execution-gate.ts). A live session can chat and stream; it cannot
@@ -50,6 +66,13 @@ export interface StartLiveSessionOptions {
   agentDir?: string;
   // An existing manager to bind into. When omitted, a new one is created.
   manager?: SessionManager;
+  // Backend registration hook, supplied by the desktop layer. The app
+  // passes () => createSession(manager, contract, sessionId) from
+  // apps/desktop/src/ipc/session-client.ts: backend ack through
+  // sen_session_create first, then the local Running record in this
+  // same manager. When omitted, the old core-only order stays (local
+  // record first, no backend call), for core-only use and old tests.
+  registerBackendSession?: (sessionId: string) => Promise<void>;
 }
 
 export interface LiveSession {
@@ -58,6 +81,9 @@ export interface LiveSession {
   sessionId: string;
   providerId: string;
   modelId: string;
+  // True only when registerBackendSession ran and the backend record
+  // exists. attachLiveSession skips its own createSession on true.
+  backendRegistered: boolean;
 }
 
 export async function startOpenRouterLiveSession(
@@ -73,19 +99,42 @@ export async function startOpenRouterLiveSession(
     );
   }
   const manager = options.manager ?? new SessionManager();
-  manager.create(options.sessionId);
+  // Refuse a reused id before any SDK work or backend call. The check
+  // is local to this live path: SessionManager.create still overwrites
+  // silently (BUG-04, NOT fixed here), so the guard lives here.
+  if (manager.hasSession(options.sessionId)) {
+    throw new Error(
+      "Duplicate live session: manager already owns session " +
+        options.sessionId +
+        " (refusing before any SDK work or backend call).",
+    );
+  }
+  const withBackend =
+    typeof options.registerBackendSession === "function";
+  // Core-only order stays when no hook is given: local record first,
+  // then the handle, then the bind. With a hook, the local record is
+  // created inside the hook (backend ack first, then local record),
+  // after the handle exists and before the bind, so a handle failure
+  // leaves no record anywhere.
+  if (!withBackend) {
+    manager.create(options.sessionId);
+  }
+  let handle: SenAgentSession | undefined;
   try {
     const runtime = await createOpenRouterRuntime({
       apiKey: options.apiKey,
       env: options.env,
     });
     const model = resolveOpenRouterModel(runtime, options.modelId);
-    const handle = await createLiveSenAgentSession({
+    handle = await createLiveSenAgentSession({
       modelRuntime: runtime,
       model,
       cwd: options.cwd,
       agentDir: options.agentDir,
     });
+    if (withBackend) {
+      await options.registerBackendSession!(options.sessionId);
+    }
     manager.bindSdkSession(options.sessionId, handle);
     manager.rawLog.append(options.sessionId, "session_live_started", {
       provider: OPENROUTER_PROVIDER_ID,
@@ -98,13 +147,22 @@ export async function startOpenRouterLiveSession(
       sessionId: options.sessionId,
       providerId: OPENROUTER_PROVIDER_ID,
       modelId: options.modelId,
+      backendRegistered: withBackend,
     };
   } catch (error) {
+    if (handle) {
+      try {
+        handle.dispose();
+      } catch {
+        // Dispose is cleanup only; the original error rethrows below.
+      }
+    }
     try {
       manager.transition(options.sessionId, "Failed");
     } catch {
-      // The transition can only fail if the state already left Running;
-      // the original error is the one that matters, so it rethrows below.
+      // The transition can only fail if no local record exists yet
+      // (hook path, failure before the hook) or the state already left
+      // Running; the original error is the one that matters.
     }
     throw error;
   }

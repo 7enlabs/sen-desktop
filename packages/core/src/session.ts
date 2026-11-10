@@ -52,6 +52,14 @@ export class SessionManager {
     return "Running";
   }
 
+  // Read-only ownership check: does this manager already hold a record
+  // (any state, including terminal) for this id? Callers that create a
+  // session through another layer check this first, because create()
+  // itself still overwrites silently (BUG-04, not fixed here).
+  hasSession(sessionId: string): boolean {
+    return this.states.has(sessionId);
+  }
+
   // Binds a real SDK session handle (created via createSenAgentSession in
   // ./agent-session.ts with an explicit model runtime) to a local session id.
   // Binding alone makes no model call; it only records the link and the log.

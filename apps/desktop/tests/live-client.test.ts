@@ -188,3 +188,76 @@ test("live-client: tool execution is still refused in the live phase", async () 
   );
   setBridgeTransport(null);
 });
+
+function fakeLiveSession(
+  manager: SessionManager,
+  handle: ReturnType<typeof fakeHandle>,
+  backendRegistered: boolean,
+) {
+  return {
+    manager,
+    handle: handle as never,
+    sessionId: "s1",
+    providerId: "openrouter",
+    modelId: "cohere/north-mini-code:free",
+    backendRegistered,
+  };
+}
+
+test("live-client attach: backend-registered LiveSession from the same manager skips sen_session_create", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  const handle = fakeHandle();
+  // Mirrors what startOpenRouterLiveSession already did with its hook:
+  // local record exists and the handle is bound in this same manager.
+  manager.create("s1");
+  manager.bindSdkSession("s1", handle as never);
+  const attached = await attachLiveSession(manager, contract(), "s1", {
+    createHandle: async () => fakeLiveSession(manager, handle, true),
+  });
+  assert.equal(attached.state, "Running");
+  assert.equal(attached.subscriberId, 7);
+  assert.deepEqual(transportCalls, ["sen_events_subscribe"]);
+  assert.equal(manager.getSdkSession("s1"), handle);
+  setBridgeTransport(null);
+});
+
+test("live-client attach: LiveSession from a different manager refuses, no backend call", async () => {
+  const transportCalls: string[] = [];
+  setBridgeTransport(async (command) => {
+    transportCalls.push(command);
+    return {};
+  });
+  const managerA = new SessionManager();
+  const managerB = new SessionManager();
+  const handle = fakeHandle();
+  managerA.create("s1");
+  managerA.bindSdkSession("s1", handle as never);
+  await assert.rejects(
+    () =>
+      attachLiveSession(managerB, contract(), "s1", {
+        createHandle: async () => fakeLiveSession(managerA, handle, true),
+      }),
+    /different SessionManager/,
+  );
+  assert.deepEqual(transportCalls, []);
+  assert.deepEqual(handle.calls, ["dispose"]);
+  assert.equal(managerB.getSdkSession("s1"), undefined);
+  setBridgeTransport(null);
+});
+
+test("live-client attach: unregistered LiveSession takes the backend-first path", async () => {
+  const transportCalls = liveTransport();
+  const manager = new SessionManager();
+  const handle = fakeHandle();
+  const attached = await attachLiveSession(manager, contract(), "s1", {
+    createHandle: async () => fakeLiveSession(manager, handle, false),
+  });
+  assert.equal(attached.state, "Running");
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+  ]);
+  assert.equal(manager.getSdkSession("s1"), handle);
+  setBridgeTransport(null);
+});
