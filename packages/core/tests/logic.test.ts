@@ -56,6 +56,38 @@ test("SessionManager: lifecycle through the statechart", () => {
   assert.throws(() => manager.transition("s2", "Error"), /Illegal state transition/);
 });
 
+test("SessionManager.create: duplicate id throws DUPLICATE_SESSION, old record untouched (BUG-04)", () => {
+  const kinds = (manager: SessionManager, id: string) =>
+    manager.rawLog.eventsFor(id).map((event) => event.kind);
+
+  // Duplicate while Running: refuses, keeps Running, adds no log entry.
+  const manager = new SessionManager();
+  assert.equal(manager.create("s1"), "Running");
+  assert.throws(() => manager.create("s1"), /DUPLICATE_SESSION: Session already exists: s1/);
+  assert.deepEqual(kinds(manager, "s1"), ["session_create_stub"]);
+  assert.equal(manager.transition("s1", "AwaitingApproval"), "AwaitingApproval");
+  assert.equal(manager.transition("s1", "Running"), "Running");
+
+  // Duplicate after each terminal state: refuses, keeps the terminal
+  // state (no resurrection), adds no log entry.
+  const terminalCases = [
+    { id: "done", to: "Completed" },
+    { id: "gone", to: "Cancelled" },
+    { id: "broke", to: "Failed" },
+  ] as const;
+  for (const { id, to } of terminalCases) {
+    manager.create(id);
+    assert.equal(manager.transition(id, to), to);
+    const before = kinds(manager, id);
+    assert.throws(() => manager.create(id), /DUPLICATE_SESSION/);
+    assert.deepEqual(kinds(manager, id), before);
+    assert.throws(() => manager.transition(id, "Running"), /Terminal state/);
+  }
+
+  // A refused duplicate does not poison the manager: a fresh id still works.
+  assert.equal(manager.create("fresh"), "Running");
+});
+
 // --- 2. Execution gate order (6 fixed steps) ---
 
 test("gate order: exact order passes, any drift fails", () => {
