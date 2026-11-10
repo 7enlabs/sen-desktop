@@ -45,6 +45,18 @@ export class SessionManager {
   readonly rawLog = new RawLog();
 
   create(sessionId: string): SessionState {
+    // BUG-04: an id that already exists - in any state, including a
+    // terminal one - is a duplicate, exactly like the Rust registry
+    // (registry.rs, ERR_DUPLICATE_SESSION). A terminal state has no
+    // outgoing path, so re-creating it would resurrect a dead session;
+    // re-creating a live one would silently overwrite its record and
+    // log. Refuse before touching any state, so the old record and the
+    // raw log stay exactly as they were, and no new record is made.
+    if (this.states.has(sessionId)) {
+      throw new Error(
+        "DUPLICATE_SESSION: Session already exists: " + sessionId,
+      );
+    }
     // Local statechart frame only: no SDK call here. An SDK-backed session
     // attaches through bindSdkSession() with an explicit model runtime.
     this.states.set(sessionId, "Running");
