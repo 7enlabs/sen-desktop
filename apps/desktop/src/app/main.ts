@@ -26,9 +26,10 @@
 //   network step is a later steer/followUp on the attached session.
 //
 // Still open, NOT decided here (see the bundle README):
-// - No bundler exists yet, so index.html still loads ./main.ts
-//   directly and a real webview cannot run this module until a bundler
-//   is chosen. This wiring is proven under node, not in a webview.
+// - Vite bundles this module now (bundler round, tin 9313), so a real
+//   webview can load the built dist/index.html. This wiring is proven
+//   under node and by a successful vite build, not yet in a real webview
+//   (no Rust toolchain on this box, so tauri dev/build is not run here).
 // - No UI or config source supplies modelId/apiKey at runtime yet, so
 //   the load-time boot below refuses with a clear message until one
 //   exists. The refusal is surfaced in the shell, never swallowed.
