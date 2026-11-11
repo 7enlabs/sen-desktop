@@ -40,6 +40,10 @@ import { SessionManager } from "../../../../packages/core/src/session.ts";
 export interface BackendSessionResult {
   sessionId: string;
   state: string;
+  // R2B-04: counts from the last turn the backend ran (0 when no turn
+  // ran: create/abort). The backend always sends both numbers.
+  unknownRecords: number;
+  versionMismatches: number;
 }
 
 export interface BackendSubscribeResult {
@@ -57,7 +61,9 @@ function asSessionResult(value: unknown, expectedId: string): BackendSessionResu
   if (
     !res ||
     typeof res.sessionId !== "string" ||
-    typeof res.state !== "string"
+    typeof res.state !== "string" ||
+    typeof res.unknownRecords !== "number" ||
+    typeof res.versionMismatches !== "number"
   ) {
     throw new Error(
       "Backend session result malformed, FAIL: " + JSON.stringify(value),

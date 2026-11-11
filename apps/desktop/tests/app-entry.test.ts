@@ -22,15 +22,15 @@ function liveTransport() {
     calls.push(command);
     const a = args as { session_id?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running" };
+      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
       return { sessionId: a.session_id, subscriberId: 7 };
     }
     if (command === "sen_session_abort") {
-      return { sessionId: a.session_id, state: "Cancelled" };
+      return { sessionId: a.session_id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
     }
-    return { sessionId: a.session_id, state: "Running" };
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   return calls;
 }

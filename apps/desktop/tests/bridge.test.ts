@@ -154,14 +154,14 @@ test("session-client create: backend ack + local Running, mismatch refused", asy
   setBridgeTransport(async (command, args) => {
     const a = args as { session_id?: string };
     assert.equal(command, "sen_session_create");
-    return { sessionId: a.session_id, state: "Running" };
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   const res = await createSession(manager, contract(), "s1");
   assert.equal(res.sessionId, "s1");
   assert.equal(res.state, "Running");
   assert.equal(manager.rawLog.eventsFor("s1").length, 1);
-  setBridgeTransport(async () => ({ sessionId: "other", state: "Running" }));
+  setBridgeTransport(async () => ({ sessionId: "other", state: "Running", unknownRecords: 0, versionMismatches: 0 }));
   const manager2 = new SessionManager();
   await assert.rejects(() => createSession(manager2, contract(), "s2"), /mismatch/);
   assert.throws(() => manager2.transition("s2", "Running"), /does not exist/);
@@ -172,7 +172,7 @@ test("session-client steer: pure IPC, backend ack returned, no local state chang
   const calls: string[] = [];
   setBridgeTransport(async (command) => {
     calls.push(command);
-    return { sessionId: "s1", state: "Running" };
+    return { sessionId: "s1", state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   await createSession(manager, contract(), "s1");
@@ -189,7 +189,7 @@ test("session-client steer/followUp: pure IPC calls in order, args passed throug
   const calls: Array<[string, unknown]> = [];
   setBridgeTransport(async (command, args) => {
     calls.push([command, args]);
-    return { sessionId: "s1", state: "Running" };
+    return { sessionId: "s1", state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   await createSession(manager, contract(), "s1");
@@ -210,7 +210,7 @@ test("session-client steer/followUp: pure IPC calls in order, args passed throug
 test("session-client steer: backend CLI failure surfaces, local stays Running", async () => {
   setBridgeTransport(async (command) => {
     if (command === "sen_session_create") {
-      return { sessionId: "s1", state: "Running" };
+      return { sessionId: "s1", state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     throw new Error(
       "CLI_NO_RESULT: CLI turn ended with no result record (exited general error (1)).",
@@ -232,9 +232,9 @@ test("session-client abort: backend + local Cancelled through IPC", async () => 
   setBridgeTransport(async (command) => {
     calls.push(command);
     if (command === "sen_session_create") {
-      return { sessionId: "s1", state: "Running" };
+      return { sessionId: "s1", state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
-    return { sessionId: "s1", state: "Cancelled" };
+    return { sessionId: "s1", state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   await createSession(manager, contract(), "s1");

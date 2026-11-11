@@ -15,8 +15,9 @@
 // - `result` is always last on a normal end, an error, or SIGINT.
 // - Unknown record types and unknown fields may be added in a minor
 //   release: they are counted, never fatal. An event type this module
-//   does not know becomes SenEvent::Unknown and is logged by the caller;
-//   the bridge never crashes on it.
+//   does not know becomes SenEvent::Unknown; the bridge counts it, and
+//   the counts travel to the frontend with the session result
+//   (SessionResult.unknown_records / version_mismatches, R2B-04).
 // - No key is ever in a record. Records carry model text, which the
 //   caller may log truncated, never the full raw line blindly.
 use serde::{Deserialize, Serialize};
@@ -110,8 +111,9 @@ pub enum SenEvent {
         duration_ms: u64,
         model: String,
     },
-    /// A record type this bridge does not know. The caller counts it and
-    /// logs the type name; the turn continues.
+    /// A record type this bridge does not know. The caller counts it;
+    /// the count travels to the frontend with the session result
+    /// (SessionResult.unknown_records, R2B-04); the turn continues.
     Unknown {
         session_id: String,
         record_type: String,

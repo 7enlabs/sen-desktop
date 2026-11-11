@@ -468,7 +468,11 @@ impl CliBridge {
                         continue;
                     };
                     records_seen += 1;
-                    if record.v.is_some_and(|v| v != STREAM_JSON_VERSION) {
+                    // R2B-04: the contract says `v` = 1 on every
+                    // record, so a record with no `v` field at all
+                    // (None) is a version mismatch too, not just a
+                    // record with `v` != 1.
+                    if record.v != Some(STREAM_JSON_VERSION) {
                         version_mismatches += 1;
                     }
                     if record.record_type == "result" {
@@ -827,6 +831,33 @@ exit 0"#;
         let (result, _events) = run_collect(bin, "steer", "hi");
         let result = result.unwrap();
         assert_eq!(result.version_mismatches, 2);
+    }
+
+    #[test]
+    fn missing_version_field_is_counted_as_mismatch() {
+        // R2B-04: the contract says `v` = 1 on every record, so a
+        // record with no `v` field at all is a version mismatch too,
+        // not just a record with `v` != 1.
+        let body = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free"}
+{"type":"result","subtype":"success","is_error":false,"result":"ok","duration_ms":1,"num_turns":1,"usage":{},"model":"m:free","session_id":"s1"}
+EOF
+exit 0"#;
+        let bin = fake_zen("noversion", body);
+        let (result, _events) = run_collect(bin, "steer", "hi");
+        let result = result.unwrap();
+        assert_eq!(result.version_mismatches, 2);
+        // A record WITH v = 1 next to one without still counts only
+        // the missing one.
+        let body = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}
+{"type":"result","subtype":"success","is_error":false,"result":"ok","duration_ms":1,"num_turns":1,"usage":{},"model":"m:free","session_id":"s1"}
+EOF
+exit 0"#;
+        let bin = fake_zen("oneversion", body);
+        let (result, _events) = run_collect(bin, "steer", "hi");
+        let result = result.unwrap();
+        assert_eq!(result.version_mismatches, 1);
     }
 
     #[test]
