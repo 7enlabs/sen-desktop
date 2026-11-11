@@ -1,0 +1,68 @@
+# CI for Sen Desktop (BUG-17, #32).
+# The only workflow before this file was pr-agent-pilot.yml, which reviews
+# PRs with a free model but runs no test and no cargo check, so broken
+# code could merge unnoticed. This workflow runs the checks on every PR
+# and on pushes to main and dev/scaffold.
+# It does not review, approve, or merge anything; it only reports.
+name: CI
+
+on:
+  push:
+    branches: [main, dev/scaffold]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-tests:
+    name: Node tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run node test suite
+        # Root script "test" covers packages/core only; the other suites
+        # live under their own test:* scripts, so run every one of them.
+        run: |
+          pnpm test
+          pnpm test:app-entry
+          pnpm test:bridge
+          pnpm test:live-client
+          pnpm test:webview
+          pnpm test:session-events
+          pnpm test:settings-client
+
+  rust:
+    name: Rust fmt + check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri system dependencies
+        # Tauri 2 on Linux needs the webview (webkit2gtk) and gtk stacks;
+        # without them cargo check fails on gdk-3.0, as it does on the
+        # seat box where those libraries are missing.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator-gtk3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+      - name: Check Rust code
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
