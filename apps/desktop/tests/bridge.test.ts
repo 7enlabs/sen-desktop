@@ -54,6 +54,64 @@ test("bridge: contract validated before transport is called", async () => {
   setBridgeTransport(null);
 });
 
+// BUG-16: assertContract must check phase, toolKind, sideEffect and risk,
+// not just the original seven fields. A contract missing any one of them
+// is rejected in the frontend and never reaches the transport (the Rust
+// side would reject it as INVALID_CONTRACT, but the bridge comment promises
+// a bad contract never reaches the backend at all).
+for (const field of ["phase", "toolKind", "sideEffect", "risk"] as const) {
+  test(`bridge BUG-16: contract missing ${field} is rejected before transport`, async () => {
+    const calls: Array<[string, unknown]> = [];
+    setBridgeTransport(async (command, args) => {
+      calls.push([command, args]);
+      return {};
+    });
+    const bad = contract();
+    (bad as Record<string, unknown>)[field] = "";
+    await assert.rejects(
+      () => invoke("sen_session_create", { contract: bad }),
+      /missing fields/,
+    );
+    assert.equal(calls.length, 0);
+    setBridgeTransport(null);
+  });
+}
+
+// BUG-16 parity: the Rust validate_contract also rejects toolKind /
+// sideEffect values outside their allowed sets, so the frontend must
+// reject them too instead of leaving them for the backend to catch.
+test("bridge BUG-16: illegal toolKind is rejected before transport", async () => {
+  const calls: Array<[string, unknown]> = [];
+  setBridgeTransport(async (command, args) => {
+    calls.push([command, args]);
+    return {};
+  });
+  const bad = contract();
+  (bad as Record<string, unknown>).toolKind = "unregistered-tool";
+  await assert.rejects(
+    () => invoke("sen_session_create", { contract: bad }),
+    /illegal tool kind/,
+  );
+  assert.equal(calls.length, 0);
+  setBridgeTransport(null);
+});
+
+test("bridge BUG-16: illegal sideEffect is rejected before transport", async () => {
+  const calls: Array<[string, unknown]> = [];
+  setBridgeTransport(async (command, args) => {
+    calls.push([command, args]);
+    return {};
+  });
+  const bad = contract();
+  (bad as Record<string, unknown>).sideEffect = "maybe-reversible";
+  await assert.rejects(
+    () => invoke("sen_session_create", { contract: bad }),
+    /illegal side effect class/,
+  );
+  assert.equal(calls.length, 0);
+  setBridgeTransport(null);
+});
+
 test("bridge: valid call passes command and args through, returns result", async () => {
   const calls: Array<[string, unknown]> = [];
   setBridgeTransport(async (command, args) => {

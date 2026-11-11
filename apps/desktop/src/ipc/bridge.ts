@@ -21,10 +21,33 @@ export function assertContract(contract: ActionContract): void {
   if (!contract.capabilityVersion) missing.push("capabilityVersion");
   if (!contract.actor) missing.push("actor");
   if (!contract.purpose) missing.push("purpose");
+  if (!contract.phase) missing.push("phase");
+  if (!contract.toolKind) missing.push("toolKind");
+  if (!contract.sideEffect) missing.push("sideEffect");
+  if (!contract.risk) missing.push("risk");
   if (!contract.idempotencyKey) missing.push("idempotencyKey");
   if (!contract.timeoutMs) missing.push("timeoutMs");
   if (missing.length > 0) {
     throw new Error("IPC contract missing fields, FAIL: " + missing.join(", "));
+  }
+  // Parity with validate_contract in
+  // apps/desktop/src-tauri/src/commands/registry.rs: the frontend must
+  // reject at least everything the backend rejects, so a bad contract
+  // never reaches the backend. An illegal tool kind or side effect class
+  // is rejected here, not left for the Rust side to catch.
+  if (
+    contract.toolKind !== "model-tool" &&
+    contract.toolKind !== "registered-tool" &&
+    contract.toolKind !== "authorized-execution-tool"
+  ) {
+    throw new Error("IPC contract illegal tool kind, FAIL");
+  }
+  if (
+    contract.sideEffect !== "no-side-effect" &&
+    contract.sideEffect !== "reversible" &&
+    contract.sideEffect !== "irreversible"
+  ) {
+    throw new Error("IPC contract illegal side effect class, FAIL");
   }
 }
 
