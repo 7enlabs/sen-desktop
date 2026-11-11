@@ -51,6 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::cli_settings::{CliSettings, DEFAULT_MODEL};
 use super::cli_spawn::{AbortOutcome, BridgeError, CliBridge, TurnResult};
@@ -598,7 +599,16 @@ impl Registry {
                 "Steer already running on this session, refused",
             )),
             SteerStart::Run(bridge) => {
-                let turn = match bridge.run_turn(kind, text, emit) {
+                // BUG-11: the contract timeout_ms is the turn deadline, capped
+                // at the 120s turn timeout inside the bridge (min(timeout_ms,
+                // 120s) per tin 9566). A hanging turn is killed at that
+                // deadline instead of running to the cap or hanging forever.
+                let turn = match bridge.run_turn_with_timeout(
+                    kind,
+                    text,
+                    Duration::from_millis(contract.timeout_ms),
+                    emit,
+                ) {
                     Ok(turn) => turn,
                     Err(e) => {
                         self.release_steer(session_id, contract, kind, text);
@@ -1198,6 +1208,29 @@ exit 0; else touch '{marker}'; exit 1; fi"#,
         assert_eq!(events.len(), 3, "retry after failure must run");
         assert_eq!(reg.get("s1").unwrap().log.len(), 2);
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn steer_enforces_contract_timeout_ms() {
+        // BUG-11: a hanging CLI with contract timeout_ms=300 must fail
+        // as CLI_TURN_TIMEOUT in well under 10s, not run on to the
+        // 120s bridge cap. The effective deadline is
+        // min(timeout_ms, TURN_TIMEOUT 120s) per the tin 9566 decision.
+        let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
+i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("bug11hang", body));
+        reg.create("s1", &contract()).unwrap();
+        let mut c = contract();
+        c.timeout_ms = 300;
+        let started = std::time::Instant::now();
+        let mut emit = |_ev: SenEvent| {};
+        let err = reg.steer("s1", &c, "steer", "hi", &mut emit).unwrap_err();
+        assert_eq!(err.code, "CLI_TURN_TIMEOUT");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // A failed steer leaves no log entry and the session stays Running.
+        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
     }
 
     #[test]

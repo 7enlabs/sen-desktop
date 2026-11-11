@@ -10,6 +10,7 @@
 // frontend as Tauri events (SEN_SESSION_EVENT) while the turn runs.
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
 use super::registry::{ActionContract, Registry};
@@ -131,12 +132,16 @@ fn run_steer_turn(
         }
         super::registry::SteerStart::Run(bridge) => bridge,
     };
+    // BUG-11: the contract timeout_ms is the turn deadline, capped at
+    // the 120s turn timeout inside the bridge (min(timeout_ms, 120s)
+    // per tin 9566). Capture it before the turn runs lock-free below.
+    let timeout = Duration::from_millis(contract.timeout_ms);
     let app_emit = app.clone();
     let mut emit = |event: SenEvent| {
         // Best effort: a listener that is gone must not fail the turn.
         let _ = app_emit.emit(SEN_SESSION_EVENT, &event);
     };
-    let turn = match bridge.run_turn(kind, text, &mut emit) {
+    let turn = match bridge.run_turn_with_timeout(kind, text, timeout, &mut emit) {
         Ok(turn) => turn,
         Err(e) => {
             // The turn never ran to a result: release the in-flight key
