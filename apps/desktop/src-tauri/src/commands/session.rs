@@ -98,6 +98,12 @@ pub fn sen_session_create(
 /// When step 1 reports Duplicate (BUG-10, #25: this exact steer already
 /// completed on the session), the recorded result is returned at once:
 /// no model call runs, no log entry is pushed, no event is emitted.
+/// When step 1 reports InFlight (BUG-10 extra, tin 9645/9650: the same
+/// steer is already running on the session), the steer is refused with
+/// DUPLICATE_STEER: there is no recorded result to replay yet, so no
+/// second model call starts. When step 2 fails, the in-flight key is
+/// released before the error returns, so a retry with the same key
+/// still executes.
 fn run_steer_turn(
     app: &AppHandle,
     state: State<'_, Mutex<Registry>>,
@@ -116,6 +122,13 @@ fn run_steer_turn(
         super::registry::SteerStart::Duplicate { state, .. } => {
             return Ok(result(session_id, state));
         }
+        super::registry::SteerStart::InFlight { .. } => {
+            return Err(super::registry::CommandError::new(
+                super::registry::ERR_DUPLICATE_STEER,
+                "Steer already running on this session, refused",
+            )
+            .to_wire());
+        }
         super::registry::SteerStart::Run(bridge) => bridge,
     };
     let app_emit = app.clone();
@@ -123,9 +136,18 @@ fn run_steer_turn(
         // Best effort: a listener that is gone must not fail the turn.
         let _ = app_emit.emit(SEN_SESSION_EVENT, &event);
     };
-    let turn = bridge
-        .run_turn(kind, text, &mut emit)
-        .map_err(|e| format!("{}: {}", e.code, e.message))?;
+    let turn = match bridge.run_turn(kind, text, &mut emit) {
+        Ok(turn) => turn,
+        Err(e) => {
+            // The turn never ran to a result: release the in-flight key
+            // (BUG-10 extra) so a retry with the same key still
+            // executes. A lock failure here must not mask the turn error.
+            if let Ok(mut registry) = state.lock() {
+                registry.release_steer(session_id, &contract.to_registry(), kind, text);
+            }
+            return Err(format!("{}: {}", e.code, e.message));
+        }
+    };
     let mut registry = state.lock().map_err(|e| e.to_string())?;
     let next = registry
         .complete_steer(session_id, &contract.to_registry(), kind, text, &turn)
