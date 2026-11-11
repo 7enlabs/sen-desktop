@@ -1,18 +1,15 @@
-// Live client tests for the SDK move (tin 9328/9459).
+// Live client tests for the CLI bridge round (tin 9530).
 // Run with: node --test apps/desktop/tests/live-client.test.ts
 // (Node 24 runs .ts files directly through type stripping; no build step.)
 // The injected transport stands in for the Rust handlers, which cannot run
-// under node. These tests prove the frontend half of the IPC-only live
-// round: attach creates the backend + local record and subscribes, close
-// aborts through the backend, steer/followUp are pure IPC whose backend
-// refusal (MODEL_NOT_WIRED until the CLI bridge lands) surfaces untouched
-// with the local state still Running, and tool execution is still refused.
-// The old BUG-05/BUG-06 tests (SDK abort/steer throwing after the backend
-// ack) are gone with the SDK handle they tested: there is no SDK abort or
-// steer in the webview anymore, so those failure modes have no subject.
-// They do NOT prove the Rust handlers run or a real model answers: that
-// evidence is the standalone registry tests, cargo check on the Leader VM,
-// and the CLI bridge phase.
+// under node. These tests prove the frontend half of the IPC live round:
+// attach creates the backend + local record and subscribes, close aborts
+// through the backend, steer/followUp are pure IPC whose backend ack means
+// the model ran to a result record, and a backend CLI failure surfaces
+// untouched with the local state still Running; tool execution is still
+// refused. They do NOT prove the Rust handlers run or a real model
+// answers: that evidence is the standalone registry tests, cargo check on
+// the Leader VM, and the CLI bridge phase.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
@@ -147,27 +144,27 @@ test("live-client steer/followUp: pure IPC, backend ack returned, local stays Ru
   setBridgeTransport(null);
 });
 
-test("live-client steer: backend MODEL_NOT_WIRED refusal surfaces, local stays Running", async () => {
+test("live-client steer: backend CLI failure surfaces, local stays Running", async () => {
   const transportCalls = liveTransport();
   const manager = new SessionManager();
   await attachLiveSession(manager, contract(), "s1");
-  // The backend refuses until the CLI bridge lands. The refusal must
-  // surface untouched — never a fake success — and the local session
-  // must stay Running: no steer ran, so no Failed transition is recorded
-  // and no steer intent sits in the backend log.
+  // The backend runs the CLI; a turn that ends with no result record
+  // fails loudly. The failure must surface untouched — never a fake
+  // success — and the local session must stay Running: no steer ran to a
+  // result, so no Failed transition is recorded.
   setBridgeTransport(async (command, args) => {
     transportCalls.push(command);
     const a = args as { session_id?: string };
     if (command === "sen_session_steer") {
       throw new Error(
-        "MODEL_NOT_WIRED: the CLI core + stream-json bridge lands in a later phase, no model call ran.",
+        "CLI_NO_RESULT: CLI turn ended with no result record (exited general error (1)).",
       );
     }
     return { sessionId: a.session_id, state: "Running" };
   });
   await assert.rejects(
     () => steerSession(contract(), "s1", "hi"),
-    /MODEL_NOT_WIRED/,
+    /CLI_NO_RESULT/,
   );
   assert.deepEqual(
     manager.rawLog.eventsFor("s1").map((event) => event.kind),

@@ -6,21 +6,19 @@
 // SDK move (tin 9328/9459): the Pi SDK is out of the webview. No SDK
 // session is created, bound, steered, or disposed anywhere in this file:
 // the model runs in the backend through the CLI core + stream-json bridge
-// (a later phase), and the frontend only talks to the backend through
-// the IPC bridge. Until the CLI bridge lands, steer/followUp are refused
-// by the backend with MODEL_NOT_WIRED, and that refusal surfaces here
-// untouched — never mapped to a fake success.
+// (Phase 2, tin 9530), and the frontend only talks to the backend through
+// the IPC bridge. A backend failure surfaces here untouched — never
+// mapped to a fake success.
 //
 // Order of truth, per phase:
 // - create: backend record first, then the local SessionManager record.
-//   No model runtime exists in this phase, by design (no default model
-//   per message 4070, no key, no network call).
+//   The session's model comes from local app settings (default free
+//   model when nothing is stored); no key is held anywhere here — the key
+//   reaches the CLI through the environment on the backend side.
 // - steer / follow_up: pure IPC. The backend gates on a Running session
-//   and either runs the model (once the CLI bridge lands) or refuses
-//   with MODEL_NOT_WIRED. The frontend records nothing locally on a
-//   refusal: the local state stays Running and the backend log holds no
-//   steer that never ran, so the two sides cannot diverge the way
-//   BUG-06 described (backend ack without a model call).
+//   and runs one CLI turn for it; the backend ack means the model call
+//   ran to a result record. A failure throws above, so no local state is
+//   recorded for a steer that never ran.
 // - abort: backend transition first (the record), then the local state
 //   transition. No SDK abort or dispose exists anymore, so the BUG-05
 //   failure mode (SDK abort throws after the backend already cancelled)
@@ -29,8 +27,9 @@
 //   TOOL_EXECUTION_NOT_WIRED (gate execute step + permission layer are
 //   later phases). The error propagates, never a fake success.
 // - events_subscribe: backend records the subscriber; the event stream
-//   itself will flow from the backend (Tauri events) once the CLI bridge
-//   lands. This call records the subscription only, it invents no events.
+//   flows from the backend (Tauri events) while a CLI turn runs — see
+//   listenSessionEvents in ./session-events.ts. This call records the
+//   subscription only, it invents no events.
 import { invoke } from "./bridge.ts";
 import type { ActionContract } from "./types.ts";
 import { SessionManager } from "../../../../packages/core/src/session.ts";
@@ -125,9 +124,9 @@ export async function steerSession(
     text,
   });
   const res = asSessionResult(raw, sessionId);
-  // The backend ack means the model call ran (once the CLI bridge
-  // lands). A refusal (MODEL_NOT_WIRED until then) throws above, so no
-  // local state is recorded for a steer that never ran.
+  // The backend ack means the model call ran to a result record. A
+  // failure throws above, so no local state is recorded for a steer that
+  // never ran.
   return res;
 }
 

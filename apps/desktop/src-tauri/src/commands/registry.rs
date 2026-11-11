@@ -1,17 +1,18 @@
-// Backend session registry for the Tauri command handlers (bridge round).
-// PURE RUST, no Tauri dependency: this module compiles and tests standalone
-// with `rustc --test`, so the handler logic has real test evidence even on a
-// box without the Tauri system libraries (gdk-3.0, webkit2gtk). The thin
-// #[tauri::command] wrappers in session.rs, tools.rs and events.rs only
-// convert wire args and delegate here; they hold no logic of their own.
+// Backend session registry for the Tauri command handlers (CLI bridge
+// round). PURE RUST, no Tauri dependency: this module compiles and tests
+// standalone with `rustc --test`, so the handler logic has real test
+// evidence even on a box without the Tauri system libraries (gdk-3.0,
+// webkit2gtk). The thin #[tauri::command] wrappers in session.rs, tools.rs
+// and events.rs only convert wire args and delegate here; they hold no
+// logic of their own.
 //
 // Design, per prep B-2 section 2 and the decided point-854 statechart:
 // - The backend owns the command gate and the session record. The model
-//   runs in the backend through the CLI core + stream-json bridge (a later
-//   phase); until then steer/follow_up refuse with MODEL_NOT_WIRED instead
-//   of acking a model call that never ran. The backend never calls the Pi
-//   SDK and never holds a key: the SDK is out of the webview entirely
-//   (tin 9328/9459), so no model runtime exists anywhere in this phase.
+//   runs in the backend through the CLI core + stream-json bridge
+//   (Phase 2, tin 9530): each session owns one CliBridge handle, and
+//   steer/follow_up run the `zen` CLI for that session. The backend never
+//   calls the Pi SDK and never holds a key: the SDK is out of the webview
+//   entirely (tin 9328/9459).
 // - Session state transitions mirror packages/core/src/session.ts exactly:
 //   Running -> AwaitingApproval | Error | Completed | Cancelled | Failed,
 //   AwaitingApproval -> Running | Cancelled (rejection never hangs),
@@ -24,8 +25,22 @@
 //   the 6-step gate order is asserted, then the call fails loudly with
 //   TOOL_EXECUTION_NOT_WIRED instead of pretending a tool ran. The gate
 //   execute step and the permission layer are later phases.
+//
+// Locking, read before touching steer: a turn runs for seconds while the
+// Registry mutex is held by the caller, so steer is split in three —
+// begin_steer (validate + hand out the session's bridge), the turn itself
+// (runs with NO registry lock held, so abort can reach the child), and
+// complete_steer (record the turn, only after the model ran). A wrapper
+// that held the registry lock across the whole turn would deadlock abort:
+// abort needs the same lock to reach the bridge.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use super::cli_settings::{CliSettings, DEFAULT_MODEL};
+use super::cli_spawn::{AbortOutcome, BridgeError, CliBridge, TurnResult};
+use super::stream_json::SenEvent;
 
 // --- Session statechart (point 854, mirror of packages/core) ---
 
@@ -100,7 +115,6 @@ pub const ERR_DUPLICATE_SESSION: &str = "DUPLICATE_SESSION";
 pub const ERR_ILLEGAL_TRANSITION: &str = "ILLEGAL_TRANSITION";
 pub const ERR_INVALID_CONTRACT: &str = "INVALID_CONTRACT";
 pub const ERR_TOOL_EXECUTION_NOT_WIRED: &str = "TOOL_EXECUTION_NOT_WIRED";
-pub const ERR_MODEL_NOT_WIRED: &str = "MODEL_NOT_WIRED";
 
 // --- IPC action contract (mirror of apps/desktop/src/ipc/types.ts) ---
 
@@ -208,26 +222,70 @@ pub struct SessionRecord {
     pub subscribers: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Registry {
     sessions: HashMap<String, SessionRecord>,
+    /// One CLI bridge handle per session (Phase 2). The handle is
+    /// created with the session and outlives single turns; the process
+    /// itself is per-turn (see cli_spawn.rs for why no process stays
+    /// alive between turns).
+    bridges: HashMap<String, Arc<CliBridge>>,
+    /// App config dir holding cli-settings.json (None in tests and when
+    /// the app config dir is unavailable: the default model applies).
+    settings_dir: Option<PathBuf>,
+    /// Explicit binary path (tests / operator override). None means the
+    /// bridge resolves per decision 1 at first turn (ZEN_BIN, then PATH).
+    zen_bin_override: Option<PathBuf>,
+}
+
+fn bridge_error_to_command(error: BridgeError) -> CommandError {
+    CommandError::new(&error.code, &error.message)
 }
 
 impl Registry {
     pub fn new() -> Registry {
         Registry {
             sessions: HashMap::new(),
+            bridges: HashMap::new(),
+            settings_dir: None,
+            zen_bin_override: None,
         }
+    }
+
+    pub fn with_settings_dir(dir: PathBuf) -> Registry {
+        let mut registry = Registry::new();
+        registry.settings_dir = Some(dir);
+        registry
+    }
+
+    pub fn set_settings_dir(&mut self, dir: PathBuf) {
+        self.settings_dir = Some(dir);
+    }
+
+    pub fn set_zen_bin(&mut self, path: PathBuf) {
+        self.zen_bin_override = Some(path);
     }
 
     pub fn get(&self, session_id: &str) -> Option<&SessionRecord> {
         self.sessions.get(session_id)
     }
 
-    fn get_mut_or_unknown(
-        &mut self,
-        session_id: &str,
-    ) -> Result<&mut SessionRecord, CommandError> {
+    /// The session's CLI bridge handle, if the session exists.
+    pub fn bridge(&self, session_id: &str) -> Option<Arc<CliBridge>> {
+        self.bridges.get(session_id).cloned()
+    }
+
+    /// Model for a new session: the stored settings model when a
+    /// settings dir is set, else the CLI's free default. Settings never
+    /// fail session creation (a bad file falls back to the default).
+    fn model_for_new_session(&self) -> String {
+        match &self.settings_dir {
+            Some(dir) => CliSettings::load(dir).model,
+            None => DEFAULT_MODEL.to_string(),
+        }
+    }
+
+    fn get_mut_or_unknown(&mut self, session_id: &str) -> Result<&mut SessionRecord, CommandError> {
         self.sessions.get_mut(session_id).ok_or_else(|| {
             CommandError::new(
                 ERR_UNKNOWN_SESSION,
@@ -236,10 +294,10 @@ impl Registry {
         })
     }
 
-    /// sen_session_create: backend record only, state Running. No model
-    /// call happens here or anywhere in the backend; the model runs
-    /// through the CLI core + stream-json bridge, which lands in a later
-    /// phase, so a created session has a record but no model runtime yet.
+    /// sen_session_create: backend record only, state Running, plus one
+    /// CLI bridge handle for the session (model from local settings,
+    /// default free model when nothing is stored). No model call happens
+    /// here: the handle spawns nothing until the first steer.
     pub fn create(
         &mut self,
         session_id: &str,
@@ -258,6 +316,7 @@ impl Registry {
                 &format!("Session already exists: {}", session_id),
             ));
         }
+        let model = self.model_for_new_session();
         self.sessions.insert(
             session_id.to_string(),
             SessionRecord {
@@ -267,27 +326,37 @@ impl Registry {
                 subscribers: 0,
             },
         );
+        self.bridges.insert(
+            session_id.to_string(),
+            Arc::new(CliBridge::new(
+                self.zen_bin_override.clone(),
+                session_id,
+                &model,
+            )),
+        );
         Ok(SessionState::Running)
     }
 
-    /// sen_session_steer / sen_session_follow_up: the backend gates on a
-    /// Running session, then refuses with MODEL_NOT_WIRED until the CLI
-    /// bridge lands. The refusal happens BEFORE any log entry, so the
-    /// backend never records a steer that did not run a model — the
-    /// BUG-06 lesson (an ack must never imply a model call happened).
-    /// Once the CLI bridge is wired, this refusal is replaced by the
-    /// real model call and the log entry below records it.
-    pub fn steer(
+    /// sen_session_steer / sen_session_follow_up, step 1 of 3: validate
+    /// the contract, the text, and the Running gate, and hand out the
+    /// session's bridge. The caller runs the turn on the bridge WITHOUT
+    /// holding the registry lock, then calls complete_steer. `kind` is
+    /// "steer" or "follow_up".
+    pub fn begin_steer(
         &mut self,
         session_id: &str,
         contract: &ActionContract,
-        // `_kind` ("steer" / "follow_up") names the log entry the CLI
-        // bridge will record once it runs the model; unused until then.
-        _kind: &str,
+        kind: &str,
         text: &str,
-    ) -> Result<SessionState, CommandError> {
+    ) -> Result<Arc<CliBridge>, CommandError> {
         validate_contract(contract)?;
-        if text.is_empty() {
+        if kind != "steer" && kind != "follow_up" {
+            return Err(CommandError::new(
+                ERR_INVALID_CONTRACT,
+                "steer kind must be steer or follow_up, FAIL",
+            ));
+        }
+        if text.trim().is_empty() {
             return Err(CommandError::new(
                 ERR_INVALID_CONTRACT,
                 "steer/follow-up text must be non-empty, FAIL",
@@ -303,18 +372,64 @@ impl Registry {
                 ),
             ));
         }
-        // No model runtime exists in this phase (CLI bridge lands later):
-        // refuse instead of acking. A steer that never ran a model must
-        // not enter the log as if it had.
-        return Err(CommandError::new(
-            ERR_MODEL_NOT_WIRED,
-            "Model runtime NOT WIRED YET: the CLI core + stream-json bridge lands in a later phase, no model call ran.",
-        ));
+        self.bridges.get(session_id).cloned().ok_or_else(|| {
+            CommandError::new(
+                ERR_UNKNOWN_SESSION,
+                &format!("Session has no CLI bridge: {}", session_id),
+            )
+        })
     }
 
-    /// sen_session_abort: Running or AwaitingApproval -> Cancelled, per the
-    /// point-854 table. Error has no path to Cancelled (only Running and
-    /// Failed), and terminal states have no outgoing path at all.
+    /// sen_session_steer / sen_session_follow_up, step 3 of 3: record the
+    /// turn AFTER the model ran. The log entry is written only here, so
+    /// the backend never records a steer that did not run a model — the
+    /// BUG-06 lesson. If the session left Running meanwhile (abort won
+    /// the race), the turn is NOT recorded and this refuses.
+    pub fn complete_steer(
+        &mut self,
+        session_id: &str,
+        kind: &str,
+        turn: &TurnResult,
+    ) -> Result<SessionState, CommandError> {
+        let record = self.get_mut_or_unknown(session_id)?;
+        if record.state != SessionState::Running {
+            return Err(CommandError::new(
+                ERR_ILLEGAL_TRANSITION,
+                &format!(
+                    "Session is {} after the turn, steer not recorded",
+                    record.state.as_str()
+                ),
+            ));
+        }
+        record.log.push(format!("steer:{}:{}", kind, turn.subtype));
+        Ok(record.state)
+    }
+
+    /// Run a whole turn in one call (tests only): begin, turn, complete.
+    /// Production wrappers use the three steps separately so the turn
+    /// runs without the registry lock held. Events go to `emit`.
+    #[cfg(test)]
+    pub fn steer(
+        &mut self,
+        session_id: &str,
+        contract: &ActionContract,
+        kind: &str,
+        text: &str,
+        emit: &mut dyn FnMut(SenEvent),
+    ) -> Result<SessionState, CommandError> {
+        let bridge = self.begin_steer(session_id, contract, kind, text)?;
+        let turn = bridge
+            .run_turn(kind, text, emit)
+            .map_err(bridge_error_to_command)?;
+        self.complete_steer(session_id, kind, &turn)
+    }
+
+    /// sen_session_abort: escalate the running CLI turn first (SIGINT,
+    /// 5s grace, SIGKILL — decision 3), then Running or
+    /// AwaitingApproval -> Cancelled, per the point-854 table. Error has
+    /// no path to Cancelled (only Running and Failed), and terminal
+    /// states have no outgoing path at all. With no turn running the
+    /// escalation is a no-op and this is a pure state transition.
     pub fn abort(
         &mut self,
         session_id: &str,
@@ -331,8 +446,19 @@ impl Registry {
                 ),
             ));
         }
+        let outcome = match self.bridges.get(session_id) {
+            Some(bridge) => bridge.abort(),
+            None => AbortOutcome::NoChild,
+        };
+        let record = self.get_mut_or_unknown(session_id)?;
         record.state = SessionState::Cancelled;
-        record.log.push("session_abort".to_string());
+        match outcome {
+            AbortOutcome::NoChild => record.log.push("session_abort".to_string()),
+            AbortOutcome::ExitedAfterSigint => record.log.push("session_abort:sigint".to_string()),
+            AbortOutcome::KilledAfterGrace => record
+                .log
+                .push("session_abort:kill-after-grace".to_string()),
+        }
         Ok(record.state)
     }
 
@@ -407,11 +533,46 @@ mod tests {
         assert!(can_transition(Error, Failed));
         assert!(!can_transition(Error, Cancelled));
         for terminal in [Completed, Cancelled, Failed] {
-            for to in [Running, AwaitingApproval, Error, Completed, Cancelled, Failed] {
+            for to in [
+                Running,
+                AwaitingApproval,
+                Error,
+                Completed,
+                Cancelled,
+                Failed,
+            ] {
                 assert!(!can_transition(terminal, to));
             }
         }
     }
+
+    /// A fake `zen` binary for tests: prints "zen 0.1.0" for --version,
+    /// else runs the given shell body (which prints canned stream-json).
+    fn fake_zen(tag: &str, body: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sen_reg_fake_zen_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zen");
+        let mut script = String::from("#!/bin/sh\n");
+        script.push_str("if [ \"$1\" = \"--version\" ]; then echo \"zen 0.1.0\"; exit 0; fi\n");
+        script.push_str(body);
+        script.push('\n');
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    const HAPPY_BODY: &str = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free","tools":[],"mcp_servers":[],"permissionMode":"default","slash_commands":[],"v":1}
+{"type":"assistant","uuid":"u1","session_id":"s1","message":{"role":"assistant","content":"hello"},"parent_tool_use_id":null,"v":1}
+{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0},"model":"m:free","session_id":"s1","v":1}
+EOF
+exit 0"#;
 
     #[test]
     fn create_then_duplicate_then_unknown() {
@@ -419,7 +580,10 @@ mod tests {
         assert_eq!(reg.create("s1", &contract()), Ok(SessionState::Running));
         let dup = reg.create("s1", &contract()).unwrap_err();
         assert_eq!(dup.code, ERR_DUPLICATE_SESSION);
-        let missing = reg.steer("nope", &contract(), "steer", "hi").unwrap_err();
+        let mut emit = |_ev: SenEvent| {};
+        let missing = reg
+            .steer("nope", &contract(), "steer", "hi", &mut emit)
+            .unwrap_err();
         assert_eq!(missing.code, ERR_UNKNOWN_SESSION);
         let missing = reg.abort("nope", &contract()).unwrap_err();
         assert_eq!(missing.code, ERR_UNKNOWN_SESSION);
@@ -428,38 +592,130 @@ mod tests {
     }
 
     #[test]
-    fn steer_requires_running_and_refuses_without_model() {
+    fn create_wires_a_bridge_with_the_default_free_model() {
         let mut reg = Registry::new();
         reg.create("s1", &contract()).unwrap();
-        // No model runtime exists in this phase (CLI bridge lands later):
-        // steer and follow_up refuse with MODEL_NOT_WIRED and the log
-        // does not grow — a steer that never ran a model is never
-        // recorded as if it had (BUG-06 lesson).
-        let err = reg.steer("s1", &contract(), "steer", "hi").unwrap_err();
-        assert_eq!(err.code, ERR_MODEL_NOT_WIRED);
+        let bridge = reg.bridge("s1").unwrap();
+        assert_eq!(bridge.session_id(), "s1");
+        assert_eq!(bridge.model(), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn create_uses_the_stored_settings_model() {
+        let dir = std::env::temp_dir().join(format!("sen_reg_settings_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        CliSettings {
+            model: "some/model:free".to_string(),
+        }
+        .save(&dir)
+        .unwrap();
+        let mut reg = Registry::with_settings_dir(dir.clone());
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.bridge("s1").unwrap().model(), "some/model:free");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn steer_runs_the_model_and_logs_only_after_the_result() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("happy", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], SenEvent::SessionStart { .. }));
+        assert!(matches!(events[2], SenEvent::Result { .. }));
+        // The log grew only because the model ran (BUG-06 lesson).
+        assert_eq!(reg.get("s1").unwrap().log.len(), 2);
+        assert!(reg.get("s1").unwrap().log[1].starts_with("steer:steer:success"));
+        // A second turn on the same session works (resume path).
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "follow_up", "again", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+    }
+
+    #[test]
+    fn steer_failure_leaves_no_log_entry() {
+        let body = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}
+EOF
+exit 1"#;
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("noresult", body));
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
+        let mut emit = |_ev: SenEvent| {};
         let err = reg
-            .steer("s1", &contract(), "follow_up", "again")
+            .steer("s1", &contract(), "steer", "hi", &mut emit)
             .unwrap_err();
-        assert_eq!(err.code, ERR_MODEL_NOT_WIRED);
+        assert_eq!(err.code, "CLI_NO_RESULT");
+        // A steer that never ran a model to a result is never recorded
+        // as if it had (BUG-06 lesson).
         assert_eq!(reg.get("s1").unwrap().log.len(), 1);
         assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
-        // The refusals harmed nothing: the session still aborts cleanly,
-        // and steering a terminal session is still ILLEGAL_TRANSITION
-        // (the state check runs before the model check).
+    }
+
+    #[test]
+    fn begin_steer_rejects_bad_kind_empty_text_and_terminal() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("happy2", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let err = reg
+            .begin_steer("s1", &contract(), "nudge", "hi")
+            .unwrap_err();
+        assert_eq!(err.code, ERR_INVALID_CONTRACT);
+        let err = reg
+            .begin_steer("s1", &contract(), "steer", "   ")
+            .unwrap_err();
+        assert_eq!(err.code, ERR_INVALID_CONTRACT);
         reg.abort("s1", &contract()).unwrap();
-        let err = reg.steer("s1", &contract(), "steer", "hi").unwrap_err();
+        let err = reg
+            .begin_steer("s1", &contract(), "steer", "hi")
+            .unwrap_err();
         assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
     }
 
     #[test]
-    fn steer_model_not_wired_leaves_no_log_entry() {
+    fn abort_escalates_the_running_turn_then_cancels() {
+        // Fake CLI: traps SIGINT, prints the interrupted result, exits
+        // 130 — the real CLI's SIGINT behaviour.
+        let body = r#"trap 'printf "%s\n" "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"Interrupted by user\",\"duration_ms\":1,\"num_turns\":0,\"usage\":{},\"model\":\"m:free\",\"session_id\":\"s1\",\"v\":1}"; exit 130' INT
+echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
+i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("abort", body));
         reg.create("s1", &contract()).unwrap();
-        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
-        let err = reg.steer("s1", &contract(), "steer", "hi").unwrap_err();
-        assert_eq!(err.code, ERR_MODEL_NOT_WIRED);
-        assert!(err.message.contains("CLI core"));
-        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
+        let bridge = reg.bridge("s1").unwrap();
+        let bridge_run = std::sync::Arc::clone(&bridge);
+        let handle = std::thread::spawn(move || {
+            let mut emit = |_ev: SenEvent| {};
+            bridge_run.run_turn("steer", "hi", &mut emit)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(reg.abort("s1", &contract()), Ok(SessionState::Cancelled));
+        assert!(reg
+            .get("s1")
+            .unwrap()
+            .log
+            .contains(&"session_abort:sigint".to_string()));
+        // The interrupted turn resolves with its interrupted result.
+        let turn = handle.join().unwrap().unwrap();
+        assert!(turn.is_error);
+        assert_eq!(turn.subtype, "error_during_execution");
+        // complete_steer refuses: the session left Running meanwhile,
+        // so the interrupted turn is not recorded as a steer.
+        let err = reg.complete_steer("s1", "steer", &turn).unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
     }
 
     #[test]

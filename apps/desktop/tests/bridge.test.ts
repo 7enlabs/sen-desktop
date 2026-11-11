@@ -148,20 +148,20 @@ test("session-client steer/followUp: pure IPC calls in order, args passed throug
   setBridgeTransport(null);
 });
 
-test("session-client steer: backend MODEL_NOT_WIRED refusal surfaces, local stays Running", async () => {
+test("session-client steer: backend CLI failure surfaces, local stays Running", async () => {
   setBridgeTransport(async (command) => {
     if (command === "sen_session_create") {
       return { sessionId: "s1", state: "Running" };
     }
     throw new Error(
-      "MODEL_NOT_WIRED: the CLI core + stream-json bridge lands in a later phase, no model call ran.",
+      "CLI_NO_RESULT: CLI turn ended with no result record (exited general error (1)).",
     );
   });
   const manager = new SessionManager();
   await createSession(manager, contract(), "s1");
   await assert.rejects(
     () => steerSession(contract(), "s1", "hi"),
-    /MODEL_NOT_WIRED/,
+    /CLI_NO_RESULT/,
   );
   // The refusal recorded nothing locally: the session is still Running.
   assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
