@@ -40,30 +40,6 @@ function contract(): ActionContract {
   };
 }
 
-function fakeHandle() {
-  const calls: string[] = [];
-  const handle = {
-    calls,
-    steer: async (text: string) => {
-      calls.push("steer:" + text);
-    },
-    followUp: async (text: string) => {
-      calls.push("followUp:" + text);
-    },
-    abort: async () => {
-      calls.push("abort");
-    },
-    subscribe: () => {
-      calls.push("subscribe");
-      return () => {};
-    },
-    dispose: () => {
-      calls.push("dispose");
-    },
-  };
-  return handle;
-}
-
 test("bridge: contract validated before transport is called", async () => {
   const calls: Array<[string, unknown]> = [];
   setBridgeTransport(async (command, args) => {
@@ -133,7 +109,7 @@ test("session-client create: backend ack + local Running, mismatch refused", asy
   setBridgeTransport(null);
 });
 
-test("session-client steer: no handle refuses before transport", async () => {
+test("session-client steer: pure IPC, backend ack returned, no local state change", async () => {
   const calls: string[] = [];
   setBridgeTransport(async (command) => {
     calls.push(command);
@@ -141,15 +117,16 @@ test("session-client steer: no handle refuses before transport", async () => {
   });
   const manager = new SessionManager();
   await createSession(manager, contract(), "s1");
-  await assert.rejects(
-    () => steerSession(manager, undefined, contract(), "s1", "hi"),
-    /No model channel attached/,
-  );
-  assert.equal(calls.length, 1);
+  const res = await steerSession(contract(), "s1", "hi");
+  assert.equal(res.state, "Running");
+  assert.deepEqual(calls, ["sen_session_create", "sen_session_steer"]);
+  // No local state was recorded for the steer: the session is still
+  // Running and accepts the Cancelled transition.
+  assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
   setBridgeTransport(null);
 });
 
-test("session-client steer/followUp: bound handle drives backend gate + SDK call", async () => {
+test("session-client steer/followUp: pure IPC calls in order, args passed through", async () => {
   const calls: Array<[string, unknown]> = [];
   setBridgeTransport(async (command, args) => {
     calls.push([command, args]);
@@ -157,11 +134,9 @@ test("session-client steer/followUp: bound handle drives backend gate + SDK call
   });
   const manager = new SessionManager();
   await createSession(manager, contract(), "s1");
-  const handle = fakeHandle();
-  manager.bindSdkSession("s1", handle as never);
-  const steered = await steerSession(manager, handle as never, contract(), "s1", "hi");
+  const steered = await steerSession(contract(), "s1", "hi");
   assert.equal(steered.state, "Running");
-  const followed = await followUpSession(manager, handle as never, contract(), "s1", "again");
+  const followed = await followUpSession(contract(), "s1", "again");
   assert.equal(followed.state, "Running");
   assert.deepEqual(
     calls.map(([c]) => c),
@@ -170,23 +145,30 @@ test("session-client steer/followUp: bound handle drives backend gate + SDK call
   const steerArgs = calls[1][1] as Record<string, unknown>;
   assert.equal(steerArgs["session_id"], "s1");
   assert.equal(steerArgs["text"], "hi");
-  assert.deepEqual(handle.calls, ["steer:hi", "followUp:again"]);
   setBridgeTransport(null);
 });
 
-test("session-client steer: unbound handle refused even when one is passed", async () => {
-  setBridgeTransport(async () => ({ sessionId: "s1", state: "Running" }));
+test("session-client steer: backend MODEL_NOT_WIRED refusal surfaces, local stays Running", async () => {
+  setBridgeTransport(async (command) => {
+    if (command === "sen_session_create") {
+      return { sessionId: "s1", state: "Running" };
+    }
+    throw new Error(
+      "MODEL_NOT_WIRED: the CLI core + stream-json bridge lands in a later phase, no model call ran.",
+    );
+  });
   const manager = new SessionManager();
   await createSession(manager, contract(), "s1");
-  const handle = fakeHandle();
   await assert.rejects(
-    () => steerSession(manager, handle as never, contract(), "s1", "hi"),
-    /not bound in SessionManager/,
+    () => steerSession(contract(), "s1", "hi"),
+    /MODEL_NOT_WIRED/,
   );
+  // The refusal recorded nothing locally: the session is still Running.
+  assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
   setBridgeTransport(null);
 });
 
-test("session-client abort: backend + SDK abort + local Cancelled", async () => {
+test("session-client abort: backend + local Cancelled through IPC", async () => {
   const calls: string[] = [];
   setBridgeTransport(async (command) => {
     calls.push(command);
@@ -197,12 +179,9 @@ test("session-client abort: backend + SDK abort + local Cancelled", async () => 
   });
   const manager = new SessionManager();
   await createSession(manager, contract(), "s1");
-  const handle = fakeHandle();
-  manager.bindSdkSession("s1", handle as never);
-  const res = await abortSession(manager, handle as never, contract(), "s1");
+  const res = await abortSession(manager, contract(), "s1");
   assert.equal(res.state, "Cancelled");
   assert.deepEqual(calls, ["sen_session_create", "sen_session_abort"]);
-  assert.deepEqual(handle.calls, ["abort", "dispose"]);
   assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
   setBridgeTransport(null);
 });

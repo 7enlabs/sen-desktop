@@ -1,17 +1,15 @@
 // SessionManager and AgentSessionRuntime: session lifecycle, per prep B-2
 // section 1 and point 854.
-// SDK PART, fill-in round (messages 4128/4138): the real createAgentSession
-// import lives in ./agent-session.ts (pi-coding-agent 1.5.0). This file keeps
-// the local statechart frame; create() below still records local state only
-// and makes no SDK call. An SDK-backed session attaches through
-// bindSdkSession(), which needs an explicitly provided model runtime (see
-// agent-session.ts); without one, no live session exists, by design.
-// The type-only import below is erased at runtime, so this file stays
-// loadable without node_modules installed.
+// SDK move (tin 9328/9459): the Pi SDK is out of the webview. This file
+// keeps only the local statechart frame; create() below records local
+// state only and makes no model call, and there is no SDK handle storage
+// here anymore (bindSdkSession/getSdkSession are gone with the SDK
+// modules). The model runs in the backend through the CLI core +
+// stream-json bridge; the frontend mirrors the session state locally
+// through this statechart and the IPC bridge.
 // The statechart below is real logic per point 854 (see
 // packages/core/tests/logic.test.ts).
 import { RawLog } from "./raw-log.ts";
-import type { SenAgentSession } from "./agent-session.ts";
 
 export type SessionState =
   | "Running"
@@ -41,7 +39,6 @@ export function canTransition(from: SessionState, to: SessionState): boolean {
 
 export class SessionManager {
   private states = new Map<string, SessionState>();
-  private sdkSessions = new Map<string, SenAgentSession>();
   readonly rawLog = new RawLog();
 
   create(sessionId: string): SessionState {
@@ -57,36 +54,20 @@ export class SessionManager {
         "DUPLICATE_SESSION: Session already exists: " + sessionId,
       );
     }
-    // Local statechart frame only: no SDK call here. An SDK-backed session
-    // attaches through bindSdkSession() with an explicit model runtime.
+    // Local statechart frame only: no model call here. The model runs in
+    // the backend through the CLI core + stream-json bridge.
     this.states.set(sessionId, "Running");
-    this.rawLog.append(sessionId, "session_create_stub", { note: "LOCAL STATE ONLY, NO SDK CALL" });
+    this.rawLog.append(sessionId, "session_create_stub", { note: "LOCAL STATE ONLY, NO MODEL CALL" });
     return "Running";
   }
 
   // Read-only ownership check: does this manager already hold a record
   // (any state, including terminal) for this id? Callers that create a
   // session through another layer check this first, because create()
-  // itself still overwrites silently (BUG-04, not fixed here).
+  // refuses duplicates (BUG-04, fixed in create() above) and a second
+  // create would throw instead of silently overwriting.
   hasSession(sessionId: string): boolean {
     return this.states.has(sessionId);
-  }
-
-  // Binds a real SDK session handle (created via createSenAgentSession in
-  // ./agent-session.ts with an explicit model runtime) to a local session id.
-  // Binding alone makes no model call; it only records the link and the log.
-  bindSdkSession(sessionId: string, handle: SenAgentSession): SessionState {
-    const state = this.states.get(sessionId);
-    if (!state) {
-      throw new Error("Session does not exist: " + sessionId);
-    }
-    this.sdkSessions.set(sessionId, handle);
-    this.rawLog.append(sessionId, "session_sdk_bound", { note: "SDK session bound; binding alone makes no model call" });
-    return state;
-  }
-
-  getSdkSession(sessionId: string): SenAgentSession | undefined {
-    return this.sdkSessions.get(sessionId);
   }
 
   transition(sessionId: string, to: SessionState): SessionState {

@@ -6,11 +6,12 @@
 // convert wire args and delegate here; they hold no logic of their own.
 //
 // Design, per prep B-2 section 2 and the decided point-854 statechart:
-// - The backend owns the command gate and the session record. The Pi SDK
-//   session itself lives in the frontend webview (packages/core, JS), so
-//   the backend never calls the SDK and never holds a model, a key, or a
-//   network call. A backend record with no SDK session bound is the
-//   designed intermediate state: local record only, no live session.
+// - The backend owns the command gate and the session record. The model
+//   runs in the backend through the CLI core + stream-json bridge (a later
+//   phase); until then steer/follow_up refuse with MODEL_NOT_WIRED instead
+//   of acking a model call that never ran. The backend never calls the Pi
+//   SDK and never holds a key: the SDK is out of the webview entirely
+//   (tin 9328/9459), so no model runtime exists anywhere in this phase.
 // - Session state transitions mirror packages/core/src/session.ts exactly:
 //   Running -> AwaitingApproval | Error | Completed | Cancelled | Failed,
 //   AwaitingApproval -> Running | Cancelled (rejection never hangs),
@@ -99,6 +100,7 @@ pub const ERR_DUPLICATE_SESSION: &str = "DUPLICATE_SESSION";
 pub const ERR_ILLEGAL_TRANSITION: &str = "ILLEGAL_TRANSITION";
 pub const ERR_INVALID_CONTRACT: &str = "INVALID_CONTRACT";
 pub const ERR_TOOL_EXECUTION_NOT_WIRED: &str = "TOOL_EXECUTION_NOT_WIRED";
+pub const ERR_MODEL_NOT_WIRED: &str = "MODEL_NOT_WIRED";
 
 // --- IPC action contract (mirror of apps/desktop/src/ipc/types.ts) ---
 
@@ -234,9 +236,10 @@ impl Registry {
         })
     }
 
-    /// sen_session_create: backend record only, state Running. No SDK call
-    /// happens here or anywhere in the backend; a live session needs a
-    /// frontend-bound model runtime, which this phase deliberately has none.
+    /// sen_session_create: backend record only, state Running. No model
+    /// call happens here or anywhere in the backend; the model runs
+    /// through the CLI core + stream-json bridge, which lands in a later
+    /// phase, so a created session has a record but no model runtime yet.
     pub fn create(
         &mut self,
         session_id: &str,
@@ -267,17 +270,20 @@ impl Registry {
         Ok(SessionState::Running)
     }
 
-    /// sen_session_steer / sen_session_follow_up: the backend records the
-    /// intent and gates on a Running session. The real SDK steer/followUp
-    /// call happens in the frontend (packages/core) after this ack, only
-    /// when a model runtime is bound there; without one the frontend
-    /// refuses before ever calling here, so a backend ack never implies
-    /// a model call happened.
+    /// sen_session_steer / sen_session_follow_up: the backend gates on a
+    /// Running session, then refuses with MODEL_NOT_WIRED until the CLI
+    /// bridge lands. The refusal happens BEFORE any log entry, so the
+    /// backend never records a steer that did not run a model — the
+    /// BUG-06 lesson (an ack must never imply a model call happened).
+    /// Once the CLI bridge is wired, this refusal is replaced by the
+    /// real model call and the log entry below records it.
     pub fn steer(
         &mut self,
         session_id: &str,
         contract: &ActionContract,
-        kind: &str,
+        // `_kind` ("steer" / "follow_up") names the log entry the CLI
+        // bridge will record once it runs the model; unused until then.
+        _kind: &str,
         text: &str,
     ) -> Result<SessionState, CommandError> {
         validate_contract(contract)?;
@@ -297,8 +303,13 @@ impl Registry {
                 ),
             ));
         }
-        record.log.push(kind.to_string());
-        Ok(record.state)
+        // No model runtime exists in this phase (CLI bridge lands later):
+        // refuse instead of acking. A steer that never ran a model must
+        // not enter the log as if it had.
+        return Err(CommandError::new(
+            ERR_MODEL_NOT_WIRED,
+            "Model runtime NOT WIRED YET: the CLI core + stream-json bridge lands in a later phase, no model call ran.",
+        ));
     }
 
     /// sen_session_abort: Running or AwaitingApproval -> Cancelled, per the
@@ -326,9 +337,9 @@ impl Registry {
     }
 
     /// sen_events_subscribe: records one subscriber on the session. The
-    /// event stream itself flows from the SDK to the frontend through the
-    /// frontend subscribe handle (packages/core); this record is the
-    /// backend bookkeeping for it, not the stream.
+    /// event stream itself will flow from the backend (Tauri events) once
+    /// the CLI bridge lands; this record is the backend bookkeeping for
+    /// it, not the stream.
     pub fn subscribe(
         &mut self,
         session_id: &str,
@@ -417,21 +428,38 @@ mod tests {
     }
 
     #[test]
-    fn steer_requires_running_and_logs() {
+    fn steer_requires_running_and_refuses_without_model() {
         let mut reg = Registry::new();
         reg.create("s1", &contract()).unwrap();
-        assert_eq!(
-            reg.steer("s1", &contract(), "steer", "hi"),
-            Ok(SessionState::Running)
-        );
-        assert_eq!(
-            reg.steer("s1", &contract(), "follow_up", "again"),
-            Ok(SessionState::Running)
-        );
-        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+        // No model runtime exists in this phase (CLI bridge lands later):
+        // steer and follow_up refuse with MODEL_NOT_WIRED and the log
+        // does not grow — a steer that never ran a model is never
+        // recorded as if it had (BUG-06 lesson).
+        let err = reg.steer("s1", &contract(), "steer", "hi").unwrap_err();
+        assert_eq!(err.code, ERR_MODEL_NOT_WIRED);
+        let err = reg
+            .steer("s1", &contract(), "follow_up", "again")
+            .unwrap_err();
+        assert_eq!(err.code, ERR_MODEL_NOT_WIRED);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
+        // The refusals harmed nothing: the session still aborts cleanly,
+        // and steering a terminal session is still ILLEGAL_TRANSITION
+        // (the state check runs before the model check).
         reg.abort("s1", &contract()).unwrap();
         let err = reg.steer("s1", &contract(), "steer", "hi").unwrap_err();
         assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+    }
+
+    #[test]
+    fn steer_model_not_wired_leaves_no_log_entry() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
+        let err = reg.steer("s1", &contract(), "steer", "hi").unwrap_err();
+        assert_eq!(err.code, ERR_MODEL_NOT_WIRED);
+        assert!(err.message.contains("CLI core"));
+        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
     }
 
     #[test]

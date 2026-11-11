@@ -4,8 +4,8 @@
 // dev.7enlab.sen-desktop, core Tauri permissions only, no plugin).
 // No live session exists yet by design: session creation needs an
 // explicitly provided model runtime in the frontend, which this phase
-// deliberately has none. The frontend bundler is still missing, so there
-// is no distributable build yet even though the backend wires up.
+// deliberately has none. The frontend is bundled with Vite (PR #21), so
+// `pnpm build` produces dist/; the backend wires up the commands.
 mod commands;
 
 use std::sync::Mutex;
