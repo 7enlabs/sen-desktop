@@ -30,8 +30,10 @@
 //   so a turn with no API key (the real CLI hangs after its init line
 //   without an auth error) does not hang silently until the user aborts.
 //   The 180s process-kill backstop is unchanged. The IPC contract
-//   timeout_ms is a different value (validated positive only) and does
-//   not bound the turn.
+//   timeout_ms is the per-turn deadline, capped at the 120s turn
+//   timeout: the effective deadline is min(timeout_ms, 120s) (BUG-11
+//   fix). A turn never runs longer than 120s, and a shorter contract
+//   deadline ends a hanging turn earlier, as the contract promises.
 //
 // PERSISTENCE, STATED HONESTLY (the decision-3 limit, see phase2-PLAN.md):
 // CLI 0.1.0 `-p` mode is one-shot — it reads stdin to EOF, runs one
@@ -67,9 +69,10 @@ pub const STDERR_TAIL_LEN: usize = 8192;
 /// result record within this long is killed and reported as
 /// CLI_TURN_TIMEOUT, so a turn with no API key (the real CLI hangs
 /// without an auth error) does not hang silently until the user aborts.
-/// Under the 180s process-kill backstop, which is unchanged. This is a
-/// bridge-internal turn limit, NOT the IPC contract timeout_ms (the
-/// contract value is only validated as positive by the registry).
+/// Under the 180s process-kill backstop, which is unchanged. This is
+/// also the CAP for a per-turn contract timeout_ms (BUG-11): the
+/// effective turn deadline is min(timeout_ms, TURN_TIMEOUT), so a turn
+/// never runs longer than 120s.
 pub const TURN_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,11 +275,28 @@ impl CliBridge {
     /// One turn at a time per handle: a second steer while one is in
     /// flight refuses with CLI_TURN_IN_PROGRESS. Events are delivered
     /// through `emit` as they arrive; the turn result comes from the
-    /// CLI's `result` record, never from the exit code.
+    /// CLI's `result` record, never from the exit code. The deadline is
+    /// the bridge turn timeout (120s by Leader decision).
     pub fn run_turn(
         &self,
         kind: &str,
         text: &str,
+        emit: &mut dyn FnMut(SenEvent),
+    ) -> Result<TurnResult, BridgeError> {
+        self.run_turn_with_timeout(kind, text, self.turn_timeout, emit)
+    }
+
+    /// Run one turn with a per-turn deadline from the IPC contract
+    /// (BUG-11): the effective deadline is min(timeout, turn_timeout),
+    /// so the contract timeout_ms bounds the turn but never extends it
+    /// past the 120s turn timeout (Leader tin 9566 decision 1). A turn
+    /// that produces no result record within the effective deadline is
+    /// killed and reported as CLI_TURN_TIMEOUT.
+    pub fn run_turn_with_timeout(
+        &self,
+        kind: &str,
+        text: &str,
+        timeout: Duration,
         emit: &mut dyn FnMut(SenEvent),
     ) -> Result<TurnResult, BridgeError> {
         if text.trim().is_empty() {
@@ -307,10 +327,11 @@ impl CliBridge {
         };
         let _guard = TurnGuard { bridge: self };
 
-        // Turn deadline: the turn must produce its result record within
-        // turn_timeout (120s by Leader decision), counting from here so
-        // a slow probe/spawn counts too.
-        let deadline = std::time::Instant::now() + self.turn_timeout;
+        // Turn deadline: the effective deadline is min(timeout,
+        // turn_timeout) (BUG-11), counting from here so a slow
+        // probe/spawn counts too. The 120s cap never moves.
+        let effective_timeout = timeout.min(self.turn_timeout);
+        let deadline = std::time::Instant::now() + effective_timeout;
 
         let bin = self.resolve_bin()?;
         if !probed {
@@ -497,7 +518,7 @@ impl CliBridge {
                         ERR_CLI_TURN_TIMEOUT,
                         &format!(
                             "CLI turn timed out after {:?} with no result record: the CLI produced no result (a turn with no API key can hang without reporting an error; check ZEN_API_KEY).",
-                            self.turn_timeout
+                            effective_timeout
                         ),
                     ));
                 }
@@ -913,6 +934,61 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         assert_eq!(err.code, ERR_CLI_TURN_TIMEOUT);
         assert!(err.message.contains("300ms"));
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn run_turn_with_timeout_shorter_than_cap_cancels_turn() {
+        // BUG-11: a per-turn timeout shorter than the 120s bridge cap
+        // bounds the turn. The hanging fake must fail as
+        // CLI_TURN_TIMEOUT in well under 10s, with the 300ms deadline
+        // in the message.
+        let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
+i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
+        let bin = fake_zen("hangs3", body);
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free");
+        let started = std::time::Instant::now();
+        let mut emit = |_ev: SenEvent| {};
+        let err = bridge
+            .run_turn_with_timeout("steer", "hi", Duration::from_millis(300), &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, ERR_CLI_TURN_TIMEOUT);
+        assert!(err.message.contains("300ms"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn run_turn_with_timeout_longer_than_cap_is_capped() {
+        // BUG-11: a per-turn timeout longer than the bridge cap never
+        // extends the turn past the cap (Leader tin 9566: 120s). With
+        // a 300ms test cap, a 3600s request still times out at 300ms.
+        let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
+i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
+        let bin = fake_zen("hangs4", body);
+        let bridge =
+            CliBridge::new(Some(bin), "s1", "m:free").with_turn_timeout(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let mut emit = |_ev: SenEvent| {};
+        let err = bridge
+            .run_turn_with_timeout("steer", "hi", Duration::from_secs(3600), &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, ERR_CLI_TURN_TIMEOUT);
+        assert!(err.message.contains("300ms"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn run_turn_with_timeout_fast_turn_still_completes() {
+        // A turn that finishes quickly is not cut off by a short
+        // per-turn timeout.
+        let bin = fake_zen("fast2", HAPPY_BODY);
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free");
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        let result = bridge
+            .run_turn_with_timeout("steer", "hi", Duration::from_millis(300), &mut emit)
+            .unwrap();
+        assert_eq!(result.subtype, "success");
+        assert_eq!(events.len(), 3);
     }
 
     #[test]
