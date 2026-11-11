@@ -157,6 +157,19 @@ export async function abortSession(
   contract: ActionContract,
   sessionId: string,
 ): Promise<BackendSessionResult> {
+  // R2B-10: refuse before touching the backend when this manager holds
+  // no record for the session. Without this check the backend would
+  // cancel the session while its real owner still holds it Running,
+  // and the local transition below would throw "Session does not exist"
+  // after the backend already moved. The message keeps the
+  // transition() wording so callers see the same refusal.
+  if (!manager.hasSession(sessionId)) {
+    throw new Error(
+      "Session does not exist: " +
+        sessionId +
+        " (abort refused before backend call)",
+    );
+  }
   const raw = await invoke("sen_session_abort", {
     contract,
     session_id: sessionId,
