@@ -50,6 +50,9 @@ function liveTransport() {
     if (command === "sen_events_subscribe") {
       return { sessionId: a.session_id, subscriberId: 7 };
     }
+    if (command === "sen_events_unsubscribe") {
+      return { sessionId: a.session_id, subscriberCount: 0 };
+    }
     if (command === "sen_session_abort") {
       return { sessionId: a.session_id, state: "Cancelled" };
     }
@@ -98,9 +101,12 @@ test("live-client close: backend + local Cancelled through the IPC bridge", asyn
   const attached = await attachLiveSession(manager, contract(), "s1");
   const res = await closeLiveSession(manager, contract(), "s1");
   assert.deepEqual(res, { sessionId: "s1", state: "Cancelled" });
+  // BUG-09: close unsubscribes before abort, so the backend subscriber
+  // count drops instead of leaking.
   assert.deepEqual(transportCalls, [
     "sen_session_create",
     "sen_events_subscribe",
+    "sen_events_unsubscribe",
     "sen_session_abort",
   ]);
   assert.equal(attached.sessionId, "s1");
@@ -115,7 +121,10 @@ test("live-client close: a session that was never created refuses, no local reco
     () => closeLiveSession(manager, contract(), "s1"),
     /does not exist/,
   );
-  assert.deepEqual(transportCalls, ["sen_session_abort"]);
+  assert.deepEqual(transportCalls, [
+    "sen_events_unsubscribe",
+    "sen_session_abort",
+  ]);
   assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
   setBridgeTransport(null);
 });

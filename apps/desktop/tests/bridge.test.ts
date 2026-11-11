@@ -19,6 +19,7 @@ import {
   followUpSession,
   steerSession,
   subscribeSession,
+  unsubscribeSession,
 } from "../src/ipc/session-client.ts";
 import { SessionManager } from "../../../packages/core/src/session.ts";
 
@@ -201,5 +202,17 @@ test("session-client subscribe: returns subscriber id, mismatch refused", async 
   assert.equal(res.subscriberId, 1);
   setBridgeTransport(async () => ({ sessionId: "other", subscriberId: 1 }));
   await assert.rejects(() => subscribeSession(contract(), "s1"), /mismatch/);
+  setBridgeTransport(null);
+});
+
+test("session-client unsubscribe (BUG-09): returns remaining count, mismatch refused", async () => {
+  setBridgeTransport(async () => ({ sessionId: "s1", subscriberCount: 1 }));
+  const res = await unsubscribeSession(contract(), "s1");
+  assert.equal(res.sessionId, "s1");
+  assert.equal(res.subscriberCount, 1);
+  setBridgeTransport(async () => ({ sessionId: "other", subscriberCount: 1 }));
+  await assert.rejects(() => unsubscribeSession(contract(), "s1"), /mismatch/);
+  setBridgeTransport(async () => ({ sessionId: "s1" }));
+  await assert.rejects(() => unsubscribeSession(contract(), "s1"), /malformed/);
   setBridgeTransport(null);
 });

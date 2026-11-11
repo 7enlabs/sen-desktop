@@ -38,6 +38,7 @@ fn main() {
             commands::session::sen_session_abort,
             commands::tools::sen_tool_call,
             commands::events::sen_events_subscribe,
+            commands::events::sen_events_unsubscribe,
             commands::settings::sen_settings_get_model,
             commands::settings::sen_settings_set_model,
         ])

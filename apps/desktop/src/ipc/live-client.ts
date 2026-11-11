@@ -18,6 +18,7 @@ import {
   abortSession,
   createSession,
   subscribeSession,
+  unsubscribeSession,
 } from "./session-client.ts";
 import type { ActionContract } from "./types.ts";
 import { SessionManager } from "../../../../packages/core/src/session.ts";
@@ -45,13 +46,18 @@ export async function attachLiveSession(
   };
 }
 
-// Closes a live session: the backend + local Cancelled path (abortSession
-// through the IPC bridge). No SDK abort or dispose exists anymore, so the
-// old finally-return swallow (BUG-12) has no subject left.
+// Closes a live session: drop the backend subscriber first (BUG-09:
+// the backend count used to leak, because close never unsubscribed),
+// then the backend + local Cancelled path (abortSession through the
+// IPC bridge). Abort itself also resets the count to 0, so a direct
+// abort that bypasses this path leaks nothing either. No SDK abort or
+// dispose exists anymore, so the old finally-return swallow (BUG-12)
+// has no subject left.
 export async function closeLiveSession(
   manager: SessionManager,
   contract: ActionContract,
   sessionId: string,
 ): Promise<unknown> {
+  await unsubscribeSession(contract, sessionId);
   return abortSession(manager, contract, sessionId);
 }
