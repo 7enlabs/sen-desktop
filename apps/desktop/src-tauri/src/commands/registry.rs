@@ -33,8 +33,22 @@
 // complete_steer (record the turn, only after the model ran). A wrapper
 // that held the registry lock across the whole turn would deadlock abort:
 // abort needs the same lock to reach the bridge.
+//
+// Idempotency (BUG-10, #25): the idempotency key is enforced, not just
+// checked for presence. begin_steer returns Duplicate when the same
+// (idempotency key, contract id, kind, text) already completed on this
+// session, and the caller returns the recorded turn result WITHOUT
+// running the model again: no new turn, no new log entry, no new events.
+// Only a turn that ran to a result is recorded (complete_steer); a failed
+// turn records nothing, so a retry after a failure still executes.
+// Concurrent duplicate (BUG-10 extra, tin 9645/9650): the same steer
+// arriving WHILE the first one still runs is refused too (InFlight):
+// begin_steer records the key as in-flight the moment the turn begins,
+// so a second identical steer sees it before any model call starts.
+// There is no recorded result to replay yet, so the refusal is a
+// distinct InFlight answer, not a faked Duplicate turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -112,6 +126,7 @@ impl CommandError {
 
 pub const ERR_UNKNOWN_SESSION: &str = "UNKNOWN_SESSION";
 pub const ERR_DUPLICATE_SESSION: &str = "DUPLICATE_SESSION";
+pub const ERR_DUPLICATE_STEER: &str = "DUPLICATE_STEER";
 pub const ERR_ILLEGAL_TRANSITION: &str = "ILLEGAL_TRANSITION";
 pub const ERR_INVALID_CONTRACT: &str = "INVALID_CONTRACT";
 pub const ERR_TOOL_EXECUTION_NOT_WIRED: &str = "TOOL_EXECUTION_NOT_WIRED";
@@ -230,12 +245,77 @@ pub struct Registry {
     /// itself is per-turn (see cli_spawn.rs for why no process stays
     /// alive between turns).
     bridges: HashMap<String, Arc<CliBridge>>,
+    /// Completed steers per session, for idempotency (BUG-10, #25):
+    /// session id -> (steer key -> recorded turn result). Only turns
+    /// that ran to a result land here, via complete_steer.
+    completed_steers: HashMap<String, HashMap<SteerKey, TurnResult>>,
+    /// Steers currently running per session (BUG-10 extra, tin
+    /// 9645/9650): session id -> keys whose turn began but has not
+    /// finished yet. begin_steer inserts the key the moment the turn
+    /// begins; complete_steer removes it before recording the
+    /// completed turn, and release_steer removes it when the turn ends
+    /// without a result. A key is never in both sets at once: the move
+    /// happens under one &mut borrow, and the registry lock is never
+    /// held while the turn runs (see the Locking note above), so this
+    /// cannot deadlock abort.
+    in_flight_steers: HashMap<String, HashSet<SteerKey>>,
     /// App config dir holding cli-settings.json (None in tests and when
     /// the app config dir is unavailable: the default model applies).
     settings_dir: Option<PathBuf>,
     /// Explicit binary path (tests / operator override). None means the
     /// bridge resolves per decision 1 at first turn (ZEN_BIN, then PATH).
     zen_bin_override: Option<PathBuf>,
+}
+
+/// The identity of one steer for idempotency (BUG-10, #25). A duplicate
+/// is the SAME idempotency key AND the SAME contract AND the SAME text:
+/// a different key re-executes (a new request), a different contract id
+/// re-executes (a different action that happens to reuse a key), and a
+/// different text re-executes (a different request body). Kind is part
+/// of the key because steer and follow_up are different operations even
+/// when they share one contract (the app reuses one contract for the
+/// whole live session, see apps/desktop/src/app/main.ts). The map is
+/// per-session, so the same key on another session is independent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SteerKey {
+    pub idempotency_key: String,
+    pub contract_id: String,
+    pub kind: String,
+    pub text: String,
+}
+
+impl SteerKey {
+    pub fn new(contract: &ActionContract, kind: &str, text: &str) -> SteerKey {
+        SteerKey {
+            idempotency_key: contract.idempotency_key.clone(),
+            contract_id: contract.id.clone(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+        }
+    }
+}
+
+/// What begin_steer hands back (BUG-10, #25). Run means the turn must
+/// still execute on the bridge; Duplicate means this exact steer already
+/// completed on this session, and the caller returns the recorded turn
+/// result without running the model, pushing a log entry, or emitting
+/// events. InFlight (BUG-10 extra, tin 9645/9650) means the same steer
+/// is ALREADY RUNNING on this session right now: there is no recorded
+/// result to replay yet, so the caller refuses it outright
+/// (DUPLICATE_STEER) instead of starting a second model call for the
+/// same request. It is a separate variant from Duplicate on purpose:
+/// replaying would need a TurnResult that does not exist yet, and
+/// inventing one would fake a result.
+#[derive(Debug, Clone)]
+pub enum SteerStart {
+    Run(Arc<CliBridge>),
+    Duplicate {
+        state: SessionState,
+        turn: TurnResult,
+    },
+    InFlight {
+        state: SessionState,
+    },
 }
 
 fn bridge_error_to_command(error: BridgeError) -> CommandError {
@@ -247,6 +327,8 @@ impl Registry {
         Registry {
             sessions: HashMap::new(),
             bridges: HashMap::new(),
+            completed_steers: HashMap::new(),
+            in_flight_steers: HashMap::new(),
             settings_dir: None,
             zen_bin_override: None,
         }
@@ -338,17 +420,24 @@ impl Registry {
     }
 
     /// sen_session_steer / sen_session_follow_up, step 1 of 3: validate
-    /// the contract, the text, and the Running gate, and hand out the
-    /// session's bridge. The caller runs the turn on the bridge WITHOUT
-    /// holding the registry lock, then calls complete_steer. `kind` is
-    /// "steer" or "follow_up".
+    /// the contract, the text, and the Running gate, then either hand
+    /// out the session's bridge (Run) or, when this exact steer already
+    /// completed on the session, return the recorded turn result
+    /// (Duplicate) so the caller returns it without running the model
+    /// again (BUG-10, #25). When the same steer is still running on the
+    /// session, return InFlight instead (BUG-10 extra, tin 9645/9650):
+    /// the caller refuses it, it never starts a second model call. The
+    /// caller runs the turn on the bridge WITHOUT holding the registry
+    /// lock, then calls complete_steer (or release_steer when the turn
+    /// fails, so the key never leaks).
+    /// `kind` is "steer" or "follow_up".
     pub fn begin_steer(
         &mut self,
         session_id: &str,
         contract: &ActionContract,
         kind: &str,
         text: &str,
-    ) -> Result<Arc<CliBridge>, CommandError> {
+    ) -> Result<SteerStart, CommandError> {
         validate_contract(contract)?;
         if kind != "steer" && kind != "follow_up" {
             return Err(CommandError::new(
@@ -372,42 +461,127 @@ impl Registry {
                 ),
             ));
         }
-        self.bridges.get(session_id).cloned().ok_or_else(|| {
+        let state = record.state;
+        let key = SteerKey::new(contract, kind, text);
+        // Idempotency (BUG-10): same key + same contract + same text +
+        // same kind already completed -> replay the recorded result,
+        // never run the model again.
+        if let Some(prior) = self
+            .completed_steers
+            .get(session_id)
+            .and_then(|done| done.get(&key))
+        {
+            return Ok(SteerStart::Duplicate {
+                state,
+                turn: prior.clone(),
+            });
+        }
+        // Concurrent duplicate (BUG-10 extra, tin 9645/9650): the same
+        // steer is already running on this session — refuse it. The key
+        // was recorded as in-flight when the first steer began (below),
+        // so a second identical steer arriving while the first turn
+        // still runs sees it here instead of starting a second model
+        // call for the same request.
+        if self
+            .in_flight_steers
+            .get(session_id)
+            .map(|running| running.contains(&key))
+            .unwrap_or(false)
+        {
+            return Ok(SteerStart::InFlight { state });
+        }
+        let bridge = self.bridges.get(session_id).cloned().ok_or_else(|| {
             CommandError::new(
                 ERR_UNKNOWN_SESSION,
                 &format!("Session has no CLI bridge: {}", session_id),
             )
-        })
+        })?;
+        // Record the steer as in-flight NOW, while the registry lock is
+        // held and before the bridge is handed out: the caller runs the
+        // turn with NO lock held, so any identical steer that begins
+        // meanwhile is refused above. The bridge lookup ran first on
+        // purpose, so a missing bridge cannot leave a key behind.
+        self.in_flight_steers
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(key);
+        Ok(SteerStart::Run(bridge))
     }
 
     /// sen_session_steer / sen_session_follow_up, step 3 of 3: record the
     /// turn AFTER the model ran. The log entry is written only here, so
     /// the backend never records a steer that did not run a model — the
-    /// BUG-06 lesson. If the session left Running meanwhile (abort won
-    /// the race), the turn is NOT recorded and this refuses.
+    /// BUG-06 lesson. The completed turn is also stored under its steer
+    /// key, so a later retry of the same key + contract + text replays
+    /// this result instead of running again (BUG-10, #25). The
+    /// in-flight key is dropped FIRST, before anything else: on the
+    /// success path the key moves from in-flight to completed below; on
+    /// the refusal path (the session left Running, abort won the race)
+    /// the key must still not leak, so a later steer is never refused
+    /// for a turn that already ended (BUG-10 extra, tin 9645/9650). If
+    /// the session left Running meanwhile (abort won the race), the turn
+    /// is NOT recorded and this refuses.
     pub fn complete_steer(
         &mut self,
         session_id: &str,
+        contract: &ActionContract,
         kind: &str,
+        text: &str,
         turn: &TurnResult,
     ) -> Result<SessionState, CommandError> {
-        let record = self.get_mut_or_unknown(session_id)?;
-        if record.state != SessionState::Running {
-            return Err(CommandError::new(
-                ERR_ILLEGAL_TRANSITION,
-                &format!(
-                    "Session is {} after the turn, steer not recorded",
-                    record.state.as_str()
-                ),
-            ));
+        if let Some(running) = self.in_flight_steers.get_mut(session_id) {
+            running.remove(&SteerKey::new(contract, kind, text));
         }
-        record.log.push(format!("steer:{}:{}", kind, turn.subtype));
-        Ok(record.state)
+        let state = {
+            let record = self.get_mut_or_unknown(session_id)?;
+            if record.state != SessionState::Running {
+                return Err(CommandError::new(
+                    ERR_ILLEGAL_TRANSITION,
+                    &format!(
+                        "Session is {} after the turn, steer not recorded",
+                        record.state.as_str()
+                    ),
+                ));
+            }
+            record.log.push(format!("steer:{}:{}", kind, turn.subtype));
+            record.state
+        };
+        self.completed_steers
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(SteerKey::new(contract, kind, text), turn.clone());
+        Ok(state)
+    }
+
+    /// Release an in-flight steer key WITHOUT recording a result: the
+    /// turn ended in error, so there is nothing to replay, and a retry
+    /// with the same key must still execute (the BUG-10 rule that only
+    /// a turn that ran to a result is recorded). Called by the
+    /// production wrapper (session.rs run_steer_turn) when run_turn
+    /// fails, and by the test-only steer() helper on the same path.
+    /// Idempotent on purpose: releasing a key that is not in-flight
+    /// (never began, already completed) is a no-op, never an error —
+    /// the turn already failed, so this must not mask it with a second
+    /// failure. (BUG-10 extra, tin 9645/9650.)
+    pub fn release_steer(
+        &mut self,
+        session_id: &str,
+        contract: &ActionContract,
+        kind: &str,
+        text: &str,
+    ) {
+        if let Some(running) = self.in_flight_steers.get_mut(session_id) {
+            running.remove(&SteerKey::new(contract, kind, text));
+        }
     }
 
     /// Run a whole turn in one call (tests only): begin, turn, complete.
     /// Production wrappers use the three steps separately so the turn
-    /// runs without the registry lock held. Events go to `emit`.
+    /// runs without the registry lock held. Events go to `emit`. A
+    /// duplicate steer returns the recorded result with no turn run and
+    /// no events (BUG-10, #25); a steer already running elsewhere is
+    /// refused (BUG-10 extra, tin 9645/9650); a failed turn releases
+    /// its in-flight key, so the retry still executes.
     #[cfg(test)]
     pub fn steer(
         &mut self,
@@ -417,11 +591,23 @@ impl Registry {
         text: &str,
         emit: &mut dyn FnMut(SenEvent),
     ) -> Result<SessionState, CommandError> {
-        let bridge = self.begin_steer(session_id, contract, kind, text)?;
-        let turn = bridge
-            .run_turn(kind, text, emit)
-            .map_err(bridge_error_to_command)?;
-        self.complete_steer(session_id, kind, &turn)
+        match self.begin_steer(session_id, contract, kind, text)? {
+            SteerStart::Duplicate { state, .. } => Ok(state),
+            SteerStart::InFlight { .. } => Err(CommandError::new(
+                ERR_DUPLICATE_STEER,
+                "Steer already running on this session, refused",
+            )),
+            SteerStart::Run(bridge) => {
+                let turn = match bridge.run_turn(kind, text, emit) {
+                    Ok(turn) => turn,
+                    Err(e) => {
+                        self.release_steer(session_id, contract, kind, text);
+                        return Err(bridge_error_to_command(e));
+                    }
+                };
+                self.complete_steer(session_id, contract, kind, text, &turn)
+            }
+        }
     }
 
     /// sen_session_abort: escalate the running CLI turn first (SIGINT,
@@ -705,6 +891,315 @@ exit 1"#;
         assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
     }
 
+    // BUG-10 (#25): a second steer with the same key + contract + text
+    // replays the recorded result: no model run (no events), no extra
+    // log entry, and begin_steer reports the recorded turn itself.
+    #[test]
+    fn steer_duplicate_key_replays_without_rerunning() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("dup", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 2);
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 0, "duplicate steer must emit no events");
+        assert_eq!(
+            reg.get("s1").unwrap().log.len(),
+            2,
+            "duplicate steer must push no log entry"
+        );
+        match reg.begin_steer("s1", &contract(), "steer", "hi").unwrap() {
+            SteerStart::Duplicate { state, turn } => {
+                assert_eq!(state, SessionState::Running);
+                assert_eq!(turn.subtype, "success");
+                assert_eq!(turn.text, "hello");
+            }
+            SteerStart::Run(_) | SteerStart::InFlight { .. } => {
+                panic!("third identical steer must be Duplicate")
+            }
+        }
+    }
+
+    // BUG-10 extra (tin 9645/9650): a second steer identical to one
+    // still running is refused (InFlight) — no second model call.
+    // After the first turn completes, the same steer replays the
+    // recorded result (Duplicate): the old behaviour, unchanged.
+    #[test]
+    fn steer_second_identical_while_first_in_flight_is_refused() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("inflight", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        reg.create("s2", &contract()).unwrap();
+        // First steer begins: Run, and the key is in-flight at once.
+        let bridge = match reg.begin_steer("s1", &contract(), "steer", "hi").unwrap() {
+            SteerStart::Run(bridge) => bridge,
+            SteerStart::Duplicate { .. } | SteerStart::InFlight { .. } => {
+                panic!("first steer must Run")
+            }
+        };
+        assert_eq!(
+            reg.in_flight_steers.get("s1").map(|running| running.len()),
+            Some(1),
+            "begin_steer must record the key as in-flight at once"
+        );
+        // Identical second steer while the first still runs: refused.
+        match reg.begin_steer("s1", &contract(), "steer", "hi").unwrap() {
+            SteerStart::InFlight { state } => {
+                assert_eq!(state, SessionState::Running);
+            }
+            SteerStart::Run(_) | SteerStart::Duplicate { .. } => {
+                panic!("second identical steer while the first runs must be InFlight")
+            }
+        }
+        // Same key on another session is independent: Run.
+        assert!(matches!(
+            reg.begin_steer("s2", &contract(), "steer", "hi").unwrap(),
+            SteerStart::Run(_)
+        ));
+        // Different kind / different text on s1 are different steers:
+        // they still begin (Run), not refused.
+        assert!(matches!(
+            reg.begin_steer("s1", &contract(), "follow_up", "hi")
+                .unwrap(),
+            SteerStart::Run(_)
+        ));
+        assert!(matches!(
+            reg.begin_steer("s1", &contract(), "steer", "other")
+                .unwrap(),
+            SteerStart::Run(_)
+        ));
+        // Tidy up the extra in-flight keys (their turns never ran).
+        reg.release_steer("s1", &contract(), "follow_up", "hi");
+        reg.release_steer("s1", &contract(), "steer", "other");
+        reg.release_steer("s2", &contract(), "steer", "hi");
+        // Finish the first turn through the bridge, then complete: the
+        // key moves from in-flight to completed.
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        let turn = bridge.run_turn("steer", "hi", &mut emit).unwrap();
+        assert_eq!(events.len(), 3);
+        reg.complete_steer("s1", &contract(), "steer", "hi", &turn)
+            .unwrap();
+        assert!(reg
+            .in_flight_steers
+            .get("s1")
+            .map(|running| running.is_empty())
+            .unwrap_or(true));
+        // Third identical steer now replays the recorded result.
+        match reg.begin_steer("s1", &contract(), "steer", "hi").unwrap() {
+            SteerStart::Duplicate { state, turn } => {
+                assert_eq!(state, SessionState::Running);
+                assert_eq!(turn.subtype, "success");
+                assert_eq!(turn.text, "hello");
+            }
+            SteerStart::Run(_) | SteerStart::InFlight { .. } => {
+                panic!("third identical steer must be Duplicate")
+            }
+        }
+    }
+
+    // BUG-10 extra (tin 9645/9650): a turn that fails releases its
+    // in-flight key, so the retry with the same key still executes
+    // instead of being refused for a turn that already ended.
+    #[test]
+    fn steer_failed_turn_releases_in_flight_key() {
+        let body = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}
+EOF
+exit 1"#;
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("inflightfail", body));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        let err = reg
+            .steer("s1", &contract(), "steer", "hi", &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, "CLI_NO_RESULT");
+        // The failed turn left no in-flight key behind ...
+        assert!(reg
+            .in_flight_steers
+            .get("s1")
+            .map(|running| running.is_empty())
+            .unwrap_or(true));
+        // ... so the retry with the same key begins cleanly (Run, not
+        // InFlight).
+        assert!(matches!(
+            reg.begin_steer("s1", &contract(), "steer", "hi").unwrap(),
+            SteerStart::Run(_)
+        ));
+    }
+
+    // BUG-10 extra (tin 9645/9650): complete_steer drops the
+    // in-flight key even when it refuses to record (abort won the
+    // race), so the key never leaks for a turn that already ended.
+    #[test]
+    fn complete_steer_refusal_still_releases_in_flight_key() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("inflightabort", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let bridge = match reg.begin_steer("s1", &contract(), "steer", "hi").unwrap() {
+            SteerStart::Run(bridge) => bridge,
+            SteerStart::Duplicate { .. } | SteerStart::InFlight { .. } => {
+                panic!("first steer must Run")
+            }
+        };
+        assert_eq!(
+            reg.in_flight_steers.get("s1").map(|running| running.len()),
+            Some(1)
+        );
+        // The turn runs to a result first; abort wins the race before
+        // complete_steer is called (the real race: abort lands while
+        // the turn is resolving).
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        let turn = bridge.run_turn("steer", "hi", &mut emit).unwrap();
+        reg.abort("s1", &contract()).unwrap();
+        // complete refuses (the session left Running), but the
+        // in-flight key must be gone all the same.
+        let err = reg
+            .complete_steer("s1", &contract(), "steer", "hi", &turn)
+            .unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        assert!(
+            reg.in_flight_steers
+                .get("s1")
+                .map(|running| running.is_empty())
+                .unwrap_or(true),
+            "refused complete_steer must still release the in-flight key"
+        );
+    }
+
+    // Same text, different idempotency key: a new request, runs again.
+    #[test]
+    fn steer_different_key_runs_again() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("diffkey", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        reg.steer("s1", &contract(), "steer", "hi", &mut emit)
+            .unwrap();
+        let mut other = contract();
+        other.idempotency_key = "k2".to_string();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &other, "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+    }
+
+    // Same key, different text: a different request body, runs again.
+    #[test]
+    fn steer_same_key_different_text_runs_again() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("difftext", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        reg.steer("s1", &contract(), "steer", "hi", &mut emit)
+            .unwrap();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "other", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+    }
+
+    // Same key + text but a different kind (steer vs follow_up): a
+    // different operation, runs again.
+    #[test]
+    fn steer_same_key_same_text_different_kind_runs_again() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("diffkind", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        reg.steer("s1", &contract(), "steer", "hi", &mut emit)
+            .unwrap();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "follow_up", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+    }
+
+    // Same key + text but a different contract id: a different action
+    // that happens to reuse a key, runs again.
+    #[test]
+    fn steer_same_key_same_text_different_contract_runs_again() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("diffcontract", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        reg.steer("s1", &contract(), "steer", "hi", &mut emit)
+            .unwrap();
+        let mut other = contract();
+        other.id = "c2".to_string();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &other, "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+    }
+
+    // Only a turn that ran to a result is recorded: a failed first
+    // steer records nothing, so the retry with the same key still runs.
+    #[test]
+    fn steer_failed_turn_does_not_record_key() {
+        let marker =
+            std::env::temp_dir().join(format!("sen_reg_bug10_retry_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // First run: no marker yet -> exit 1 with no result record.
+        // Later runs: marker exists -> the happy output.
+        let body = format!(
+            r#"if [ -f '{marker}' ]; then cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+{{"type":"assistant","uuid":"u1","session_id":"s1","message":{{"role":"assistant","content":"hello"}},"parent_tool_use_id":null,"v":1}}
+{{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0}},"model":"m:free","session_id":"s1","v":1}}
+EOF
+exit 0; else touch '{marker}'; exit 1; fi"#,
+            marker = marker.display()
+        );
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("retry", &body));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        let err = reg
+            .steer("s1", &contract(), "steer", "hi", &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, "CLI_NO_RESULT");
+        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3, "retry after failure must run");
+        assert_eq!(reg.get("s1").unwrap().log.len(), 2);
+        let _ = std::fs::remove_file(&marker);
+    }
+
     #[test]
     fn begin_steer_rejects_bad_kind_empty_text_and_terminal() {
         let mut reg = Registry::new();
@@ -754,7 +1249,9 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         assert_eq!(turn.subtype, "error_during_execution");
         // complete_steer refuses: the session left Running meanwhile,
         // so the interrupted turn is not recorded as a steer.
-        let err = reg.complete_steer("s1", "steer", &turn).unwrap_err();
+        let err = reg
+            .complete_steer("s1", &contract(), "steer", "hi", &turn)
+            .unwrap_err();
         assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
     }
 
