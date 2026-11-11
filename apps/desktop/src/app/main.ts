@@ -71,7 +71,7 @@ function appLiveContract(sessionId: string): ActionContract {
     sideEffect: "no-side-effect",
     risk: "low",
     idempotencyKey: "app-live-" + nonce,
-    timeoutMs: 30000,
+    timeoutMs: 120000,
     approvalRequired: false,
     auditRequired: false,
   };
