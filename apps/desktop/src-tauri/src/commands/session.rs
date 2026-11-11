@@ -95,6 +95,9 @@ pub fn sen_session_create(
 /// (step 2), then record the turn (step 3). Events stream to the frontend
 /// through the `emit` callback while the turn runs; a failed emit never
 /// fails the turn (the event is already recorded in the turn result).
+/// When step 1 reports Duplicate (BUG-10, #25: this exact steer already
+/// completed on the session), the recorded result is returned at once:
+/// no model call runs, no log entry is pushed, no event is emitted.
 fn run_steer_turn(
     app: &AppHandle,
     state: State<'_, Mutex<Registry>>,
@@ -103,11 +106,17 @@ fn run_steer_turn(
     kind: &str,
     contract: ContractArgs,
 ) -> Result<SessionResult, String> {
-    let bridge = {
+    let start = {
         let mut registry = state.lock().map_err(|e| e.to_string())?;
         registry
             .begin_steer(session_id, &contract.to_registry(), kind, text)
             .map_err(|e| e.to_wire())?
+    };
+    let bridge = match start {
+        super::registry::SteerStart::Duplicate { state, .. } => {
+            return Ok(result(session_id, state));
+        }
+        super::registry::SteerStart::Run(bridge) => bridge,
     };
     let app_emit = app.clone();
     let mut emit = |event: SenEvent| {
@@ -119,7 +128,7 @@ fn run_steer_turn(
         .map_err(|e| format!("{}: {}", e.code, e.message))?;
     let mut registry = state.lock().map_err(|e| e.to_string())?;
     let next = registry
-        .complete_steer(session_id, kind, &turn)
+        .complete_steer(session_id, &contract.to_registry(), kind, text, &turn)
         .map_err(|e| e.to_wire())?;
     Ok(result(session_id, next))
 }
