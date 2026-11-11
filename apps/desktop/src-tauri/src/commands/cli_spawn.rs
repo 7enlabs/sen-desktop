@@ -8,7 +8,7 @@
 //
 // HOW A TURN RUNS (verified against the real CLI, rev 8ac73fe):
 //   zen -p --output-format stream-json --bare --setting-sources ""
-//       --model <model> [--session-id <id> | -r <id>] <prompt>
+//       --model <model> [--base-url <url>] [--session-id <id> | -r <id>] <prompt>
 // - `--setting-sources ""` + `--bare` keep project/user settings out of
 //   the run, so a turn is reproducible from its explicit inputs.
 // - The first turn of a handle starts a fresh CLI session named with
@@ -108,9 +108,17 @@ pub const ERR_CLI_EMPTY_TEXT: &str = "CLI_EMPTY_TEXT";
 /// Build the exact CLI argv for one turn. The prompt is the last argv
 /// element; flags never follow it. `resume` = false starts a fresh CLI
 /// session named --session-id <id>; true resumes it with -r <id>.
-/// No key appears anywhere in argv: the CLI reads ZEN_API_KEY from the
-/// inherited environment.
-pub fn build_cli_argv(model: &str, session_id: &str, resume: bool, text: &str) -> Vec<String> {
+/// `base_url` (R2B-05) appends `--base-url <url>` after --model when
+/// Some, and passes no flag when None (the CLI uses its own default
+/// endpoint). No key appears anywhere in argv: the CLI reads
+/// ZEN_API_KEY from the inherited environment.
+pub fn build_cli_argv(
+    model: &str,
+    base_url: Option<&str>,
+    session_id: &str,
+    resume: bool,
+    text: &str,
+) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "-p".to_string(),
         "--output-format".to_string(),
@@ -121,6 +129,10 @@ pub fn build_cli_argv(model: &str, session_id: &str, resume: bool, text: &str) -
         "--model".to_string(),
         model.to_string(),
     ];
+    if let Some(url) = base_url {
+        argv.push("--base-url".to_string());
+        argv.push(url.to_string());
+    }
     if resume {
         argv.push("-r".to_string());
         argv.push(session_id.to_string());
@@ -183,6 +195,9 @@ pub struct CliBridge {
     bin_override: Mutex<Option<PathBuf>>,
     session_id: String,
     model: String,
+    /// Optional provider base URL (R2B-05): passed as --base-url on
+    /// every turn when Some, no flag when None.
+    base_url: Option<String>,
     state: Mutex<BridgeState>,
     child_slot: Arc<Mutex<Option<Child>>>,
     abort_grace: Duration,
@@ -210,6 +225,7 @@ impl std::fmt::Debug for CliBridge {
         f.debug_struct("CliBridge")
             .field("session_id", &self.session_id)
             .field("model", &self.model)
+            .field("base_url", &self.base_url)
             .field("started", &started)
             .finish()
     }
@@ -219,11 +235,19 @@ impl CliBridge {
     /// Create a handle. Spawns no process and makes no model call.
     /// `bin_override` is Some only for tests / an explicit operator
     /// path; production passes None and resolves per decision 1.
-    pub fn new(bin_override: Option<PathBuf>, session_id: &str, model: &str) -> CliBridge {
+    /// `base_url` is the stored provider base URL (R2B-05): Some
+    /// passes --base-url on every turn, None passes no flag.
+    pub fn new(
+        bin_override: Option<PathBuf>,
+        session_id: &str,
+        model: &str,
+        base_url: Option<&str>,
+    ) -> CliBridge {
         CliBridge {
             bin_override: Mutex::new(bin_override),
             session_id: session_id.to_string(),
             model: model.to_string(),
+            base_url: base_url.map(str::to_string),
             state: Mutex::new(BridgeState {
                 started: false,
                 probed: false,
@@ -258,6 +282,11 @@ impl CliBridge {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// The stored provider base URL, if any (R2B-05).
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
     }
 
     /// Resolve the binary for this handle: the override when set, else
@@ -347,7 +376,13 @@ impl CliBridge {
             ));
         }
 
-        let argv = build_cli_argv(&self.model, &self.session_id, resume, text);
+        let argv = build_cli_argv(
+            &self.model,
+            self.base_url.as_deref(),
+            &self.session_id,
+            resume,
+            text,
+        );
         let mut child = match Command::new(&bin)
             .args(&argv)
             .stdin(Stdio::null())
@@ -734,7 +769,7 @@ mod tests {
         kind: &str,
         text: &str,
     ) -> (Result<TurnResult, BridgeError>, Vec<SenEvent>) {
-        let bridge = CliBridge::new(Some(bin), "s1", "m:free");
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None);
         let events: Arc<Mutex<Vec<SenEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         let mut emit = move |ev: SenEvent| {
@@ -754,7 +789,7 @@ exit 0"#;
 
     #[test]
     fn build_argv_first_turn_uses_session_id_later_resume() {
-        let first = build_cli_argv("m:free", "s1", false, "hi");
+        let first = build_cli_argv("m:free", None, "s1", false, "hi");
         assert_eq!(
             first,
             vec![
@@ -771,13 +806,82 @@ exit 0"#;
                 "hi",
             ]
         );
-        let later = build_cli_argv("m:free", "s1", true, "again");
+        let later = build_cli_argv("m:free", None, "s1", true, "again");
         assert!(later.contains(&"-r".to_string()));
         assert!(later.contains(&"s1".to_string()));
         assert!(!later.contains(&"--session-id".to_string()));
         assert_eq!(later.last().unwrap(), "again");
         // No key anywhere in argv.
         assert!(!first.iter().any(|a| a.contains("KEY")));
+    }
+
+    // R2B-05: a stored base URL is passed as --base-url after --model
+    // and before --session-id/-r; None passes no --base-url flag.
+    #[test]
+    fn build_argv_passes_base_url_after_model_before_session() {
+        let url = "https://example.invalid/v1";
+        let first = build_cli_argv("m:free", Some(url), "s1", false, "hi");
+        assert_eq!(
+            first,
+            vec![
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--bare",
+                "--setting-sources",
+                "",
+                "--model",
+                "m:free",
+                "--base-url",
+                url,
+                "--session-id",
+                "s1",
+                "hi",
+            ]
+        );
+        let later = build_cli_argv("m:free", Some(url), "s1", true, "again");
+        let base_pos = later.iter().position(|a| a == "--base-url").unwrap();
+        let resume_pos = later.iter().position(|a| a == "-r").unwrap();
+        assert!(base_pos < resume_pos, "--base-url must precede -r");
+        assert_eq!(later[base_pos + 1], url);
+        assert_eq!(later.last().unwrap(), "again");
+        // None passes no flag at all.
+        let none = build_cli_argv("m:free", None, "s1", false, "hi");
+        assert!(!none.contains(&"--base-url".to_string()));
+    }
+
+    // R2B-05: a turn on a bridge created with a base URL really spawns
+    // the CLI with --base-url <url> in argv (proven against a fake
+    // binary that records its argv).
+    #[test]
+    fn turn_passes_base_url_to_the_cli_binary() {
+        let marker = std::env::temp_dir().join(format!("sen_base_url_argv_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let body = format!(
+            "printf '%s\\n' \"$@\" > '{marker}'\n{HAPPY_BODY}",
+            marker = marker.display()
+        );
+        let bin = fake_zen("baseurl", &body);
+        let bridge = CliBridge::new(
+            Some(bin),
+            "s1",
+            "m:free",
+            Some("https://example.invalid/v1"),
+        );
+        assert_eq!(bridge.base_url(), Some("https://example.invalid/v1"));
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        let result = bridge.run_turn("steer", "hi", &mut emit).unwrap();
+        assert_eq!(result.subtype, "success");
+        let argv = std::fs::read_to_string(&marker).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        let base_pos = argv.iter().position(|a| *a == "--base-url").unwrap();
+        assert_eq!(argv[base_pos + 1], "https://example.invalid/v1");
+        let model_pos = argv.iter().position(|a| *a == "--model").unwrap();
+        let session_pos = argv.iter().position(|a| *a == "--session-id").unwrap();
+        assert!(model_pos < base_pos && base_pos < session_pos);
+        assert_eq!(argv.last().unwrap(), &"hi");
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[test]
@@ -862,7 +966,7 @@ exit 1"#;
     #[test]
     fn abort_with_no_child_is_a_noop() {
         let bin = fake_zen("noop", HAPPY_BODY);
-        let bridge = CliBridge::new(Some(bin), "s1", "m:free");
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None);
         assert_eq!(bridge.abort(), AbortOutcome::NoChild);
     }
 
@@ -874,7 +978,7 @@ exit 1"#;
 echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
 i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let bin = fake_zen("sigint", body);
-        let bridge = Arc::new(CliBridge::new(Some(bin), "s1", "m:free"));
+        let bridge = Arc::new(CliBridge::new(Some(bin), "s1", "m:free", None));
         let events: Arc<Mutex<Vec<SenEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         let bridge_run = Arc::clone(&bridge);
@@ -902,7 +1006,8 @@ echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1
 i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let bin = fake_zen("ignoresigint", body);
         let bridge = Arc::new(
-            CliBridge::new(Some(bin), "s1", "m:free").with_abort_grace(Duration::from_millis(300)),
+            CliBridge::new(Some(bin), "s1", "m:free", None)
+                .with_abort_grace(Duration::from_millis(300)),
         );
         let bridge_run = Arc::clone(&bridge);
         let handle = std::thread::spawn(move || {
@@ -926,8 +1031,8 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
 i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let bin = fake_zen("hangs", body);
-        let bridge =
-            CliBridge::new(Some(bin), "s1", "m:free").with_turn_timeout(Duration::from_millis(300));
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None)
+            .with_turn_timeout(Duration::from_millis(300));
         let started = std::time::Instant::now();
         let mut emit = |_ev: SenEvent| {};
         let err = bridge.run_turn("steer", "hi", &mut emit).unwrap_err();
@@ -945,7 +1050,7 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
 i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let bin = fake_zen("hangs3", body);
-        let bridge = CliBridge::new(Some(bin), "s1", "m:free");
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None);
         let started = std::time::Instant::now();
         let mut emit = |_ev: SenEvent| {};
         let err = bridge
@@ -964,8 +1069,8 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
 i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let bin = fake_zen("hangs4", body);
-        let bridge =
-            CliBridge::new(Some(bin), "s1", "m:free").with_turn_timeout(Duration::from_millis(300));
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None)
+            .with_turn_timeout(Duration::from_millis(300));
         let started = std::time::Instant::now();
         let mut emit = |_ev: SenEvent| {};
         let err = bridge
@@ -981,7 +1086,7 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         // A turn that finishes quickly is not cut off by a short
         // per-turn timeout.
         let bin = fake_zen("fast2", HAPPY_BODY);
-        let bridge = CliBridge::new(Some(bin), "s1", "m:free");
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None);
         let mut events: Vec<SenEvent> = Vec::new();
         let mut emit = |ev: SenEvent| events.push(ev);
         let result = bridge
@@ -996,8 +1101,8 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         // A turn that finishes quickly is not cut off by a short
         // timeout: the timeout only fires when no result arrives.
         let bin = fake_zen("fast", HAPPY_BODY);
-        let bridge =
-            CliBridge::new(Some(bin), "s1", "m:free").with_turn_timeout(Duration::from_secs(5));
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None)
+            .with_turn_timeout(Duration::from_secs(5));
         let mut events: Vec<SenEvent> = Vec::new();
         let mut emit = |ev: SenEvent| events.push(ev);
         let result = bridge.run_turn("steer", "hi", &mut emit).unwrap();
@@ -1013,8 +1118,8 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
 i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let bin = fake_zen("hangs2", body);
-        let bridge =
-            CliBridge::new(Some(bin), "s1", "m:free").with_turn_timeout(Duration::from_millis(300));
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None)
+            .with_turn_timeout(Duration::from_millis(300));
         let mut emit = |_ev: SenEvent| {};
         let first = bridge.run_turn("steer", "hi", &mut emit).unwrap_err();
         assert_eq!(first.code, ERR_CLI_TURN_TIMEOUT);
@@ -1037,7 +1142,7 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let bridge = CliBridge::new(Some(path), "s1", "m:free");
+        let bridge = CliBridge::new(Some(path), "s1", "m:free", None);
         let mut emit = |_ev: SenEvent| {};
         let err = bridge.run_turn("steer", "hi", &mut emit).unwrap_err();
         assert_eq!(err.code, ERR_CLI_VERSION_MISMATCH);
