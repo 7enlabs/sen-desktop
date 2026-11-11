@@ -1,9 +1,9 @@
-// Real Tauri command handler for event subscriptions (bridge round).
+// Real Tauri command handler for event subscriptions (CLI bridge round).
 // Thin wrapper only: it converts wire args and delegates to
 // commands/registry.rs, which records one subscriber on the session.
-// The event stream itself will flow from the backend (Tauri events) once
-// the CLI bridge lands; this record is the backend bookkeeping for it,
-// not the stream.
+// The event stream itself flows from the backend (Tauri events, named
+// sen-session-event) while a CLI turn runs; this record is the backend
+// bookkeeping for it, not the stream.
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::State;

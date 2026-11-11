@@ -1,17 +1,24 @@
-// Real Tauri command handlers for sessions (bridge round).
+// Real Tauri command handlers for sessions (CLI bridge round).
 // Thin wrappers only: they convert wire args and delegate to
 // commands/registry.rs, which owns the statechart, the contract check and
-// the record. No session logic lives here.
+// the record, and to commands/cli_spawn.rs, which owns the CLI turn.
+// No session logic lives here.
 // The backend never calls the Pi SDK and never holds a key. The model
-// runs in the backend through the CLI core + stream-json bridge (a later
-// phase); until then steer/follow_up are refused by the registry with
-// MODEL_NOT_WIRED. A backend record with no model runtime is the
-// designed intermediate state in this phase.
+// runs in the backend through the CLI core + stream-json bridge: steer /
+// follow_up run the `zen` CLI for the session (resolved per decision 1,
+// model from local settings per decision 2), and CLI events flow to the
+// frontend as Tauri events (SEN_SESSION_EVENT) while the turn runs.
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use super::registry::{ActionContract, Registry};
+use super::stream_json::SenEvent;
+
+/// Tauri event carrying one Sen event to the frontend while a turn runs.
+/// The frontend listens with `listenSessionEvents` (see
+/// apps/desktop/src/ipc/session-events.ts) and filters by sessionId.
+pub const SEN_SESSION_EVENT: &str = "sen-session-event";
 
 /// Wire contract, camelCase on the wire to match
 /// apps/desktop/src/ipc/types.ts exactly. The registry struct uses
@@ -68,7 +75,8 @@ fn result(session_id: &str, state: super::registry::SessionState) -> SessionResu
     }
 }
 
-/// sen_session_create: backend record only, state Running. No SDK call.
+/// sen_session_create: backend record + one CLI bridge handle for the
+/// session, state Running. No model call happens here.
 #[tauri::command]
 pub fn sen_session_create(
     state: State<'_, Mutex<Registry>>,
@@ -82,41 +90,71 @@ pub fn sen_session_create(
     Ok(result(&session_id, next))
 }
 
-/// sen_session_steer: gates on a Running session. The model call runs in
-/// the backend once the CLI bridge lands; until then the registry refuses
-/// with MODEL_NOT_WIRED and no intent is recorded.
+/// Run one turn for a session: validate + take the bridge (step 1), run
+/// the CLI turn with NO registry lock held so abort can reach the child
+/// (step 2), then record the turn (step 3). Events stream to the frontend
+/// through the `emit` callback while the turn runs; a failed emit never
+/// fails the turn (the event is already recorded in the turn result).
+fn run_steer_turn(
+    app: &AppHandle,
+    state: State<'_, Mutex<Registry>>,
+    session_id: &str,
+    text: &str,
+    kind: &str,
+    contract: ContractArgs,
+) -> Result<SessionResult, String> {
+    let bridge = {
+        let mut registry = state.lock().map_err(|e| e.to_string())?;
+        registry
+            .begin_steer(session_id, &contract.to_registry(), kind, text)
+            .map_err(|e| e.to_wire())?
+    };
+    let app_emit = app.clone();
+    let mut emit = |event: SenEvent| {
+        // Best effort: a listener that is gone must not fail the turn.
+        let _ = app_emit.emit(SEN_SESSION_EVENT, &event);
+    };
+    let turn = bridge
+        .run_turn(kind, text, &mut emit)
+        .map_err(|e| format!("{}: {}", e.code, e.message))?;
+    let mut registry = state.lock().map_err(|e| e.to_string())?;
+    let next = registry
+        .complete_steer(session_id, kind, &turn)
+        .map_err(|e| e.to_wire())?;
+    Ok(result(session_id, next))
+}
+
+/// sen_session_steer: gates on a Running session, then runs one CLI turn
+/// for it. The backend ack means the model call ran to a result record;
+/// a failure surfaces as a typed error and nothing is recorded.
 #[tauri::command]
 pub fn sen_session_steer(
+    app: AppHandle,
     state: State<'_, Mutex<Registry>>,
     session_id: String,
     text: String,
     contract: ContractArgs,
 ) -> Result<SessionResult, String> {
-    let mut registry = state.lock().map_err(|e| e.to_string())?;
-    let next = registry
-        .steer(&session_id, &contract.to_registry(), "steer", &text)
-        .map_err(|e| e.to_wire())?;
-    Ok(result(&session_id, next))
+    run_steer_turn(&app, state, &session_id, &text, "steer", contract)
 }
 
-/// sen_session_follow_up: same gate as steer; refused with
-/// MODEL_NOT_WIRED until the CLI bridge lands.
+/// sen_session_follow_up: same gate and turn as steer, kind follow_up
+/// (later turns resume the CLI session with -r).
 #[tauri::command]
 pub fn sen_session_follow_up(
+    app: AppHandle,
     state: State<'_, Mutex<Registry>>,
     session_id: String,
     text: String,
     contract: ContractArgs,
 ) -> Result<SessionResult, String> {
-    let mut registry = state.lock().map_err(|e| e.to_string())?;
-    let next = registry
-        .steer(&session_id, &contract.to_registry(), "follow_up", &text)
-        .map_err(|e| e.to_wire())?;
-    Ok(result(&session_id, next))
+    run_steer_turn(&app, state, &session_id, &text, "follow_up", contract)
 }
 
-/// sen_session_abort: Running or AwaitingApproval -> Cancelled, per the
-/// point-854 table. Error and terminal states refuse with a typed error.
+/// sen_session_abort: escalates the running CLI turn first (SIGINT, 5s
+/// grace, SIGKILL), then Running or AwaitingApproval -> Cancelled, per
+/// the point-854 table. Error and terminal states refuse with a typed
+/// error.
 #[tauri::command]
 pub fn sen_session_abort(
     state: State<'_, Mutex<Registry>>,

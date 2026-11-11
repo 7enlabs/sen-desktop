@@ -14,23 +14,26 @@
 //   No SDK session is created anywhere in the webview: the Pi SDK
 //   (createAgentSession, ModelRuntime) cannot run in a browser, and the
 //   vite build failed on it (Rollup: "spawn" is not exported). The model
-//   runs in the backend through the CLI core + stream-json bridge, which
-//   lands in a later phase; until then steer/followUp are refused by the
-//   backend with MODEL_NOT_WIRED instead of pretending a model call ran.
+//   runs in the backend through the CLI core + stream-json bridge
+//   (Phase 2, tin 9530): steer/followUp run the `zen` CLI for the
+//   session, and model events flow from the backend as Tauri events
+//   (sen-session-event) while a turn runs.
 // - subscribeSession records the subscriber on the backend. Model events
-//   will flow from the backend (Tauri events) once the CLI bridge lands;
-//   this phase subscribes only, it invents no events.
+//   flow from the backend (Tauri events) while a CLI turn runs; the
+//   listener is listenSessionEvents in ../ipc/session-events.ts.
 // - No model id, no key, no network call is configured here: the entry
-//   names no model and holds no key. The key reaches the CLI through the
-//   environment on the backend side, never through the webview.
+//   names no model and holds no key. The model comes from local app
+//   settings (sen_settings_get_model, default free model when nothing is
+//   stored); the key reaches the CLI through the environment on the
+//   backend side, never through the webview.
 //
 // Still open, NOT decided here:
 // - This wiring is proven under node (tests) and by a successful vite
 //   build after the SDK move, not yet in a real webview (no Rust
 //   toolchain on this box, so tauri dev/build is not run here).
-// - No UI or config source supplies a model id at runtime yet, so
-//   steer/followUp refuse with MODEL_NOT_WIRED until the CLI bridge
-//   lands. The refusal is surfaced in the shell, never swallowed.
+// - No UI supplies a model id at runtime yet; the model comes from local
+//   app settings (sen_settings_set_model), default free model when
+//   nothing is stored. There is no settings screen in this phase.
 import { attachLiveSession } from "../ipc/live-client.ts";
 import type { AttachedLiveSession } from "../ipc/live-client.ts";
 import type { ActionContract } from "../ipc/types.ts";
