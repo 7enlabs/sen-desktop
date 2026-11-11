@@ -452,6 +452,12 @@ impl Registry {
         };
         let record = self.get_mut_or_unknown(session_id)?;
         record.state = SessionState::Cancelled;
+        // BUG-09 (#24): close drops the subscriber count. A cancelled
+        // session has no listeners left: whatever subscribers were
+        // attached are gone with the session, so the count resets to 0
+        // instead of leaking. This holds even for a direct abort that
+        // bypasses the frontend close path (which unsubscribes first).
+        record.subscribers = 0;
         match outcome {
             AbortOutcome::NoChild => record.log.push("session_abort".to_string()),
             AbortOutcome::ExitedAfterSigint => record.log.push("session_abort:sigint".to_string()),
@@ -466,6 +472,11 @@ impl Registry {
     /// event stream itself will flow from the backend (Tauri events) once
     /// the CLI bridge lands; this record is the backend bookkeeping for
     /// it, not the stream.
+    ///
+    /// BUG-09 (#24): a terminal session accepted subscribers, so the
+    /// count only ever grew. Like steer, subscribe now refuses a
+    /// terminal session with ILLEGAL_TRANSITION; only a live session
+    /// accepts a new subscriber.
     pub fn subscribe(
         &mut self,
         session_id: &str,
@@ -473,7 +484,36 @@ impl Registry {
     ) -> Result<u32, CommandError> {
         validate_contract(contract)?;
         let record = self.get_mut_or_unknown(session_id)?;
+        if record.state.is_terminal() {
+            return Err(CommandError::new(
+                ERR_ILLEGAL_TRANSITION,
+                &format!(
+                    "Cannot subscribe to a session in state {}, only a live session accepts subscribers",
+                    record.state.as_str()
+                ),
+            ));
+        }
         record.subscribers += 1;
+        Ok(record.subscribers)
+    }
+
+    /// sen_events_unsubscribe: drops one subscriber from the session and
+    /// returns the remaining count. BUG-09 (#24): no unsubscribe existed,
+    /// so the subscriber count leaked upward forever. The count
+    /// saturates at 0: an extra unsubscribe (for example a close racing
+    /// a second close) is a no-op returning 0, never an underflow and
+    /// never a failure that could block cleanup. Unsubscribe is allowed
+    /// on a terminal session for the same reason: abort already drops
+    /// the count to 0, so unsubscribing after close is a harmless no-op
+    /// instead of a second error on the close path.
+    pub fn unsubscribe(
+        &mut self,
+        session_id: &str,
+        contract: &ActionContract,
+    ) -> Result<u32, CommandError> {
+        validate_contract(contract)?;
+        let record = self.get_mut_or_unknown(session_id)?;
+        record.subscribers = record.subscribers.saturating_sub(1);
         Ok(record.subscribers)
     }
 
@@ -782,6 +822,59 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
         let err = reg.tool_call(&contract(), "").unwrap_err();
         assert_eq!(err.code, ERR_INVALID_CONTRACT);
+    }
+
+    /// BUG-09 (#24): subscribing to a terminal session returned Ok and
+    /// the count only ever grew. Subscribe must refuse exactly like
+    /// steer, with ILLEGAL_TRANSITION, and leave the count untouched.
+    #[test]
+    fn subscribe_rejects_terminal_session() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.subscribe("s1", &contract()), Ok(1));
+        reg.abort("s1", &contract()).unwrap();
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Cancelled);
+        let err = reg.subscribe("s1", &contract()).unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        assert_eq!(reg.get("s1").unwrap().subscribers, 0);
+        // A live session still accepts subscribers after the refusal.
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.subscribe("s1", &contract()), Ok(1));
+    }
+
+    /// BUG-09 (#24): there was no unsubscribe at all. Unsubscribe drops
+    /// the count one at a time, saturates at 0 instead of underflowing,
+    /// and refuses an unknown session.
+    #[test]
+    fn unsubscribe_decrements_and_saturates_at_zero() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.subscribe("s1", &contract()), Ok(1));
+        assert_eq!(reg.subscribe("s1", &contract()), Ok(2));
+        assert_eq!(reg.unsubscribe("s1", &contract()), Ok(1));
+        assert_eq!(reg.unsubscribe("s1", &contract()), Ok(0));
+        // An extra unsubscribe (close racing a second close) is a
+        // no-op returning 0, never an underflow.
+        assert_eq!(reg.unsubscribe("s1", &contract()), Ok(0));
+        let missing = reg.unsubscribe("nope", &contract()).unwrap_err();
+        assert_eq!(missing.code, ERR_UNKNOWN_SESSION);
+    }
+
+    /// BUG-09 (#24): close must drop the subscriber count. Abort (the
+    /// backend half of close) resets the count to 0, so a direct abort
+    /// that bypasses the frontend close path leaks nothing either; and
+    /// unsubscribing after close is a harmless no-op, not a second
+    /// error on the close path.
+    #[test]
+    fn abort_drops_subscriber_count() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.subscribe("s1", &contract()), Ok(1));
+        assert_eq!(reg.subscribe("s1", &contract()), Ok(2));
+        assert_eq!(reg.abort("s1", &contract()), Ok(SessionState::Cancelled));
+        assert_eq!(reg.get("s1").unwrap().subscribers, 0);
+        assert_eq!(reg.unsubscribe("s1", &contract()), Ok(0));
     }
 
     #[test]

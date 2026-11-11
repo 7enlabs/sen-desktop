@@ -30,6 +30,9 @@
 //   flows from the backend (Tauri events) while a CLI turn runs — see
 //   listenSessionEvents in ./session-events.ts. This call records the
 //   subscription only, it invents no events.
+// - events_unsubscribe (BUG-09): backend drops one subscriber and
+//   returns the remaining count; close calls it before abort, and abort
+//   itself resets the count to 0.
 import { invoke } from "./bridge.ts";
 import type { ActionContract } from "./types.ts";
 import { SessionManager } from "../../../../packages/core/src/session.ts";
@@ -42,6 +45,11 @@ export interface BackendSessionResult {
 export interface BackendSubscribeResult {
   sessionId: string;
   subscriberId: number;
+}
+
+export interface BackendUnsubscribeResult {
+  sessionId: string;
+  subscriberCount: number;
 }
 
 function asSessionResult(value: unknown, expectedId: string): BackendSessionResult {
@@ -178,6 +186,45 @@ export async function subscribeSession(
     session_id: sessionId,
   });
   return asSubscribeResult(raw, sessionId);
+}
+
+function asUnsubscribeResult(
+  value: unknown,
+  expectedId: string,
+): BackendUnsubscribeResult {
+  const res = value as BackendUnsubscribeResult | null;
+  if (
+    !res ||
+    typeof res.sessionId !== "string" ||
+    typeof res.subscriberCount !== "number"
+  ) {
+    throw new Error(
+      "Backend unsubscribe result malformed, FAIL: " + JSON.stringify(value),
+    );
+  }
+  if (res.sessionId !== expectedId) {
+    throw new Error(
+      "Backend session id mismatch, FAIL: expected " +
+        expectedId +
+        ", got " +
+        res.sessionId,
+    );
+  }
+  return res;
+}
+
+// BUG-09 (#24): drops one backend subscriber, returns the remaining
+// count. The backend count saturates at 0, so an extra unsubscribe is
+// a harmless no-op, never an underflow.
+export async function unsubscribeSession(
+  contract: ActionContract,
+  sessionId: string,
+): Promise<BackendUnsubscribeResult> {
+  const raw = await invoke("sen_events_unsubscribe", {
+    contract,
+    session_id: sessionId,
+  });
+  return asUnsubscribeResult(raw, sessionId);
 }
 
 export async function callTool(
