@@ -100,10 +100,42 @@ pub const ERR_CLI_SPAWN_FAILED: &str = "CLI_SPAWN_FAILED";
 pub const ERR_CLI_TURN_IN_PROGRESS: &str = "CLI_TURN_IN_PROGRESS";
 pub const ERR_CLI_INVALID_RECORD: &str = "CLI_INVALID_RECORD";
 pub const ERR_CLI_NO_RESULT: &str = "CLI_NO_RESULT";
+/// Typed no-result codes (R2B-03): a turn that ends with no result
+/// record maps the CLI exit code to one of these instead of the shared
+/// CLI_NO_RESULT, so the frontend can tell auth apart from other
+/// failures by code. Exit 1 stays CLI_NO_RESULT; 130/143 and unknown
+/// codes also stay CLI_NO_RESULT. Note: CLI_NOT_FOUND here is the
+/// exit-3 (resource not found) code, distinct from cli_bin's
+/// ERR_CLI_NOT_FOUND which reports a missing binary at resolve time.
+pub const ERR_CLI_AUTH: &str = "CLI_AUTH";
+pub const ERR_CLI_NOT_FOUND: &str = "CLI_NOT_FOUND";
+pub const ERR_CLI_VALIDATION: &str = "CLI_VALIDATION";
+pub const ERR_CLI_FORBIDDEN: &str = "CLI_FORBIDDEN";
+pub const ERR_CLI_RATE_LIMIT: &str = "CLI_RATE_LIMIT";
+pub const ERR_CLI_CONFLICT: &str = "CLI_CONFLICT";
 pub const ERR_CLI_TRUNCATED: &str = "CLI_TRUNCATED";
 pub const ERR_CLI_TURN_ABORTED: &str = "CLI_TURN_ABORTED";
 pub const ERR_CLI_TURN_TIMEOUT: &str = "CLI_TURN_TIMEOUT";
 pub const ERR_CLI_EMPTY_TEXT: &str = "CLI_EMPTY_TEXT";
+
+/// Map a no-result turn's CLI exit code to a typed error code
+/// (R2B-03). The exit-code table in cli_bin.rs is reporting-only, so
+/// this is the control-flow mapping: exit 2 auth, 3 not found,
+/// 4 validation, 5 forbidden, 6 rate limit, 7 conflict. Exit 1
+/// stays CLI_NO_RESULT (the existing no_result_record_fails_loudly
+/// test pins it), and 130/143, unknown codes, and a missing code
+/// (killed by signal) also stay CLI_NO_RESULT.
+pub fn no_result_error_code(exit_code: Option<i32>) -> &'static str {
+    match exit_code {
+        Some(2) => ERR_CLI_AUTH,
+        Some(3) => ERR_CLI_NOT_FOUND,
+        Some(4) => ERR_CLI_VALIDATION,
+        Some(5) => ERR_CLI_FORBIDDEN,
+        Some(6) => ERR_CLI_RATE_LIMIT,
+        Some(7) => ERR_CLI_CONFLICT,
+        _ => ERR_CLI_NO_RESULT,
+    }
+}
 
 /// Build the exact CLI argv for one turn. The prompt is the last argv
 /// element; flags never follow it. `resume` = false starts a fresh CLI
@@ -571,7 +603,7 @@ impl CliBridge {
                 format!(" stderr: {}", detail)
             };
             return Err(BridgeError::new(
-                ERR_CLI_NO_RESULT,
+                no_result_error_code(exit_code),
                 &format!(
                     "CLI turn ended with no result record (exited {}).{}",
                     exit_code_label(exit_code),
@@ -840,6 +872,72 @@ exit 1"#;
         let err = result.unwrap_err();
         assert_eq!(err.code, ERR_CLI_NO_RESULT);
         assert!(err.message.contains("general error (1)"));
+    }
+
+    /// R2B-03: a no-result turn maps the CLI exit code to a typed error
+    /// code instead of one shared CLI_NO_RESULT, so the frontend can
+    /// tell auth apart from other failures by code. Each of these
+    /// FAILS on head (every exit maps to CLI_NO_RESULT) and PASSES
+    /// after the fix. Exit 1 stays CLI_NO_RESULT (covered by
+    /// no_result_record_fails_loudly above); 130/143 and unknown codes
+    /// also keep CLI_NO_RESULT.
+    fn no_result_with_exit(tag: &str, exit_code: i32) -> BridgeError {
+        let body = format!(
+            "cat <<'EOF'\n{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m:free\",\"v\":1}}\nEOF\nexit {}",
+            exit_code
+        );
+        let bin = fake_zen(tag, &body);
+        let (result, _events) = run_collect(bin, "steer", "hi");
+        result.unwrap_err()
+    }
+
+    #[test]
+    fn no_result_exit_2_is_typed_auth() {
+        let err = no_result_with_exit("noresult2", 2);
+        assert_eq!(err.code, ERR_CLI_AUTH);
+        assert!(err.message.contains("auth (2)"));
+    }
+
+    #[test]
+    fn no_result_exit_3_is_typed_not_found() {
+        let err = no_result_with_exit("noresult3", 3);
+        assert_eq!(err.code, ERR_CLI_NOT_FOUND);
+        assert!(err.message.contains("not found (3)"));
+    }
+
+    #[test]
+    fn no_result_exit_4_is_typed_validation() {
+        let err = no_result_with_exit("noresult4", 4);
+        assert_eq!(err.code, ERR_CLI_VALIDATION);
+        assert!(err.message.contains("validation (4)"));
+    }
+
+    #[test]
+    fn no_result_exit_5_is_typed_forbidden() {
+        let err = no_result_with_exit("noresult5", 5);
+        assert_eq!(err.code, ERR_CLI_FORBIDDEN);
+        assert!(err.message.contains("forbidden (5)"));
+    }
+
+    #[test]
+    fn no_result_exit_6_is_typed_rate_limit() {
+        let err = no_result_with_exit("noresult6", 6);
+        assert_eq!(err.code, ERR_CLI_RATE_LIMIT);
+        assert!(err.message.contains("rate limit (6)"));
+    }
+
+    #[test]
+    fn no_result_exit_7_is_typed_conflict() {
+        let err = no_result_with_exit("noresult7", 7);
+        assert_eq!(err.code, ERR_CLI_CONFLICT);
+        assert!(err.message.contains("conflict (7)"));
+    }
+
+    #[test]
+    fn no_result_exit_130_keeps_no_result_code() {
+        let err = no_result_with_exit("noresult130", 130);
+        assert_eq!(err.code, ERR_CLI_NO_RESULT);
+        assert!(err.message.contains("SIGINT (130)"));
     }
 
     #[test]
