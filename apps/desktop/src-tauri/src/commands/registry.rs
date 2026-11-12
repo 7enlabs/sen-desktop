@@ -358,13 +358,14 @@ impl Registry {
         self.bridges.get(session_id).cloned()
     }
 
-    /// Model for a new session: the stored settings model when a
-    /// settings dir is set, else the CLI's free default. Settings never
-    /// fail session creation (a bad file falls back to the default).
-    fn model_for_new_session(&self) -> String {
+    /// Settings for a new session: the stored settings when a
+    /// settings dir is set, else the defaults (CLI's free default
+    /// model, no base URL). Settings never fail session creation (a
+    /// bad file falls back to the defaults).
+    fn settings_for_new_session(&self) -> CliSettings {
         match &self.settings_dir {
-            Some(dir) => CliSettings::load(dir).model,
-            None => DEFAULT_MODEL.to_string(),
+            Some(dir) => CliSettings::load(dir),
+            None => CliSettings::default(),
         }
     }
 
@@ -378,9 +379,10 @@ impl Registry {
     }
 
     /// sen_session_create: backend record only, state Running, plus one
-    /// CLI bridge handle for the session (model from local settings,
-    /// default free model when nothing is stored). No model call happens
-    /// here: the handle spawns nothing until the first steer.
+    /// CLI bridge handle for the session (model and base URL from local
+    /// settings, default free model and no base URL when nothing is
+    /// stored). No model call happens here: the handle spawns nothing
+    /// until the first steer.
     pub fn create(
         &mut self,
         session_id: &str,
@@ -399,7 +401,7 @@ impl Registry {
                 &format!("Session already exists: {}", session_id),
             ));
         }
-        let model = self.model_for_new_session();
+        let settings = self.settings_for_new_session();
         self.sessions.insert(
             session_id.to_string(),
             SessionRecord {
@@ -414,7 +416,8 @@ impl Registry {
             Arc::new(CliBridge::new(
                 self.zen_bin_override.clone(),
                 session_id,
-                &model,
+                &settings.model,
+                settings.base_url.as_deref(),
             )),
         );
         Ok(SessionState::Running)
@@ -857,12 +860,44 @@ exit 0"#;
         std::fs::create_dir_all(&dir).unwrap();
         CliSettings {
             model: "some/model:free".to_string(),
+            base_url: None,
         }
         .save(&dir)
         .unwrap();
         let mut reg = Registry::with_settings_dir(dir.clone());
         reg.create("s1", &contract()).unwrap();
         assert_eq!(reg.bridge("s1").unwrap().model(), "some/model:free");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R2B-05: a stored base URL reaches the new session's bridge, and
+    // a settings file without one leaves the bridge with no base URL.
+    #[test]
+    fn create_uses_the_stored_settings_base_url() {
+        let dir = std::env::temp_dir().join(format!("sen_reg_baseurl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        CliSettings {
+            model: "some/model:free".to_string(),
+            base_url: Some("https://example.invalid/v1".to_string()),
+        }
+        .save(&dir)
+        .unwrap();
+        let mut reg = Registry::with_settings_dir(dir.clone());
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(
+            reg.bridge("s1").unwrap().base_url(),
+            Some("https://example.invalid/v1")
+        );
+        // Old file, no base_url key: the bridge gets None.
+        std::fs::write(
+            CliSettings::file_path(&dir),
+            "{\"model\":\"some/model:free\"}",
+        )
+        .unwrap();
+        let mut reg2 = Registry::with_settings_dir(dir.clone());
+        reg2.create("s2", &contract()).unwrap();
+        assert_eq!(reg2.bridge("s2").unwrap().base_url(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

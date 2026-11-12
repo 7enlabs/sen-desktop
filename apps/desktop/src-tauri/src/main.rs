@@ -19,9 +19,10 @@ fn main() {
         .manage(Mutex::new(Registry::new()))
         .setup(|app| {
             // Local CLI settings live in the app config dir
-            // (cli-settings.json, model id only, never a key). When the
-            // dir is unavailable the registry keeps no settings dir and
-            // new sessions use the CLI's free default model.
+            // (cli-settings.json, model id + optional base URL, never a
+            // key). When the dir is unavailable the registry keeps no
+            // settings dir and new sessions use the CLI's free default
+            // model.
             if let Ok(dir) = app.path().app_config_dir() {
                 if let Some(state) = app.try_state::<Mutex<Registry>>() {
                     if let Ok(mut registry) = state.lock() {
@@ -41,6 +42,8 @@ fn main() {
             commands::events::sen_events_unsubscribe,
             commands::settings::sen_settings_get_model,
             commands::settings::sen_settings_set_model,
+            commands::settings::sen_settings_get_base_url,
+            commands::settings::sen_settings_set_base_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
