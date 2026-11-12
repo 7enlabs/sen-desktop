@@ -77,13 +77,73 @@ export function setEventListen(next: EventListen | null): void {
   eventListen = next ?? realListen;
 }
 
-function isSenEvent(value: unknown): value is SenEvent {
-  const ev = value as SenEvent | null;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function hasString(record: Record<string, unknown>, key: string): boolean {
+  return typeof record[key] === "string";
+}
+
+// The turn usage the Rust SenEvent::Result carries: all three counters
+// must be numbers, or the result payload is malformed.
+function isSenTurnUsage(value: unknown): value is SenTurnUsage {
   return (
-    !!ev &&
-    typeof ev.type === "string" &&
-    typeof (ev as { sessionId?: unknown }).sessionId === "string"
+    isRecord(value) &&
+    typeof value.inputTokens === "number" &&
+    typeof value.outputTokens === "number" &&
+    typeof value.cacheReadInputTokens === "number"
   );
+}
+
+// Validate one payload against the SenEvent union: the variant must be
+// one of the 7 the Rust backend emits (which mirror the CLI's
+// system/assistant/user/stream_event/result records, R2-16 / #65), and
+// its required fields must have the right types. Anything else — an
+// unknown type, a known type with missing or wrong-typed fields — is
+// dropped, never delivered to onEvent. The old check (type is a string
+// + sessionId is a string) let unknown and malformed payloads through.
+function isSenEvent(value: unknown): value is SenEvent {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (typeof value.type !== "string" || typeof value.sessionId !== "string") {
+    return false;
+  }
+  switch (value.type) {
+    case "sessionStart":
+      return hasString(value, "model");
+    case "message":
+      return hasString(value, "text");
+    case "messageUpdate":
+      // Deltas are provisional per the CLI contract (issue #20): the
+      // full assistant record that follows is authoritative. A renderer
+      // must replace, not append, the accumulated deltas when it
+      // arrives, keyed by sessionId and turn order.
+      return hasString(value, "delta");
+    case "toolResult":
+      return (
+        hasString(value, "toolUseId") &&
+        "content" in value &&
+        typeof value.isError === "boolean"
+      );
+    case "system":
+      return hasString(value, "subtype");
+    case "result":
+      return (
+        hasString(value, "subtype") &&
+        typeof value.isError === "boolean" &&
+        hasString(value, "text") &&
+        typeof value.numTurns === "number" &&
+        isSenTurnUsage(value.usage) &&
+        typeof value.durationMs === "number" &&
+        hasString(value, "model")
+      );
+    case "unknown":
+      return hasString(value, "recordType");
+    default:
+      return false;
+  }
 }
 
 /// Listen for events of one session only. Events for other sessions are
