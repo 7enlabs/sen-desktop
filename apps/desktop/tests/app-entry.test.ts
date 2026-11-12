@@ -59,14 +59,19 @@ test("app entry: startApp wires one session through the backend, same manager", 
   setBridgeTransport(null);
 });
 
-test("app entry: startApp without a session id uses the default id", async () => {
+test("app entry: startApp without a session id generates a UUID default id", async () => {
   const transportCalls = liveTransport();
   const app = await startApp({});
   assert.deepEqual(transportCalls, [
     "sen_session_create",
     "sen_events_subscribe",
   ]);
-  assert.equal(app.sessionId, "app-live-session");
+  // R2B-01: the default id must be a UUID, because the CLI rejects
+  // "--session-id app-live-session" with exit 4 (not a valid UUID).
+  const uuidPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  assert.match(app.sessionId, uuidPattern);
+  assert.equal(app.attached.sessionId, app.sessionId);
   assert.equal(app.state, "Running");
   assert.equal(app.attached.subscriberId, 7);
   setBridgeTransport(null);

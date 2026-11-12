@@ -40,8 +40,11 @@ import type { ActionContract } from "../ipc/types.ts";
 import { SessionManager } from "../../../../packages/core/src/session.ts";
 
 export interface StartAppOptions {
-  // Session id for the one app session. Defaults to
-  // "app-live-session"; there is no UI yet to open a second one.
+  // Session id for the one app session. Defaults to a freshly
+  // generated UUID (crypto.randomUUID): the CLI rejects a
+  // non-UUID --session-id with exit 4 (R2B-01), so the fixed
+  // string "app-live-session" can never be the default. There is
+  // no UI yet to open a second one.
   sessionId?: string;
   // An existing manager to bind into. When omitted, the app creates one
   // and owns it for the whole session lifecycle.
@@ -87,7 +90,7 @@ function appLiveContract(sessionId: string): ActionContract {
 export async function startApp(
   options: StartAppOptions = {},
 ): Promise<StartedApp> {
-  const sessionId = options.sessionId ?? "app-live-session";
+  const sessionId = options.sessionId ?? crypto.randomUUID();
   const manager = options.manager ?? new SessionManager();
   if (manager.hasSession(sessionId)) {
     throw new Error("DUPLICATE_SESSION: Session already exists: " + sessionId);
