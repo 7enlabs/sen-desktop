@@ -390,3 +390,49 @@ test("live-client close: unlisten stops the frontend listener before backend uns
   ]);
   setBridgeTransport(null);
 });
+
+test("live-client close (V-04): unlisten runs BEFORE backend unsubscribe and abort", async () => {
+  // V-04 (base 7158fe1): no production close path exists yet, so this
+  // locks the join contract itself — closeLiveSession must stop the
+  // frontend listener first, then unsubscribe, then abort. A future UI
+  // close path passes StartedApp.unlisten as the 4th argument; the order
+  // inside closeLiveSession is what this test pins, not a caller that
+  // does not exist yet. The order array records the unlisten call on the
+  // same timeline as the backend commands, so a swap fails this test.
+  const order: string[] = [];
+  setBridgeTransport(async (command, args) => {
+    order.push(command);
+    const a = args as { session_id?: string };
+    if (command === "sen_session_create") {
+      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    }
+    if (command === "sen_events_subscribe") {
+      return { sessionId: a.session_id, subscriberId: 7 };
+    }
+    if (command === "sen_events_unsubscribe") {
+      return { sessionId: a.session_id, subscriberCount: 0 };
+    }
+    if (command === "sen_session_abort") {
+      return { sessionId: a.session_id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
+    }
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+  });
+  const manager = new SessionManager();
+  const attached = await attachLiveSession(manager, contract(), "s1");
+  const unlisten = attached.unlisten;
+  assert.equal(typeof unlisten, "function");
+  await closeLiveSession(manager, contract(), "s1", () => {
+    order.push("unlisten");
+    if (unlisten) {
+      unlisten();
+    }
+  });
+  assert.deepEqual(order, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "unlisten",
+    "sen_events_unsubscribe",
+    "sen_session_abort",
+  ]);
+  setBridgeTransport(null);
+});

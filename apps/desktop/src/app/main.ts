@@ -68,6 +68,13 @@ export interface StartedApp {
   attached: AttachedLiveSession;
   // Stops the frontend event listener installed by attach. The caller
   // owns it: pass it to closeLiveSession when the session closes.
+  // V-04 (base 7158fe1): no production close path exists yet — no UI,
+  // no window-close handler, no closeApp — so nothing passes this in
+  // today. When the UI builds a close path, it passes this value as the
+  // 4th argument to closeLiveSession (manager, contract, sessionId,
+  // unlisten); closeLiveSession already stops the listener first, then
+  // unsubscribes, then aborts. Do not invent a closeApp here: the close
+  // path belongs to the UI work that owns the window lifecycle.
   unlisten: UnlistenFn | null;
 }
 

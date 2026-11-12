@@ -1,0 +1,10 @@
+[
+  "{\"type\":\"sessionStart\",\"sessionId\":\"s1\",\"model\":\"m\"}",
+  "{\"type\":\"message\",\"sessionId\":\"s1\",\"text\":\"hi\"}",
+  "{\"type\":\"message\",\"sessionId\":\"s1\",\"text\":\"\",\"toolCalls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"Read\"},\"id\":\"c1\",\"type\":\"function\"}]}",
+  "{\"type\":\"messageUpdate\",\"sessionId\":\"s1\",\"delta\":\"hel\"}",
+  "{\"type\":\"toolResult\",\"sessionId\":\"s1\",\"toolUseId\":\"t1\",\"content\":\"ok\",\"isError\":false}",
+  "{\"type\":\"system\",\"sessionId\":\"s1\",\"subtype\":\"tool_progress\"}",
+  "{\"type\":\"result\",\"sessionId\":\"s1\",\"subtype\":\"success\",\"isError\":false,\"text\":\"done\",\"numTurns\":2,\"usage\":{\"inputTokens\":10,\"outputTokens\":5,\"cacheReadInputTokens\":1},\"durationMs\":123,\"model\":\"m\"}",
+  "{\"type\":\"unknown\",\"sessionId\":\"s1\",\"recordType\":\"future_thing\",\"subtype\":\"x\"}"
+]
