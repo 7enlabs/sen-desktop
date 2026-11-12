@@ -45,7 +45,7 @@ function liveTransport() {
     calls.push(command);
     const a = args as { session_id?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running" };
+      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
       return { sessionId: a.session_id, subscriberId: 7 };
@@ -54,9 +54,9 @@ function liveTransport() {
       return { sessionId: a.session_id, subscriberCount: 0 };
     }
     if (command === "sen_session_abort") {
-      return { sessionId: a.session_id, state: "Cancelled" };
+      return { sessionId: a.session_id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
     }
-    return { sessionId: a.session_id, state: "Running" };
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   return calls;
 }
@@ -100,7 +100,7 @@ test("live-client close: backend + local Cancelled through the IPC bridge", asyn
   const manager = new SessionManager();
   const attached = await attachLiveSession(manager, contract(), "s1");
   const res = await closeLiveSession(manager, contract(), "s1");
-  assert.deepEqual(res, { sessionId: "s1", state: "Cancelled" });
+  assert.deepEqual(res, { sessionId: "s1", state: "Cancelled", unknownRecords: 0, versionMismatches: 0 });
   // BUG-09: close unsubscribes before abort, so the backend subscriber
   // count drops instead of leaking.
   assert.deepEqual(transportCalls, [
@@ -134,9 +134,9 @@ test("live-client steer/followUp: pure IPC, backend ack returned, local stays Ru
   const manager = new SessionManager();
   await attachLiveSession(manager, contract(), "s1");
   const steered = await steerSession(contract(), "s1", "hi");
-  assert.deepEqual(steered, { sessionId: "s1", state: "Running" });
+  assert.deepEqual(steered, { sessionId: "s1", state: "Running", unknownRecords: 0, versionMismatches: 0 });
   const followed = await followUpSession(contract(), "s1", "again");
-  assert.deepEqual(followed, { sessionId: "s1", state: "Running" });
+  assert.deepEqual(followed, { sessionId: "s1", state: "Running", unknownRecords: 0, versionMismatches: 0 });
   assert.deepEqual(transportCalls, [
     "sen_session_create",
     "sen_events_subscribe",
@@ -169,7 +169,7 @@ test("live-client steer: backend CLI failure surfaces, local stays Running", asy
         "CLI_NO_RESULT: CLI turn ended with no result record (exited general error (1)).",
       );
     }
-    return { sessionId: a.session_id, state: "Running" };
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   await assert.rejects(
     () => steerSession(contract(), "s1", "hi"),
@@ -188,7 +188,7 @@ test("live-client abort: pure IPC, backend + local Cancelled", async () => {
   const manager = new SessionManager();
   await attachLiveSession(manager, contract(), "s1");
   const res = await abortSession(manager, contract(), "s1");
-  assert.deepEqual(res, { sessionId: "s1", state: "Cancelled" });
+  assert.deepEqual(res, { sessionId: "s1", state: "Cancelled", unknownRecords: 0, versionMismatches: 0 });
   assert.deepEqual(transportCalls, [
     "sen_session_create",
     "sen_events_subscribe",
@@ -208,7 +208,7 @@ test("live-client abort: backend refusal surfaces, local stays Running", async (
     if (command === "sen_session_abort") {
       throw new Error("backend down");
     }
-    return { sessionId: a.session_id, state: "Running" };
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   await assert.rejects(
     () => abortSession(manager, contract(), "s1"),

@@ -67,12 +67,34 @@ impl ContractArgs {
 pub struct SessionResult {
     pub session_id: String,
     pub state: String,
+    /// Unknown records seen in the last turn (R2B-04): 0 when no turn
+    /// ran (create/abort), the turn's count after steer/follow_up, and
+    /// the recorded turn's count on a Duplicate replay.
+    pub unknown_records: u64,
+    /// Version mismatches seen in the last turn (R2B-04, same rule as
+    /// unknown_records; a record with no `v` field counts as one).
+    pub version_mismatches: u64,
 }
 
 fn result(session_id: &str, state: super::registry::SessionState) -> SessionResult {
     SessionResult {
         session_id: session_id.to_string(),
         state: state.as_str().to_string(),
+        unknown_records: 0,
+        version_mismatches: 0,
+    }
+}
+
+fn result_with_counts(
+    session_id: &str,
+    state: super::registry::SessionState,
+    turn: &super::cli_spawn::TurnResult,
+) -> SessionResult {
+    SessionResult {
+        session_id: session_id.to_string(),
+        state: state.as_str().to_string(),
+        unknown_records: turn.unknown_records,
+        version_mismatches: turn.version_mismatches,
     }
 }
 
@@ -120,8 +142,11 @@ fn run_steer_turn(
             .map_err(|e| e.to_wire())?
     };
     let bridge = match start {
-        super::registry::SteerStart::Duplicate { state, .. } => {
-            return Ok(result(session_id, state));
+        super::registry::SteerStart::Duplicate { state, turn } => {
+            // R2B-04: the recorded turn carries its counts, so a
+            // replayed steer reports the same numbers as the turn
+            // that originally ran.
+            return Ok(result_with_counts(session_id, state, &turn));
         }
         super::registry::SteerStart::InFlight { .. } => {
             return Err(super::registry::CommandError::new(
@@ -157,7 +182,9 @@ fn run_steer_turn(
     let next = registry
         .complete_steer(session_id, &contract.to_registry(), kind, text, &turn)
         .map_err(|e| e.to_wire())?;
-    Ok(result(session_id, next))
+    // R2B-04: the turn's unknown/version counts travel to the frontend
+    // with the session result instead of staying inside TurnResult.
+    Ok(result_with_counts(session_id, next, &turn))
 }
 
 /// sen_session_steer: gates on a Running session, then runs one CLI turn
