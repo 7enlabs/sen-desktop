@@ -102,6 +102,12 @@ export async function attachLiveSession(
 // abort that bypasses this path leaks nothing either. No SDK abort or
 // dispose exists anymore, so the old finally-return swallow (BUG-12)
 // has no subject left.
+// V-04 (base 7158fe1): the join point is the 4th parameter, unlisten.
+// No production caller passes it yet — the only callers are tests —
+// because no UI/window close path exists on this base. When the UI
+// builds one, it passes StartedApp.unlisten here; the order below
+// (unlisten, unsubscribe, abort) is locked by the V-04 test in
+// live-client.test.ts.
 export async function closeLiveSession(
   manager: SessionManager,
   contract: ActionContract,

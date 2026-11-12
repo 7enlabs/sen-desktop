@@ -486,6 +486,68 @@ mod tests {
         );
     }
 
+    // R2-01 / #65 follow-up: the 8 wire events shared by the two wire
+    // tests. sen_event_serializes_with_camel_case_fields locks each
+    // event against a hand-written literal; the fixture test below
+    // serializes these same values and compares them byte-for-byte
+    // with the committed fixture that the TS test reads verbatim.
+    // One construction site, so the producer side cannot drift from
+    // itself — the only copy left is the literal list in the lock test,
+    // which the fixture test now cross-checks via the fixture.
+    fn wire_fixture_events() -> Vec<SenEvent> {
+        vec![
+            SenEvent::SessionStart {
+                session_id: "s1".to_string(),
+                model: "m".to_string(),
+            },
+            SenEvent::Message {
+                session_id: "s1".to_string(),
+                text: "hi".to_string(),
+                tool_calls: None,
+            },
+            SenEvent::Message {
+                session_id: "s1".to_string(),
+                text: "".to_string(),
+                tool_calls: Some(
+                    serde_json::json!([{"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]),
+                ),
+            },
+            SenEvent::MessageUpdate {
+                session_id: "s1".to_string(),
+                delta: "hel".to_string(),
+            },
+            SenEvent::ToolResult {
+                session_id: "s1".to_string(),
+                tool_use_id: "t1".to_string(),
+                content: serde_json::json!("ok"),
+                is_error: false,
+            },
+            SenEvent::System {
+                session_id: "s1".to_string(),
+                subtype: "tool_progress".to_string(),
+            },
+            SenEvent::Result {
+                session_id: "s1".to_string(),
+                subtype: "success".to_string(),
+                is_error: false,
+                text: "done".to_string(),
+                num_turns: 2,
+                usage: TurnUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_input_tokens: 1,
+                },
+                duration_ms: 123,
+                model: "m".to_string(),
+            },
+            SenEvent::Unknown {
+                session_id: "s1".to_string(),
+                record_type: "future_thing".to_string(),
+                subtype: Some("x".to_string()),
+            },
+        ]
+    }
+
     #[test]
     fn sen_event_serializes_with_camel_case_fields() {
         // V-01 / #65: the wire to the frontend is camelCase — the TS
@@ -497,85 +559,120 @@ mod tests {
         // serialized shape: if a field ever goes back to snake_case it
         // fails here, not silently in the webview (where the validator
         // would drop the event). The TS side locks the same bytes in
-        // session-events.test.ts ("wire bytes copied from Rust").
-        let cases: Vec<(SenEvent, &str)> = vec![
-            (
-                SenEvent::SessionStart {
-                    session_id: "s1".to_string(),
-                    model: "m".to_string(),
-                },
-                r#"{"type":"sessionStart","sessionId":"s1","model":"m"}"#,
-            ),
-            (
-                SenEvent::Message {
-                    session_id: "s1".to_string(),
-                    text: "hi".to_string(),
-                    tool_calls: None,
-                },
-                r#"{"type":"message","sessionId":"s1","text":"hi"}"#,
-            ),
-            (
-                SenEvent::Message {
-                    session_id: "s1".to_string(),
-                    text: "".to_string(),
-                    tool_calls: Some(
-                        serde_json::json!([{"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]),
-                    ),
-                },
-                r#"{"type":"message","sessionId":"s1","text":"","toolCalls":[{"function":{"arguments":"{}","name":"Read"},"id":"c1","type":"function"}]}"#,
-            ),
-            (
-                SenEvent::MessageUpdate {
-                    session_id: "s1".to_string(),
-                    delta: "hel".to_string(),
-                },
-                r#"{"type":"messageUpdate","sessionId":"s1","delta":"hel"}"#,
-            ),
-            (
-                SenEvent::ToolResult {
-                    session_id: "s1".to_string(),
-                    tool_use_id: "t1".to_string(),
-                    content: serde_json::json!("ok"),
-                    is_error: false,
-                },
-                r#"{"type":"toolResult","sessionId":"s1","toolUseId":"t1","content":"ok","isError":false}"#,
-            ),
-            (
-                SenEvent::System {
-                    session_id: "s1".to_string(),
-                    subtype: "tool_progress".to_string(),
-                },
-                r#"{"type":"system","sessionId":"s1","subtype":"tool_progress"}"#,
-            ),
-            (
-                SenEvent::Result {
-                    session_id: "s1".to_string(),
-                    subtype: "success".to_string(),
-                    is_error: false,
-                    text: "done".to_string(),
-                    num_turns: 2,
-                    usage: TurnUsage {
-                        input_tokens: 10,
-                        output_tokens: 5,
-                        cache_read_input_tokens: 1,
-                    },
-                    duration_ms: 123,
-                    model: "m".to_string(),
-                },
-                r#"{"type":"result","sessionId":"s1","subtype":"success","isError":false,"text":"done","numTurns":2,"usage":{"inputTokens":10,"outputTokens":5,"cacheReadInputTokens":1},"durationMs":123,"model":"m"}"#,
-            ),
-            (
-                SenEvent::Unknown {
-                    session_id: "s1".to_string(),
-                    record_type: "future_thing".to_string(),
-                    subtype: Some("x".to_string()),
-                },
-                r#"{"type":"unknown","sessionId":"s1","recordType":"future_thing","subtype":"x"}"#,
-            ),
+        // session-events.test.ts ("wire bytes copied from Rust" test,
+        // kept as-is) and, since R2-01, in the committed fixture
+        // tests/fixtures/sen-events-wire.json read verbatim by the
+        // "Rust-generated wire fixture" TS test.
+        let expected = [
+            r#"{"type":"sessionStart","sessionId":"s1","model":"m"}"#,
+            r#"{"type":"message","sessionId":"s1","text":"hi"}"#,
+            r#"{"type":"message","sessionId":"s1","text":"","toolCalls":[{"function":{"arguments":"{}","name":"Read"},"id":"c1","type":"function"}]}"#,
+            r#"{"type":"messageUpdate","sessionId":"s1","delta":"hel"}"#,
+            r#"{"type":"toolResult","sessionId":"s1","toolUseId":"t1","content":"ok","isError":false}"#,
+            r#"{"type":"system","sessionId":"s1","subtype":"tool_progress"}"#,
+            r#"{"type":"result","sessionId":"s1","subtype":"success","isError":false,"text":"done","numTurns":2,"usage":{"inputTokens":10,"outputTokens":5,"cacheReadInputTokens":1},"durationMs":123,"model":"m"}"#,
+            r#"{"type":"unknown","sessionId":"s1","recordType":"future_thing","subtype":"x"}"#,
         ];
-        for (event, expected) in cases {
+        for (event, expected) in wire_fixture_events().into_iter().zip(expected) {
             assert_eq!(serde_json::to_string(&event).unwrap(), expected);
         }
+    }
+
+    // R2-01 / #65 follow-up: locate the committed wire fixture
+    // (apps/desktop/tests/fixtures/sen-events-wire.json) from wherever
+    // this file is compiled. Under the standalone harness file!() is
+    // the absolute #[path] (…/apps/desktop/src-tauri/src/commands/
+    // stream_json.rs); in the Tauri crate CARGO_MANIFEST_DIR is
+    // …/apps/desktop/src-tauri; as a last resort walk up from the
+    // current directory looking for the repo layout.
+    fn wire_fixture_path() -> std::path::PathBuf {
+        for ancestor in std::path::Path::new(file!()).ancestors() {
+            if ancestor
+                .file_name()
+                .map(|n| n == "src-tauri")
+                .unwrap_or(false)
+            {
+                return ancestor
+                    .parent()
+                    .expect("src-tauri has a parent")
+                    .join("tests/fixtures/sen-events-wire.json");
+            }
+        }
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        if manifest
+            .file_name()
+            .map(|n| n == "src-tauri")
+            .unwrap_or(false)
+        {
+            return manifest
+                .parent()
+                .expect("src-tauri has a parent")
+                .join("tests/fixtures/sen-events-wire.json");
+        }
+        let mut dir = std::env::current_dir().expect("current dir");
+        loop {
+            let candidate = dir.join("apps/desktop/tests/fixtures/sen-events-wire.json");
+            if dir
+                .join("apps/desktop/src-tauri/src/commands/stream_json.rs")
+                .exists()
+            {
+                return candidate;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        panic!(
+            "R2-01: cannot locate tests/fixtures/sen-events-wire.json \
+             (file!() = {}, CARGO_MANIFEST_DIR = {})",
+            file!(),
+            env!("CARGO_MANIFEST_DIR")
+        );
+    }
+
+    #[test]
+    fn sen_event_wire_fixture_matches_serde_output() {
+        // R2-01 / #65 follow-up: the in-repo link between the Rust
+        // producer and the TS validator. The committed fixture holds
+        // the real serde_json::to_string output of each wire event,
+        // one JSON string per line-entry; the TS test
+        // ("Rust-generated wire fixture ...", session-events.test.ts)
+        // reads that same file verbatim and feeds it through the real
+        // listenSessionEvents validator. If the Rust shape ever drifts
+        // (e.g. a field back to snake_case) this test fails here; if
+        // the fixture is hand-edited away from serde output it fails
+        // here too — the fixture is generated, never hand-written.
+        // Regenerate (after an intentional wire change, together with
+        // the TS lock test): SEN_REGEN_WIRE_FIXTURE=1 cargo test
+        // --offline sen_event_wire_fixture_matches_serde_output
+        // (via the standalone harness on this box, or in the Tauri
+        // crate where CI runs cargo test). Never edit the fixture by
+        // hand: a hand edit that matches neither side fails this test.
+        let path = wire_fixture_path();
+        let serialized: Vec<String> = wire_fixture_events()
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        if std::env::var_os("SEN_REGEN_WIRE_FIXTURE").is_some() {
+            let text = serde_json::to_string_pretty(&serialized).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("{text}\n")).unwrap();
+            return;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "R2-01: cannot read wire fixture {}: {e} — regenerate it \
+                 with SEN_REGEN_WIRE_FIXTURE=1 (see tests/fixtures/README.md)",
+                path.display()
+            )
+        });
+        let fixture: Vec<String> =
+            serde_json::from_str(&text).expect("wire fixture is a JSON array of strings");
+        assert_eq!(
+            fixture, serialized,
+            "R2-01: committed wire fixture differs from real serde output — \
+             regenerate it with SEN_REGEN_WIRE_FIXTURE=1, do not hand-edit it"
+        );
     }
 
     #[test]
