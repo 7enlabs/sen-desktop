@@ -162,7 +162,10 @@ fn run_steer_turn(
 
 /// sen_session_steer: gates on a Running session, then runs one CLI turn
 /// for it. The backend ack means the model call ran to a result record;
-/// a failure surfaces as a typed error and nothing is recorded.
+/// a failure surfaces as a typed error and nothing is recorded. A result
+/// record with is_error=true (R2B-02) is also not recorded as a completed
+/// steer: the error is visible in the event stream, and a retry with the
+/// same key runs the model again instead of replaying the error.
 #[tauri::command]
 pub fn sen_session_steer(
     app: AppHandle,

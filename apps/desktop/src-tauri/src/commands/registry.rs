@@ -512,10 +512,17 @@ impl Registry {
     /// sen_session_steer / sen_session_follow_up, step 3 of 3: record the
     /// turn AFTER the model ran. The log entry is written only here, so
     /// the backend never records a steer that did not run a model — the
-    /// BUG-06 lesson. The completed turn is also stored under its steer
-    /// key, so a later retry of the same key + contract + text replays
-    /// this result instead of running again (BUG-10, #25). The
-    /// in-flight key is dropped FIRST, before anything else: on the
+    /// BUG-06 lesson. A turn that ran to a SUCCESS result is also stored
+    /// under its steer key, so a later retry of the same key + contract
+    /// + text replays this result instead of running again (BUG-10,
+    /// #25). A turn whose result record carries is_error=true (R2B-02)
+    /// is NOT stored: the model call failed (e.g. HTTP 401), so there is
+    /// no completed result to replay, and a retry with the same key must
+    /// run the model again. The error turn is still logged (its subtype
+    /// marks it, e.g. steer:steer:error_during_execution) and this still
+    /// returns Ok(state): the backend ack means the result record was
+    /// received, and the error itself is visible in the event stream.
+    /// The in-flight key is dropped FIRST, before anything else: on the
     /// success path the key moves from in-flight to completed below; on
     /// the refusal path (the session left Running, abort won the race)
     /// the key must still not leak, so a later steer is never refused
@@ -547,10 +554,17 @@ impl Registry {
             record.log.push(format!("steer:{}:{}", kind, turn.subtype));
             record.state
         };
-        self.completed_steers
-            .entry(session_id.to_string())
-            .or_default()
-            .insert(SteerKey::new(contract, kind, text), turn.clone());
+        // R2B-02: an error turn (is_error=true) is not a completed
+        // steer — do not cache it, so a retry with the same key runs
+        // the model again instead of replaying the error as a
+        // Duplicate. The log entry above already records that the
+        // turn ran and what its subtype was.
+        if !turn.is_error {
+            self.completed_steers
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(SteerKey::new(contract, kind, text), turn.clone());
+        }
         Ok(state)
     }
 
@@ -939,6 +953,98 @@ exit 1"#;
                 panic!("third identical steer must be Duplicate")
             }
         }
+    }
+
+    // R2B-02 (P1): a turn that returns a result record with
+    // is_error=true (e.g. HTTP 401, subtype error_during_execution)
+    // is NOT a completed steer. It must not be cached, so a retry
+    // with the same key + contract + text runs the model again
+    // instead of replaying the error as a Duplicate.
+    #[test]
+    fn steer_error_turn_is_not_cached_retry_reruns_model() {
+        let marker = std::env::temp_dir().join(format!("sen_reg_r2b02_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // First run: no marker yet -> the error result, exit 1 (the
+        // real CLI's behaviour on a bad key). Later runs: marker
+        // exists -> the happy output (key fixed, model runs).
+        let body = format!(
+            r#"if [ -f '{marker}' ]; then cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+{{"type":"assistant","uuid":"u1","session_id":"s1","message":{{"role":"assistant","content":"hello"}},"parent_tool_use_id":null,"v":1}}
+{{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0}},"model":"m:free","session_id":"s1","v":1}}
+EOF
+exit 0; else touch '{marker}'; cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+{{"type":"result","subtype":"error_during_execution","is_error":true,"result":"HTTP 401 Unauthorized","duration_ms":1,"num_turns":0,"usage":{{}},"model":"m:free","session_id":"s1","v":1}}
+EOF
+exit 1; fi"#,
+            marker = marker.display()
+        );
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("r2b02", &body));
+        reg.create("s1", &contract()).unwrap();
+        // Steer 1: the error turn. The backend ack is Ok(Running) -
+        // the error is visible in the event stream, not as a failure.
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 2, "error turn must still emit its events");
+        assert!(matches!(events[1], SenEvent::Result { is_error: true, .. }));
+        if let SenEvent::Result { subtype, text, .. } = &events[1] {
+            assert_eq!(subtype, "error_during_execution");
+            assert!(text.contains("401"), "error text must carry the 401");
+        }
+        // The error turn ran, so it is logged - but it must NOT be
+        // cached as a completed steer.
+        assert_eq!(reg.get("s1").unwrap().log.len(), 2);
+        assert_eq!(
+            reg.get("s1").unwrap().log[1],
+            "steer:steer:error_during_execution"
+        );
+        assert_eq!(
+            reg.completed_steers
+                .get("s1")
+                .map(|done| done.len())
+                .unwrap_or(0),
+            0,
+            "error turn must not be recorded in completed_steers"
+        );
+        // Steer 2, same key + contract + text: must run the model
+        // again (events emitted, fake binary ran a second time and
+        // returned the happy result), not replay the error.
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(
+            events.len(),
+            3,
+            "retry after an error turn must run the model"
+        );
+        assert!(matches!(
+            events[2],
+            SenEvent::Result {
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(marker.exists(), "fake binary must have run a second time");
+        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+        // The successful retry IS cached: a third identical steer
+        // replays it (BUG-10 behaviour, unchanged).
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 0, "success turn must still be cached");
+        let _ = std::fs::remove_file(&marker);
     }
 
     // BUG-10 extra (tin 9645/9650): a second steer identical to one
