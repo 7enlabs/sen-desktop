@@ -27,8 +27,12 @@
 //   label for reporting only.
 // - Turn timeout (Leader tin 9566 decision 1): a turn that produces no
 //   result record within 120s is killed and reported as CLI_TURN_TIMEOUT,
-//   so a turn with no API key (the real CLI hangs after its init line
-//   without an auth error) does not hang silently until the user aborts.
+//   so a turn that truly hangs (no result record at all) does not hang
+//   silently until the user aborts. A turn with no API key is NOT such a
+//   case: with the bridge's stdin null, the real CLI returns a 401 result
+//   (is_error=true, exit 1) in ~1s (R2B-08). The earlier "no key hangs"
+//   reading came from a probe with inherited stdin: CLI -p reads stdin
+//   to EOF, so it waited on stdin, not on auth.
 //   After the read loop ends (EOF) the turn waits for the child only up
 //   to the 180s process-kill backstop (PROCESS_KILL_BACKSTOP, R2B-06),
 //   then kills it, so a CLI that closed stdout but stays alive cannot
@@ -70,8 +74,10 @@ pub const STDERR_TAIL_LEN: usize = 8192;
 
 /// Turn timeout (Leader tin 9566 decision 1): a turn that produces no
 /// result record within this long is killed and reported as
-/// CLI_TURN_TIMEOUT, so a turn with no API key (the real CLI hangs
-/// without an auth error) does not hang silently until the user aborts.
+/// CLI_TURN_TIMEOUT, so a genuinely hung turn (no result record at all)
+/// does not hang silently until the user aborts. A turn with no API key
+/// is not the hanging case: with stdin null the real CLI returns a 401
+/// result (is_error=true, exit 1) in ~1s (R2B-08).
 /// Under the 180s process-kill backstop (PROCESS_KILL_BACKSTOP, R2B-06):
 /// after the read loop ends (EOF) the wait for the child is bounded,
 /// then the child is SIGKILLed, so a CLI that closed stdout but stays
@@ -517,8 +523,10 @@ impl CliBridge {
 
         // Stdout is read on a helper thread and sent over a channel, so
         // the turn loop can wait on it with the remaining time instead
-        // of blocking forever on a hung CLI (measured: no key → init
-        // line only, then silence). EOF is the sender going away.
+        // of blocking forever on a hung CLI (one that produces no result
+        // record at all; a no-key turn is not such a case — with stdin
+        // null it returns a 401 result in ~1s, R2B-08). EOF is the
+        // sender going away.
         let (line_tx, line_rx) = std::sync::mpsc::channel::<Result<String, String>>();
         {
             let mut reader = BufReader::new(stdout);
@@ -615,7 +623,7 @@ impl CliBridge {
                     return Err(BridgeError::new(
                         ERR_CLI_TURN_TIMEOUT,
                         &format!(
-                            "CLI turn timed out after {:?} with no result record: the CLI produced no result (a turn with no API key can hang without reporting an error; check ZEN_API_KEY).",
+                            "CLI turn timed out after {:?} with no result record: the CLI produced no result record at all. (A missing API key is not the cause: with stdin null a no-key turn returns a 401 result in ~1s.)",
                             effective_timeout
                         ),
                     ));
@@ -1212,8 +1220,10 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
 
     #[test]
     fn turn_times_out_when_cli_hangs() {
-        // Fake CLI: prints init, then silence — the real CLI's no-key
-        // behaviour (init line only, then hangs). With a 300ms turn
+        // Fake CLI: prints init, then silence — a genuinely hung CLI
+        // (no result record at all). This is NOT the real CLI's no-key
+        // behaviour: with stdin null a no-key turn returns a 401 result
+        // in ~1s (R2B-08). With a 300ms turn
         // timeout the turn must fail as CLI_TURN_TIMEOUT in well under
         // the 30s the fake would run.
         let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
@@ -1226,6 +1236,10 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let err = bridge.run_turn("steer", "hi", &mut emit).unwrap_err();
         assert_eq!(err.code, ERR_CLI_TURN_TIMEOUT);
         assert!(err.message.contains("300ms"));
+        // R2B-08: the timeout message must no longer blame a missing
+        // API key for the hang.
+        assert!(!err.message.contains("hang without reporting an error"));
+        assert!(!err.message.contains("no API key can hang"));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
