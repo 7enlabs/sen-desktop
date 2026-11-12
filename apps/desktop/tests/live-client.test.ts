@@ -167,8 +167,11 @@ test("live-client close: a session that was never created refuses, no local reco
   );
   assert.deepEqual(transportCalls, [
     "sen_events_unsubscribe",
-    "sen_session_abort",
   ]);
+  // R2B-10: close still unsubscribes first, but abortSession now
+  // refuses before the backend call when the manager holds no record,
+  // so no sen_session_abort reaches the backend for a session that
+  // was never created here.
   assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
   setBridgeTransport(null);
 });
@@ -239,6 +242,28 @@ test("live-client abort: pure IPC, backend + local Cancelled", async () => {
     "sen_session_abort",
   ]);
   assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  setBridgeTransport(null);
+});
+
+test("live-client abort (R2B-10): foreign manager refuses before any backend call", async () => {
+  const transportCalls = liveTransport();
+  const managerA = new SessionManager();
+  await attachLiveSession(managerA, contract(), "s2");
+  // Manager B never held s2. Aborting through it must refuse before
+  // the backend is touched, or the backend would cancel s2 while
+  // manager A still holds it Running.
+  const managerB = new SessionManager();
+  await assert.rejects(
+    () => abortSession(managerB, contract(), "s2"),
+    /does not exist/,
+  );
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+  ]);
+  // The backend was never told to abort, so manager A still owns s2
+  // Running and can cancel it itself.
+  assert.equal(managerA.transition("s2", "Cancelled"), "Cancelled");
   setBridgeTransport(null);
 });
 
