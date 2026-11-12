@@ -34,6 +34,15 @@
 // that held the registry lock across the whole turn would deadlock abort:
 // abort needs the same lock to reach the bridge.
 //
+// Abort is split the same way (R2B-07): begin_abort (validate the
+// transition + hand out the session's bridge, no state change), the
+// bridge.abort() escalation (runs with NO registry lock held — it polls
+// up to the 5s grace when the child ignores SIGINT, and holding the
+// lock across it blocked every other Tauri command), and complete_abort
+// (re-check the transition, then Cancelled + log). The one-call abort()
+// below is test-only for the same reason steer() is: production code
+// must use the three steps, never hold the lock across bridge.abort().
+//
 // Idempotency (BUG-10, #25): the idempotency key is enforced, not just
 // checked for presence. begin_steer returns Duplicate when the same
 // (idempotency key, contract id, kind, text) already completed on this
@@ -266,6 +275,11 @@ pub struct Registry {
     /// Explicit binary path (tests / operator override). None means the
     /// bridge resolves per decision 1 at first turn (ZEN_BIN, then PATH).
     zen_bin_override: Option<PathBuf>,
+    /// Test-only abort grace for bridges created after the call (R2B-07):
+    /// shortens the SIGKILL escalation in tests so the lock-free abort
+    /// can be proven without waiting the full 5s production grace.
+    #[cfg(test)]
+    abort_grace_override: Option<Duration>,
 }
 
 /// The identity of one steer for idempotency (BUG-10, #25). A duplicate
@@ -332,6 +346,8 @@ impl Registry {
             in_flight_steers: HashMap::new(),
             settings_dir: None,
             zen_bin_override: None,
+            #[cfg(test)]
+            abort_grace_override: None,
         }
     }
 
@@ -347,6 +363,31 @@ impl Registry {
 
     pub fn set_zen_bin(&mut self, path: PathBuf) {
         self.zen_bin_override = Some(path);
+    }
+
+    /// Test-only (R2B-07): the abort grace for bridges created after
+    /// this call. Production always uses the 5s ABORT_GRACE in
+    /// cli_spawn.rs; tests shorten it so the SIGKILL escalation can be
+    /// proven without waiting the full grace.
+    #[cfg(test)]
+    pub fn set_abort_grace(&mut self, grace: Duration) {
+        self.abort_grace_override = Some(grace);
+    }
+
+    /// Build the session's bridge, applying the test-only abort grace
+    /// when one is set (R2B-07). Production always takes the default.
+    /// `base_url` is the stored provider base URL (R2B-05): passed
+    /// through to CliBridge::new so a new session keeps using the
+    /// saved base URL.
+    fn new_bridge(&self, session_id: &str, model: &str, base_url: Option<&str>) -> CliBridge {
+        let bridge = CliBridge::new(self.zen_bin_override.clone(), session_id, model, base_url);
+        #[cfg(test)]
+        {
+            if let Some(grace) = self.abort_grace_override {
+                return bridge.with_abort_grace(grace);
+            }
+        }
+        bridge
     }
 
     pub fn get(&self, session_id: &str) -> Option<&SessionRecord> {
@@ -413,12 +454,7 @@ impl Registry {
         );
         self.bridges.insert(
             session_id.to_string(),
-            Arc::new(CliBridge::new(
-                self.zen_bin_override.clone(),
-                session_id,
-                &settings.model,
-                settings.base_url.as_deref(),
-            )),
+            Arc::new(self.new_bridge(session_id, &settings.model, settings.base_url.as_deref())),
         );
         Ok(SessionState::Running)
     }
@@ -637,17 +673,18 @@ impl Registry {
         }
     }
 
-    /// sen_session_abort: escalate the running CLI turn first (SIGINT,
-    /// 5s grace, SIGKILL — decision 3), then Running or
-    /// AwaitingApproval -> Cancelled, per the point-854 table. Error has
-    /// no path to Cancelled (only Running and Failed), and terminal
-    /// states have no outgoing path at all. With no turn running the
-    /// escalation is a no-op and this is a pure state transition.
-    pub fn abort(
+    /// sen_session_abort, step 1 of 3 (R2B-07): validate the contract
+    /// and the transition, then hand out the session's bridge. The
+    /// state is NOT changed here: the caller runs bridge.abort() with
+    /// NO registry lock held (it polls up to the 5s grace when the
+    /// child ignores SIGINT), then calls complete_abort to record the
+    /// outcome. Returns None when the session has no bridge (the
+    /// complete step then records a plain NoChild abort).
+    pub fn begin_abort(
         &mut self,
         session_id: &str,
         contract: &ActionContract,
-    ) -> Result<SessionState, CommandError> {
+    ) -> Result<Option<Arc<CliBridge>>, CommandError> {
         validate_contract(contract)?;
         let record = self.get_mut_or_unknown(session_id)?;
         if !can_transition(record.state, SessionState::Cancelled) {
@@ -659,11 +696,33 @@ impl Registry {
                 ),
             ));
         }
-        let outcome = match self.bridges.get(session_id) {
-            Some(bridge) => bridge.abort(),
-            None => AbortOutcome::NoChild,
-        };
+        Ok(self.bridges.get(session_id).cloned())
+    }
+
+    /// sen_session_abort, step 3 of 3 (R2B-07): re-check the transition
+    /// — the state may have changed while bridge.abort() ran lock-free
+    /// (a concurrent abort may already have cancelled the session) —
+    /// then Running or AwaitingApproval -> Cancelled, per the
+    /// point-854 table, with the subscriber count reset to 0 and the
+    /// log entry matching the AbortOutcome, exactly as the old
+    /// one-call abort did. Error has no path to Cancelled (only
+    /// Running and Failed), and terminal states have no outgoing path
+    /// at all.
+    pub fn complete_abort(
+        &mut self,
+        session_id: &str,
+        outcome: AbortOutcome,
+    ) -> Result<SessionState, CommandError> {
         let record = self.get_mut_or_unknown(session_id)?;
+        if !can_transition(record.state, SessionState::Cancelled) {
+            return Err(CommandError::new(
+                ERR_ILLEGAL_TRANSITION,
+                &format!(
+                    "Illegal state transition: {} to Cancelled",
+                    record.state.as_str()
+                ),
+            ));
+        }
         record.state = SessionState::Cancelled;
         // BUG-09 (#24): close drops the subscriber count. A cancelled
         // session has no listeners left: whatever subscribers were
@@ -679,6 +738,25 @@ impl Registry {
                 .push("session_abort:kill-after-grace".to_string()),
         }
         Ok(record.state)
+    }
+
+    /// Run a whole abort in one call (tests only): begin, escalate,
+    /// complete. Production wrappers use the three steps separately so
+    /// the escalation runs without the registry lock held (R2B-07).
+    /// With no turn running the escalation is a no-op and this is a
+    /// pure state transition.
+    #[cfg(test)]
+    pub fn abort(
+        &mut self,
+        session_id: &str,
+        contract: &ActionContract,
+    ) -> Result<SessionState, CommandError> {
+        let bridge = self.begin_abort(session_id, contract)?;
+        let outcome = match bridge {
+            Some(bridge) => bridge.abort(),
+            None => AbortOutcome::NoChild,
+        };
+        self.complete_abort(session_id, outcome)
     }
 
     /// sen_events_subscribe: records one subscriber on the session. The
@@ -1546,6 +1624,101 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         assert_eq!(reg.abort("s1", &contract()), Ok(SessionState::Cancelled));
         assert_eq!(reg.get("s1").unwrap().subscribers, 0);
         assert_eq!(reg.unsubscribe("s1", &contract()), Ok(0));
+    }
+
+    // R2B-07: abort must NOT hold the registry lock while the bridge
+    // polls the grace period. Thread A aborts a session whose child
+    // ignores SIGINT (grace 1000ms, test-only) through the production
+    // 3-step pattern (begin_abort / bridge.abort() lock-free /
+    // complete_abort); thread B creates another session meanwhile and
+    // must finish well under the grace. On the old code the wrapper
+    // held the lock across the whole abort and thread B blocked for
+    // the full grace (5s with the production grace, proven by the
+    // scratch probe: 5.05s).
+    #[test]
+    fn abort_does_not_hold_registry_lock_during_grace() {
+        let body = r#"trap '' INT
+echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
+i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
+        let reg = std::sync::Arc::new(std::sync::Mutex::new(Registry::new()));
+        {
+            let mut r = reg.lock().unwrap();
+            r.set_zen_bin(fake_zen("r2b07", body));
+            r.set_abort_grace(Duration::from_millis(1000));
+            r.create("s1", &contract()).unwrap();
+        }
+        // Start a turn on s1 in the background (child ignores SIGINT).
+        let bridge = reg.lock().unwrap().bridge("s1").unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut emit = |_ev: SenEvent| {};
+            bridge.run_turn("steer", "hi", &mut emit)
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        // Thread A: the production 3-step abort, lock released while
+        // bridge.abort() waits out the grace.
+        let reg_a = std::sync::Arc::clone(&reg);
+        let abort_handle = std::thread::spawn(move || {
+            let bridge = {
+                let mut registry = reg_a.lock().unwrap();
+                registry.begin_abort("s1", &contract()).unwrap()
+            };
+            let outcome = match bridge {
+                Some(bridge) => bridge.abort(),
+                None => AbortOutcome::NoChild,
+            };
+            let mut registry = reg_a.lock().unwrap();
+            registry.complete_abort("s1", outcome)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        // Thread B: create another session while the abort waits.
+        let reg_b = std::sync::Arc::clone(&reg);
+        let started = std::time::Instant::now();
+        let created = std::thread::spawn(move || {
+            let mut registry = reg_b.lock().unwrap();
+            registry.create("s2", &contract())
+        })
+        .join();
+        let elapsed_b = started.elapsed();
+        assert!(created.is_ok(), "thread B panicked");
+        assert_eq!(created.unwrap(), Ok(SessionState::Running));
+        assert!(
+            elapsed_b < Duration::from_millis(500),
+            "R2B-07: create blocked {:?} while abort waited out the grace",
+            elapsed_b
+        );
+        // The abort itself still completes: KilledAfterGrace, Cancelled.
+        assert_eq!(abort_handle.join().unwrap(), Ok(SessionState::Cancelled));
+        assert!(reg
+            .lock()
+            .unwrap()
+            .get("s1")
+            .unwrap()
+            .log
+            .contains(&"session_abort:kill-after-grace".to_string()));
+        // The interrupted turn ends aborted.
+        let err = handle.join().unwrap().unwrap_err();
+        assert_eq!(err.code, "CLI_TURN_ABORTED");
+    }
+
+    // R2B-07: complete_abort re-checks the transition, because the
+    // state may have changed while bridge.abort() ran lock-free. A
+    // concurrent abort that cancels first wins; this abort's complete
+    // step must refuse instead of writing a second log entry.
+    #[test]
+    fn complete_abort_refuses_when_session_already_cancelled() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        let bridge = reg.begin_abort("s1", &contract()).unwrap();
+        assert!(bridge.is_some(), "begin_abort must hand out the bridge");
+        // A concurrent abort wins the race and cancels first.
+        assert_eq!(reg.abort("s1", &contract()), Ok(SessionState::Cancelled));
+        let err = reg.complete_abort("s1", AbortOutcome::NoChild).unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        assert_eq!(
+            reg.get("s1").unwrap().log.len(),
+            2,
+            "refused complete_abort must write no log entry"
+        );
     }
 
     #[test]

@@ -220,16 +220,31 @@ pub fn sen_session_follow_up(
 /// sen_session_abort: escalates the running CLI turn first (SIGINT, 5s
 /// grace, SIGKILL), then Running or AwaitingApproval -> Cancelled, per
 /// the point-854 table. Error and terminal states refuse with a typed
-/// error.
+/// error. Split in three (R2B-07), like run_steer_turn: begin_abort
+/// validates the transition and hands out the bridge (step 1), the
+/// bridge.abort() escalation runs with NO registry lock held so other
+/// Tauri commands are not blocked while it polls the grace period
+/// (step 2), then complete_abort re-checks the transition and records
+/// Cancelled + the log entry for the AbortOutcome (step 3).
 #[tauri::command]
 pub fn sen_session_abort(
     state: State<'_, Mutex<Registry>>,
     session_id: String,
     contract: ContractArgs,
 ) -> Result<SessionResult, String> {
+    let bridge = {
+        let mut registry = state.lock().map_err(|e| e.to_string())?;
+        registry
+            .begin_abort(&session_id, &contract.to_registry())
+            .map_err(|e| e.to_wire())?
+    };
+    let outcome = match bridge {
+        Some(bridge) => bridge.abort(),
+        None => super::cli_spawn::AbortOutcome::NoChild,
+    };
     let mut registry = state.lock().map_err(|e| e.to_string())?;
     let next = registry
-        .abort(&session_id, &contract.to_registry())
+        .complete_abort(&session_id, outcome)
         .map_err(|e| e.to_wire())?;
     Ok(result(&session_id, next))
 }
