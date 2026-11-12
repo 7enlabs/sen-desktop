@@ -2,13 +2,14 @@
 
 Status: LIVE SESSION ROUND (tin 4528/4542). This local bundle is the
 live-session working copy on top of merged PR #6 (9ed6981, 06:06 04/11):
-whole Pi stack 1.5.0; Tauri command handlers are real (commands/registry.rs plus
+Pi SDK removed from the app in PR #33; the model runs in the backend
+through the CLI core + stream-json bridge; Tauri command handlers are real (commands/registry.rs plus
 the Builder in main.rs); the frontend bridge calls the real
 @tauri-apps/api invoke; the live session channel is wired
 (packages/core model-channel + live-session, OpenRouter free route, explicit
 model only, key only from OPENROUTER_API_KEY at runtime; live attach real
-via apps/desktop ipc/live-client.ts; stream events flow through the SDK
-handle subscribe); tool execution is still refused; the frontend bundler
+via apps/desktop ipc/live-client.ts; stream events flow through the
+stream-json bridge); tool execution is still refused; the frontend bundler
 is still missing, so the full app is not built; cargo check evidence for
 the new branch comes from the Leader VM, as in the lockfile round.
 
@@ -26,8 +27,8 @@ structural level:
   and merged with PR #2.
 - Identifier: dev.7enlab.sen-desktop (temporary, changeable before release).
 - Minimum permissions: core Tauri only, no plugin added yet.
-- Desktop shell: main window 1200x800, temporary title Pi Desktop until the
-  10/11 Sen-name verification per B-1, no feature UI, no fake content.
+- Desktop shell: main window 1200x800, title Sen Desktop,
+  no feature UI, no fake content.
 - Default model: NONE; packages/providers is only a channel-declaration
   shell, no model attached, no key, no network call. Live sessions name
   their model explicitly at call time (OpenRouter free route, tin 4528/4542);
@@ -48,8 +49,7 @@ release-name decision. No package is published under the scope.
 Three names are all temporary pre-release names, and their unification is NOT
 decided here:
 
-- Window title: Pi Desktop (temporary, until the 10/11 Sen-name
-  verification per B-1).
+- Window title: Sen Desktop.
 - productName: Sen Desktop (temporary pre-release name).
 - Identifier: dev.7enlab.sen-desktop (temporary, changeable before
   release).
@@ -59,7 +59,8 @@ file keeps the temporary names above and marks them as temporary.
 
 ## Constraints kept from the prep
 
-- Pi coding agent 1.5.0 per tin 4178 (1.3.0 pin dropped); pi-agent-core 1.5.0 per tin 4212.
+- Pi SDK removed from the app in PR #33; no Pi version is a constraint
+  anymore (the 1.5.0 pin per tin 4178/4212 is history, not a constraint).
 - No cua-driver before the Z Red gate on 10/11. No iOS target in this
   scaffold.
 - F8 MCP waits for the full-text cross-check; it is not in this scaffold.
