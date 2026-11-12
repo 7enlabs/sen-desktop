@@ -10,11 +10,42 @@
 // They do NOT prove a real webview runs this module or a real model
 // answers: the webview proof is the vite build (npm run build) plus the
 // webview-no-sdk suite, and the model proof waits for the CLI bridge.
-import test from "node:test";
+import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import { startApp } from "../src/app/main.ts";
 import { SessionManager } from "../../../packages/core/src/session.ts";
+import {
+  setEventListen,
+  SEN_SESSION_EVENT,
+  type EventListen,
+  type SenEvent,
+} from "../src/ipc/session-events.ts";
+
+// Fake Tauri event listener: startApp attaches a live session, which
+// always listens after subscribing (R2-16 / #65), so tests stand in for
+// the backend here exactly like they do for the bridge transport.
+const capturedEvents: { send?: (payload: unknown) => void } = {};
+
+function fakeEventListen(): EventListen {
+  return async (event, handler) => {
+    assert.equal(event, SEN_SESSION_EVENT);
+    capturedEvents.send = (payload: unknown) => {
+      handler({ payload, event, id: 1 });
+    };
+    return () => undefined;
+  };
+}
+
+beforeEach(() => {
+  capturedEvents.send = undefined;
+  setEventListen(fakeEventListen());
+});
+
+afterEach(() => {
+  setEventListen(null);
+  setBridgeTransport(null);
+});
 
 function liveTransport() {
   const calls: string[] = [];
@@ -110,5 +141,38 @@ test("app entry: a backend failure leaves no local record", async () => {
     /backend down/,
   );
   assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
+  setBridgeTransport(null);
+});
+
+test("app entry: startApp receives live events into the session record and onEvent", async () => {
+  // R2-16 / #65: the app entry wires one session through the backend
+  // AND listens for its events. A validated message event lands in the
+  // session record and in the caller's onEvent; an unknown-type event
+  // reaches neither.
+  const received: SenEvent[] = [];
+  liveTransport();
+  const manager = new SessionManager();
+  const app = await startApp({
+    sessionId: "s1",
+    manager,
+    onEvent: (event) => received.push(event),
+  });
+  assert.equal(typeof app.unlisten, "function");
+  const send = capturedEvents.send as (payload: unknown) => void;
+  send({ type: "bogus", sessionId: "s1", text: "no such variant" });
+  send({ type: "message", sessionId: "s1", text: "hello" });
+  send({
+    type: "sessionStart",
+    sessionId: "s1",
+    model: "m:free",
+  });
+  assert.deepEqual(received, [
+    { type: "message", sessionId: "s1", text: "hello" },
+    { type: "sessionStart", sessionId: "s1", model: "m:free" },
+  ]);
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub", "session_event", "session_event"],
+  );
   setBridgeTransport(null);
 });

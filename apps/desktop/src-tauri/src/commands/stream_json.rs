@@ -66,6 +66,7 @@ pub struct CliRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -74,33 +75,37 @@ pub struct TurnUsage {
 
 /// Sen event derived from one CLI record. Serialized to the frontend over
 /// the Tauri event `sen-session-event` with `type` as the tag.
+///
+/// Wire shape is camelCase throughout, like the other backend results
+/// (SessionResult, SubscribeResult): the enum-level rename_all only
+/// renames variants, NOT fields, so each struct variant carries its own
+/// rename_all (V-01 / #65: without them the fields serialize snake_case
+/// and the frontend validator drops every real event). The test
+/// sen_event_serializes_with_camel_case_fields locks this shape.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SenEvent {
-    SessionStart {
-        session_id: String,
-        model: String,
-    },
+    #[serde(rename_all = "camelCase")]
+    SessionStart { session_id: String, model: String },
+    #[serde(rename_all = "camelCase")]
     Message {
         session_id: String,
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<serde_json::Value>,
     },
-    MessageUpdate {
-        session_id: String,
-        delta: String,
-    },
+    #[serde(rename_all = "camelCase")]
+    MessageUpdate { session_id: String, delta: String },
+    #[serde(rename_all = "camelCase")]
     ToolResult {
         session_id: String,
         tool_use_id: String,
         content: serde_json::Value,
         is_error: bool,
     },
-    System {
-        session_id: String,
-        subtype: String,
-    },
+    #[serde(rename_all = "camelCase")]
+    System { session_id: String, subtype: String },
+    #[serde(rename_all = "camelCase")]
     Result {
         session_id: String,
         subtype: String,
@@ -114,6 +119,7 @@ pub enum SenEvent {
     /// A record type this bridge does not know. The caller counts it;
     /// the count travels to the frontend with the session result
     /// (SessionResult.unknown_records, R2B-04); the turn continues.
+    #[serde(rename_all = "camelCase")]
     Unknown {
         session_id: String,
         record_type: String,
@@ -204,8 +210,10 @@ fn usage_of(record: &CliRecord) -> TurnUsage {
 
 /// Translate one CLI record into a Sen event. Unknown record types return
 /// SenEvent::Unknown (the caller counts them); the additive-only contract
-/// means a new record type must never break the bridge. Missing optional
-/// fields degrade to empty values, never a crash.
+/// means a new record type must never break the bridge. A user record
+/// with no tool_result block is Unknown too, never a fabricated empty
+/// ToolResult (R2-16 / #65). Missing optional fields degrade to empty
+/// values, never a crash.
 pub fn translate_cli_record(record: &CliRecord) -> SenEvent {
     let session_id = session_id_of(record);
     match record.record_type.as_str() {
@@ -238,9 +246,11 @@ pub fn translate_cli_record(record: &CliRecord) -> SenEvent {
             let mut tool_use_id = String::new();
             let mut tool_content = serde_json::Value::Null;
             let mut is_error = false;
+            let mut found_tool_result = false;
             if let Some(blocks) = message.get("content").and_then(|v| v.as_array()) {
                 for block in blocks {
                     if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                        found_tool_result = true;
                         if let Some(id) = block.get("tool_use_id").and_then(|v| v.as_str()) {
                             tool_use_id = id.to_string();
                         }
@@ -255,6 +265,19 @@ pub fn translate_cli_record(record: &CliRecord) -> SenEvent {
                         break;
                     }
                 }
+            }
+            // R2-16 / #65: a user record with no tool_result block is not
+            // a tool result at all — the CLI contract says user records
+            // are tool results, so anything else is an unknown record.
+            // Never fabricate a ToolResult with an empty id and null
+            // content: the caller counts the Unknown (R2B-04) and the
+            // turn continues.
+            if !found_tool_result {
+                return SenEvent::Unknown {
+                    session_id,
+                    record_type: "user".to_string(),
+                    subtype: record.subtype.clone(),
+                };
             }
             if tool_use_id.is_empty() {
                 if let Some(parent) = record.parent_tool_use_id.as_ref().and_then(|v| v.as_str()) {
@@ -430,6 +453,129 @@ mod tests {
                 delta: "".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn translate_user_without_tool_result_is_unknown_not_fabricated() {
+        // R2-16 / #65: a user record with no tool_result block must not
+        // become a ToolResult with an empty id and null content. The CLI
+        // contract says user records are tool results, so anything else
+        // is an unknown record: the caller counts it (R2B-04), the turn
+        // continues, and no fake ToolResult is ever emitted.
+        let ev = translate_cli_record(&record(
+            r#"{"type":"user","session_id":"s1","message":{"role":"user","content":"hello"},"parent_tool_use_id":null,"v":1}"#,
+        ));
+        assert_eq!(
+            ev,
+            SenEvent::Unknown {
+                session_id: "s1".to_string(),
+                record_type: "user".to_string(),
+                subtype: None,
+            }
+        );
+        let ev = translate_cli_record(&record(
+            r#"{"type":"user","session_id":"s1","message":{"role":"user","content":[{"type":"text","text":"hi"}]},"parent_tool_use_id":null,"v":1}"#,
+        ));
+        assert_eq!(
+            ev,
+            SenEvent::Unknown {
+                session_id: "s1".to_string(),
+                record_type: "user".to_string(),
+                subtype: None,
+            }
+        );
+    }
+
+    #[test]
+    fn sen_event_serializes_with_camel_case_fields() {
+        // V-01 / #65: the wire to the frontend is camelCase — the TS
+        // SenEvent type and isSenEvent validator expect sessionId,
+        // toolUseId, isError, recordType, numTurns, durationMs and the
+        // usage counters in camelCase. serde's enum-level rename_all
+        // only renames variants, not fields, so each variant (and
+        // TurnUsage) needs its own rename_all. This test locks the
+        // serialized shape: if a field ever goes back to snake_case it
+        // fails here, not silently in the webview (where the validator
+        // would drop the event). The TS side locks the same bytes in
+        // session-events.test.ts ("wire bytes copied from Rust").
+        let cases: Vec<(SenEvent, &str)> = vec![
+            (
+                SenEvent::SessionStart {
+                    session_id: "s1".to_string(),
+                    model: "m".to_string(),
+                },
+                r#"{"type":"sessionStart","sessionId":"s1","model":"m"}"#,
+            ),
+            (
+                SenEvent::Message {
+                    session_id: "s1".to_string(),
+                    text: "hi".to_string(),
+                    tool_calls: None,
+                },
+                r#"{"type":"message","sessionId":"s1","text":"hi"}"#,
+            ),
+            (
+                SenEvent::Message {
+                    session_id: "s1".to_string(),
+                    text: "".to_string(),
+                    tool_calls: Some(
+                        serde_json::json!([{"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]),
+                    ),
+                },
+                r#"{"type":"message","sessionId":"s1","text":"","toolCalls":[{"function":{"arguments":"{}","name":"Read"},"id":"c1","type":"function"}]}"#,
+            ),
+            (
+                SenEvent::MessageUpdate {
+                    session_id: "s1".to_string(),
+                    delta: "hel".to_string(),
+                },
+                r#"{"type":"messageUpdate","sessionId":"s1","delta":"hel"}"#,
+            ),
+            (
+                SenEvent::ToolResult {
+                    session_id: "s1".to_string(),
+                    tool_use_id: "t1".to_string(),
+                    content: serde_json::json!("ok"),
+                    is_error: false,
+                },
+                r#"{"type":"toolResult","sessionId":"s1","toolUseId":"t1","content":"ok","isError":false}"#,
+            ),
+            (
+                SenEvent::System {
+                    session_id: "s1".to_string(),
+                    subtype: "tool_progress".to_string(),
+                },
+                r#"{"type":"system","sessionId":"s1","subtype":"tool_progress"}"#,
+            ),
+            (
+                SenEvent::Result {
+                    session_id: "s1".to_string(),
+                    subtype: "success".to_string(),
+                    is_error: false,
+                    text: "done".to_string(),
+                    num_turns: 2,
+                    usage: TurnUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_input_tokens: 1,
+                    },
+                    duration_ms: 123,
+                    model: "m".to_string(),
+                },
+                r#"{"type":"result","sessionId":"s1","subtype":"success","isError":false,"text":"done","numTurns":2,"usage":{"inputTokens":10,"outputTokens":5,"cacheReadInputTokens":1},"durationMs":123,"model":"m"}"#,
+            ),
+            (
+                SenEvent::Unknown {
+                    session_id: "s1".to_string(),
+                    record_type: "future_thing".to_string(),
+                    subtype: Some("x".to_string()),
+                },
+                r#"{"type":"unknown","sessionId":"s1","recordType":"future_thing","subtype":"x"}"#,
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(serde_json::to_string(&event).unwrap(), expected);
+        }
     }
 
     #[test]

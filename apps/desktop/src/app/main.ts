@@ -20,7 +20,11 @@
 //   (sen-session-event) while a turn runs.
 // - subscribeSession records the subscriber on the backend. Model events
 //   flow from the backend (Tauri events) while a CLI turn runs; the
-//   listener is listenSessionEvents in ../ipc/session-events.ts.
+//   listener is listenSessionEvents in ../ipc/session-events.ts, installed
+//   by attachLiveSession, which records every validated event in the
+//   session's raw log (kind session_event) and passes it to onEvent when
+//   given — so the app receives the CLI's system/assistant/user/result
+//   events (R2-16 / #65), instead of subscribing and never listening.
 // - No model id, no key, no network call is configured here: the entry
 //   names no model and holds no key. The model comes from local app
 //   settings (sen_settings_get_model, default free model when nothing is
@@ -37,6 +41,8 @@
 import { attachLiveSession } from "../ipc/live-client.ts";
 import type { AttachedLiveSession } from "../ipc/live-client.ts";
 import type { ActionContract } from "../ipc/types.ts";
+import type { SenEvent } from "../ipc/session-events.ts";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { SessionManager } from "../../../../packages/core/src/session.ts";
 
 export interface StartAppOptions {
@@ -49,6 +55,10 @@ export interface StartAppOptions {
   // An existing manager to bind into. When omitted, the app creates one
   // and owns it for the whole session lifecycle.
   manager?: SessionManager;
+  // Optional extra sink for live events, in addition to the session
+  // record: every validated event is recorded in the session's raw log
+  // (kind session_event) with or without this callback (R2-16 / #65).
+  onEvent?: (event: SenEvent) => void;
 }
 
 export interface StartedApp {
@@ -56,6 +66,9 @@ export interface StartedApp {
   sessionId: string;
   state: string;
   attached: AttachedLiveSession;
+  // Stops the frontend event listener installed by attach. The caller
+  // owns it: pass it to closeLiveSession when the session closes.
+  unlisten: UnlistenFn | null;
 }
 
 // The one contract for the app session lifecycle. The id and the
@@ -99,12 +112,19 @@ export async function startApp(
   // attachLiveSession creates the session (backend ack, then the local
   // record) and subscribes on the same manager; startApp does not create
   // it separately, or the second create would hit DUPLICATE_SESSION.
-  const attached = await attachLiveSession(manager, contract, sessionId);
+  // Attach also installs the session-event listener, so the CLI's
+  // system/assistant/user/result events reach the app (R2-16 / #65):
+  // every validated event is recorded in the session's raw log, and the
+  // caller's onEvent gets the same events when given.
+  const attached = await attachLiveSession(manager, contract, sessionId, {
+    onEvent: options.onEvent,
+  });
   return {
     manager,
     sessionId,
     state: attached.state,
     attached,
+    unlisten: attached.unlisten,
   };
 }
 

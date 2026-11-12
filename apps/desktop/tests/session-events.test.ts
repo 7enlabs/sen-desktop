@@ -98,6 +98,103 @@ test("session-events: malformed payloads are dropped, never crash", async () => 
   setEventListen(null);
 });
 
+test("session-events: unknown event types and malformed variants are dropped", async () => {
+  // R2-16 / #65: the backend speaks only the 7 Sen variants that mirror
+  // the CLI's system/assistant/user/stream_event/result records. A
+  // payload with an unknown type, or a known type with the wrong fields,
+  // must never reach onEvent — the old check (type is a string +
+  // sessionId is a string) let all of these through.
+  const received: SenEvent[] = [];
+  const captured: { send?: SendFn } = {};
+  setEventListen(fakeListen(captured));
+  await listenSessionEvents("s1", (e) => received.push(e));
+  const send = captured.send as SendFn;
+  send({ type: "bogus", sessionId: "s1", text: "no such variant" });
+  send({ type: "message_start", sessionId: "s1" });
+  send({ type: "message", sessionId: "s1" });
+  send({ type: "message", sessionId: "s1", text: 7 });
+  send({ type: "messageUpdate", sessionId: "s1" });
+  send({ type: "toolResult", sessionId: "s1", toolUseId: 7, content: "ok", isError: false });
+  send({ type: "system", sessionId: "s1" });
+  send({
+    type: "result",
+    sessionId: "s1",
+    subtype: "success",
+    isError: false,
+    text: "done",
+    numTurns: 1,
+    durationMs: 5,
+    model: "m:free",
+  });
+  send({
+    type: "toolResult",
+    sessionId: "s1",
+    toolUseId: "t1",
+    content: "ok",
+    isError: false,
+  });
+  send({ type: "message", sessionId: "s1", text: "ok" });
+  assert.deepEqual(received, [
+    { type: "toolResult", sessionId: "s1", toolUseId: "t1", content: "ok", isError: false },
+    { type: "message", sessionId: "s1", text: "ok" },
+  ]);
+  setEventListen(null);
+});
+
+test("session-events: real Rust-serialized wire bytes are delivered for all variants", async () => {
+  // V-01 / #65: the wire lock. These JSON strings are copied verbatim
+  // from the Rust serialize output (serde_json::to_string of each
+  // SenEvent variant — the Rust test
+  // sen_event_serializes_with_camel_case_fields locks the producer
+  // side). They are parsed, not hand-written as objects, so this test
+  // fails if the backend ever goes back to snake_case fields: the old
+  // hand-written camelCase payloads could not catch that, and the
+  // validator dropped 100% of real events because of it.
+  const wireJson = [
+    '{"type":"sessionStart","sessionId":"s1","model":"m"}',
+    '{"type":"message","sessionId":"s1","text":"hi"}',
+    '{"type":"message","sessionId":"s1","text":"","toolCalls":[{"function":{"arguments":"{}","name":"Read"},"id":"c1","type":"function"}]}',
+    '{"type":"messageUpdate","sessionId":"s1","delta":"hel"}',
+    '{"type":"toolResult","sessionId":"s1","toolUseId":"t1","content":"ok","isError":false}',
+    '{"type":"system","sessionId":"s1","subtype":"tool_progress"}',
+    '{"type":"result","sessionId":"s1","subtype":"success","isError":false,"text":"done","numTurns":2,"usage":{"inputTokens":10,"outputTokens":5,"cacheReadInputTokens":1},"durationMs":123,"model":"m"}',
+    '{"type":"unknown","sessionId":"s1","recordType":"future_thing","subtype":"x"}',
+  ];
+  const received: SenEvent[] = [];
+  const captured: { send?: SendFn } = {};
+  setEventListen(fakeListen(captured));
+  await listenSessionEvents("s1", (e) => received.push(e));
+  const send = captured.send as SendFn;
+  for (const json of wireJson) {
+    send(JSON.parse(json) as unknown);
+  }
+  assert.equal(received.length, wireJson.length);
+  assert.deepEqual(
+    received.map((event) => event.type),
+    [
+      "sessionStart",
+      "message",
+      "message",
+      "messageUpdate",
+      "toolResult",
+      "system",
+      "result",
+      "unknown",
+    ],
+  );
+  const result = received[6];
+  assert.equal(result.type, "result");
+  if (result.type === "result") {
+    assert.equal(result.numTurns, 2);
+    assert.deepEqual(result.usage, {
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadInputTokens: 1,
+    });
+  }
+  setEventListen(null);
+});
+
 test("session-events: event name matches the Rust backend constant", () => {
   assert.equal(SEN_SESSION_EVENT, "sen-session-event");
 });
