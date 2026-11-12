@@ -29,7 +29,10 @@
 //   result record within 120s is killed and reported as CLI_TURN_TIMEOUT,
 //   so a turn with no API key (the real CLI hangs after its init line
 //   without an auth error) does not hang silently until the user aborts.
-//   The 180s process-kill backstop is unchanged. The IPC contract
+//   After the read loop ends (EOF) the turn waits for the child only up
+//   to the 180s process-kill backstop (PROCESS_KILL_BACKSTOP, R2B-06),
+//   then kills it, so a CLI that closed stdout but stays alive cannot
+//   hang the turn forever. The IPC contract
 //   timeout_ms is the per-turn deadline, capped at the 120s turn
 //   timeout: the effective deadline is min(timeout_ms, 120s) (BUG-11
 //   fix). A turn never runs longer than 120s, and a shorter contract
@@ -69,11 +72,23 @@ pub const STDERR_TAIL_LEN: usize = 8192;
 /// result record within this long is killed and reported as
 /// CLI_TURN_TIMEOUT, so a turn with no API key (the real CLI hangs
 /// without an auth error) does not hang silently until the user aborts.
-/// Under the 180s process-kill backstop, which is unchanged. This is
+/// Under the 180s process-kill backstop (PROCESS_KILL_BACKSTOP, R2B-06):
+/// after the read loop ends (EOF) the wait for the child is bounded,
+/// then the child is SIGKILLed, so a CLI that closed stdout but stays
+/// alive cannot hang the turn forever. This is
 /// also the CAP for a per-turn contract timeout_ms (BUG-11): the
 /// effective turn deadline is min(timeout_ms, TURN_TIMEOUT), so a turn
 /// never runs longer than 120s.
 pub const TURN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Process-kill backstop (R2B-06): after the read loop ends (EOF), the
+/// turn waits at most this long for the child to exit before SIGKILLing
+/// it and reaping it. Before R2B-06 this 180s value only existed in a
+/// comment while the code called an unbounded `child.wait()` after EOF,
+/// so a CLI that closed stdout but stayed alive hung the turn forever
+/// (and left `turn_in_flight` stuck, refusing later turns with
+/// CLI_TURN_IN_PROGRESS).
+pub const PROCESS_KILL_BACKSTOP: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeError {
@@ -237,6 +252,9 @@ pub struct CliBridge {
     /// that produces no result record within this long is killed and
     /// reported as CLI_TURN_TIMEOUT.
     turn_timeout: Duration,
+    /// Process-kill backstop (R2B-06, default 180s): bound on waiting
+    /// for the child after the read loop ends (EOF) before SIGKILLing it.
+    process_kill_backstop: Duration,
 }
 
 /// Clears turn_in_flight when the turn ends on any path.
@@ -289,6 +307,7 @@ impl CliBridge {
             child_slot: Arc::new(Mutex::new(None)),
             abort_grace: ABORT_GRACE,
             turn_timeout: TURN_TIMEOUT,
+            process_kill_backstop: PROCESS_KILL_BACKSTOP,
         }
     }
 
@@ -297,6 +316,14 @@ impl CliBridge {
     #[cfg(test)]
     pub fn with_abort_grace(mut self, grace: Duration) -> CliBridge {
         self.abort_grace = grace;
+        self
+    }
+
+    /// Test-only: shorten the process-kill backstop so the bounded
+    /// wait after EOF can be proven without waiting the full 180s.
+    #[cfg(test)]
+    pub fn with_process_kill_backstop(mut self, backstop: Duration) -> CliBridge {
+        self.process_kill_backstop = backstop;
         self
     }
 
@@ -611,10 +638,13 @@ impl CliBridge {
                 )
             })?;
             match slot.take() {
-                Some(mut child) => match child.wait() {
-                    Ok(status) => status.code(),
-                    Err(_) => None,
-                },
+                // R2B-06: bounded wait, not an unbounded child.wait():
+                // a CLI that closed stdout but stays alive used to hang
+                // this turn forever (and stuck turn_in_flight). The
+                // backstop kills it after PROCESS_KILL_BACKSTOP (180s)
+                // and the turn keeps the result record it already has.
+                // Overlaps R2B-09, which touches the same wait region.
+                Some(mut child) => self.wait_child_after_eof(&mut child),
                 None => None,
             }
         };
@@ -693,6 +723,35 @@ impl CliBridge {
             unknown_records,
             version_mismatches,
         })
+    }
+
+    /// Wait for the child after the read loop ended (EOF), bounded by
+    /// the process-kill backstop (R2B-06): a CLI that closed stdout but
+    /// stays alive must not hang the turn forever on `child.wait()`.
+    /// Polls `try_wait()` every 50ms (same cadence as the abort poll);
+    /// a child that already exited returns at once with no waiting.
+    /// Past the deadline the child is SIGKILLed and reaped, and the
+    /// turn keeps the result record it already has. Returns the exit
+    /// code, or None when the child was killed (signal death has no
+    /// code) or the code is unknown.
+    fn wait_child_after_eof(&self, child: &mut Child) -> Option<i32> {
+        let deadline = std::time::Instant::now() + self.process_kill_backstop;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.code(),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return match child.wait() {
+                            Ok(status) => status.code(),
+                            Err(_) => None,
+                        };
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return None,
+            }
+        }
     }
 
     fn is_aborted(&self) -> bool {
@@ -1256,6 +1315,42 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
             .run_turn("follow_up", "again", &mut emit)
             .unwrap_err();
         assert_eq!(second.code, ERR_CLI_TURN_TIMEOUT);
+    }
+
+    #[test]
+    fn turn_returns_when_cli_closes_stdout_but_stays_alive() {
+        // R2B-06: fake CLI prints the result record, then closes
+        // stdout (exec 1>&-) but stays alive 30s. The read loop ends
+        // on EOF; the turn must return the result promptly once the
+        // process-kill backstop fires, not hang on child.wait() until
+        // the fake exits. With a 300ms test backstop the turn must
+        // finish in well under 5s, with the result intact and the
+        // child killed (no exit code: killed by signal).
+        let body = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}
+{"type":"result","subtype":"success","is_error":false,"result":"done","duration_ms":1,"num_turns":1,"usage":{},"model":"m:free","session_id":"s1","v":1}
+EOF
+exec 1>&-
+sleep 30"#;
+        let bin = fake_zen("eof_alive", body);
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None)
+            .with_process_kill_backstop(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let events: Arc<Mutex<Vec<SenEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let mut emit = move |ev: SenEvent| {
+            sink.lock().unwrap().push(ev);
+        };
+        let result = bridge.run_turn("steer", "hi", &mut emit).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(result.subtype, "success");
+        assert_eq!(result.text, "done");
+        assert_eq!(result.exit_code, None);
+        assert_eq!(events.lock().unwrap().len(), 2);
+        // The handle is not stuck: a second turn proceeds instead of
+        // refusing with CLI_TURN_IN_PROGRESS.
+        let second = bridge.run_turn("follow_up", "again", &mut emit);
+        assert!(second.is_ok() || second.unwrap_err().code != ERR_CLI_TURN_IN_PROGRESS);
     }
 
     #[test]
