@@ -96,6 +96,13 @@ pub const TURN_TIMEOUT: Duration = Duration::from_secs(120);
 /// CLI_TURN_IN_PROGRESS).
 pub const PROCESS_KILL_BACKSTOP: Duration = Duration::from_secs(180);
 
+/// Grace after a `result` record (R2B-09): once the result is in hand
+/// the turn waits at most this long for the child to exit on its own
+/// (the real CLI exits at once, so its exit code is still recorded),
+/// then SIGKILLs it. Output after the result record is meaningless:
+/// the result is the last record per the stream-json v1 contract.
+pub const RESULT_EXIT_GRACE: Duration = Duration::from_millis(500);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeError {
     pub code: String,
@@ -550,6 +557,7 @@ impl CliBridge {
         }
 
         let mut result_record: Option<CliRecord> = None;
+        let mut broke_on_result = false;
         let mut records_seen: u64 = 0;
         let mut unknown_records: u64 = 0;
         let mut version_mismatches: u64 = 0;
@@ -585,6 +593,16 @@ impl CliBridge {
                         unknown_records += 1;
                     }
                     emit(event);
+                    if record.record_type == "result" {
+                        // R2B-09: the result record is the last record
+                        // per the stream-json v1 contract, so the turn
+                        // is done — return at once instead of waiting
+                        // for EOF or the remaining deadline while the
+                        // CLI lingers. The bounded wait below reaps
+                        // the child (SIGKILL after RESULT_EXIT_GRACE).
+                        broke_on_result = true;
+                        break;
+                    }
                     if !has_newline && result_record.is_none() {
                         // A trailing partial line without a newline means
                         // the output was cut off (the CLI always ends
@@ -646,13 +664,35 @@ impl CliBridge {
                 )
             })?;
             match slot.take() {
-                // R2B-06: bounded wait, not an unbounded child.wait():
-                // a CLI that closed stdout but stays alive used to hang
-                // this turn forever (and stuck turn_in_flight). The
-                // backstop kills it after PROCESS_KILL_BACKSTOP (180s)
-                // and the turn keeps the result record it already has.
-                // Overlaps R2B-09, which touches the same wait region.
-                Some(mut child) => self.wait_child_after_eof(&mut child),
+                // R2B-09 + R2B-06 (merged): the wait after the read
+                // loop is bounded on both paths. With a result record
+                // in hand, poll for a quick exit up to RESULT_EXIT_GRACE
+                // (500ms, keeps the real exit code), then SIGKILL and
+                // reap. Without a result record, go through the 180s
+                // process-kill backstop (wait_child_after_eof) — never
+                // an unbounded child.wait(), or R2B-06 would lose its
+                // effect exactly in the lingering-child case R2B-09
+                // fixes.
+                Some(mut child) => {
+                    if broke_on_result {
+                        let deadline = std::time::Instant::now() + RESULT_EXIT_GRACE;
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(status)) => break status.code(),
+                                Ok(None) => {
+                                    if std::time::Instant::now() >= deadline {
+                                        let _ = child.kill();
+                                        break child.wait().ok().and_then(|status| status.code());
+                                    }
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                Err(_) => break None,
+                            }
+                        }
+                    } else {
+                        self.wait_child_after_eof(&mut child)
+                    }
+                }
                 None => None,
             }
         };
@@ -1310,6 +1350,29 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let result = bridge.run_turn("steer", "hi", &mut emit).unwrap();
         assert_eq!(result.subtype, "success");
         assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn result_record_returns_without_waiting_for_child_exit() {
+        // R2B-09: fake CLI prints a result record, then lingers 5s
+        // before exiting. The turn must return with the result at
+        // once (well under 2s), not wait for EOF / the child exit.
+        let body = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}
+{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0},"model":"m:free","session_id":"s1","v":1}
+EOF
+sleep 5
+exit 0"#;
+        let bin = fake_zen("lingers_after_result", body);
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None);
+        let started = std::time::Instant::now();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        let result = bridge.run_turn("steer", "hi", &mut emit).unwrap();
+        assert_eq!(result.subtype, "success");
+        assert_eq!(result.text, "hello");
+        assert_eq!(events.len(), 2);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
