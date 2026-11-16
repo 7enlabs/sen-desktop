@@ -21,10 +21,15 @@
 // - Every command validates the full IPC action contract first (same
 //   required fields as apps/desktop/src/ipc/types.ts). A missing field
 //   means FAIL, never a silent default.
-// - Tool execution is NOT filled in here: the contract is validated and
-//   the 6-step gate order is asserted, then the call fails loudly with
-//   TOOL_EXECUTION_NOT_WIRED instead of pretending a tool ran. The gate
-//   execute step and the permission layer are later phases.
+// - Tool execution is NOT filled in here: the contract is validated,
+//   the 6-step gate order is asserted, and the P0-2 approval gate
+//   decides (auto / ask-first / never + default-deny policy), then
+//   the call fails loudly with TOOL_EXECUTION_NOT_WIRED when the gate
+//   passes, because the gate execute step itself is a later phase.
+//   A gate refusal (APPROVAL_REQUIRED / APPROVAL_NEVER_DENIED /
+//   TOOL_POLICY_DENIED) fails before any execution is attempted.
+//   Every evaluation is recorded in the append-only activity log,
+//   including refusals.
 //
 // Locking, read before touching steer: a turn runs for seconds while the
 // Registry mutex is held by the caller, so steer is split in three —
@@ -62,6 +67,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::approval_gate::{
+    gate_tool_call, ActivityEntry, ActivityLog, Approval, ApprovalStore, GateDecision, ToolPolicy,
+};
 use super::cli_settings::{CliSettings, DEFAULT_MODEL};
 use super::cli_spawn::{AbortOutcome, BridgeError, CliBridge, TurnResult};
 use super::model_router::{next_route, resolve_attempt_order, Route, RouterConfig};
@@ -141,6 +149,9 @@ pub const ERR_DUPLICATE_STEER: &str = "DUPLICATE_STEER";
 pub const ERR_ILLEGAL_TRANSITION: &str = "ILLEGAL_TRANSITION";
 pub const ERR_INVALID_CONTRACT: &str = "INVALID_CONTRACT";
 pub const ERR_TOOL_EXECUTION_NOT_WIRED: &str = "TOOL_EXECUTION_NOT_WIRED";
+pub const ERR_APPROVAL_REQUIRED: &str = "APPROVAL_REQUIRED";
+pub const ERR_APPROVAL_NEVER_DENIED: &str = "APPROVAL_NEVER_DENIED";
+pub const ERR_TOOL_POLICY_DENIED: &str = "TOOL_POLICY_DENIED";
 
 // --- IPC action contract (mirror of apps/desktop/src/ipc/types.ts) ---
 
@@ -279,6 +290,13 @@ pub struct Registry {
     /// Explicit binary path (tests / operator override). None means the
     /// bridge resolves per decision 1 at first turn (ZEN_BIN, then PATH).
     zen_bin_override: Option<PathBuf>,
+    /// P0-2 approval gate state: the default-deny tool policy
+    /// (empty allow-list denies everything), the granted approvals,
+    /// and the append-only activity log. The policy starts empty on
+    /// purpose: no tool runs until a rule allows it by name.
+    tool_policy: ToolPolicy,
+    approvals: ApprovalStore,
+    activity_log: ActivityLog,
     /// Test-only abort grace for bridges created after the call (R2B-07):
     /// shortens the SIGKILL escalation in tests so the lock-free abort
     /// can be proven without waiting the full 5s production grace.
@@ -352,6 +370,9 @@ impl Registry {
             zen_bin_override: None,
             #[cfg(test)]
             abort_grace_override: None,
+            tool_policy: ToolPolicy::new(),
+            approvals: ApprovalStore::new(),
+            activity_log: ActivityLog::new(),
         }
     }
 
@@ -904,9 +925,48 @@ impl Registry {
         Ok(record.subscribers)
     }
 
+    /// P0-2 approval gate, operator side:
+    /// - `allow_tool` adds one explicit allow rule to the policy.
+    ///   The policy starts empty (default-deny), so this is the only
+    ///   way a tool becomes runnable at all.
+    /// - `approve_tool` grants one approval for one tool + one
+    ///   idempotency key, by a named granter. A grant for a
+    ///   never-tier tool is recorded but never honored.
+    /// - `activity_log` / `list_approvals` read back the gate state
+    ///   (clones; the log has no delete or update path).
+    pub fn allow_tool(&mut self, tool_name: &str) {
+        self.tool_policy.allow_tool(tool_name);
+    }
+
+    pub fn set_tool_policy(&mut self, policy: ToolPolicy) {
+        self.tool_policy = policy;
+    }
+
+    pub fn approve_tool(
+        &mut self,
+        tool_name: &str,
+        idempotency_key: &str,
+        granted_by: &str,
+    ) -> Approval {
+        self.approvals.grant(tool_name, idempotency_key, granted_by)
+    }
+
+    pub fn activity_log(&self) -> Vec<ActivityEntry> {
+        self.activity_log.entries()
+    }
+
+    pub fn list_approvals(&self) -> Vec<Approval> {
+        self.approvals.list()
+    }
+
     /// sen_tool_call: validates the contract and the gate order, then
-    /// fails loudly. The gate execute step and the permission layer are
-    /// not filled in yet, so no tool runs for real in this phase.
+    /// runs the P0-2 approval gate (auto / ask-first / never +
+    /// default-deny policy) and records the evaluation in the
+    /// append-only activity log — allowed, refused, and
+    /// awaiting-approval alike. A gate refusal fails here, before any
+    /// execution is attempted. When the gate passes, the call still
+    /// fails loudly with TOOL_EXECUTION_NOT_WIRED: the gate execute
+    /// step is a later phase, and no tool runs for real yet.
     pub fn tool_call(
         &mut self,
         contract: &ActionContract,
@@ -920,10 +980,37 @@ impl Registry {
             ));
         }
         assert_gate_order(&GATE_ORDER)?;
-        Err(CommandError::new(
-            ERR_TOOL_EXECUTION_NOT_WIRED,
-            "Tool execution NOT FILLED IN YET: gate execute step and permission layer are later phases, no tool ran.",
-        ))
+        let evaluation = gate_tool_call(
+            &self.tool_policy,
+            &self.approvals,
+            &mut self.activity_log,
+            &contract.actor,
+            tool_name,
+            &contract.idempotency_key,
+        );
+        match evaluation.decision {
+            GateDecision::Allow => Err(CommandError::new(
+                ERR_TOOL_EXECUTION_NOT_WIRED,
+                "Approval gate passed, but tool execution is NOT FILLED IN YET: gate execute step is a later phase, no tool ran.",
+            )),
+            GateDecision::AskFirst => Err(CommandError::new(
+                ERR_APPROVAL_REQUIRED,
+                &evaluation.reason,
+            )),
+            GateDecision::Deny => {
+                if evaluation.tier == super::approval_gate::ApprovalTier::Never {
+                    Err(CommandError::new(
+                        ERR_APPROVAL_NEVER_DENIED,
+                        &evaluation.reason,
+                    ))
+                } else {
+                    Err(CommandError::new(
+                        ERR_TOOL_POLICY_DENIED,
+                        &evaluation.reason,
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -1720,10 +1807,95 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         reg.create("s1", &contract()).unwrap();
         assert_eq!(reg.subscribe("s1", &contract()), Ok(1));
         assert_eq!(reg.subscribe("s1", &contract()), Ok(2));
+        // P0-2: "my-tool" is unclassified (ask-first) and the default
+        // policy is empty, so default-deny refuses it before any
+        // execution is attempted.
         let err = reg.tool_call(&contract(), "my-tool").unwrap_err();
-        assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
+        assert_eq!(err.code, ERR_TOOL_POLICY_DENIED);
         let err = reg.tool_call(&contract(), "").unwrap_err();
         assert_eq!(err.code, ERR_INVALID_CONTRACT);
+    }
+
+    // P0-2 approval gate, through Registry::tool_call:
+    // - an auto tool with an explicit allow rule passes the gate and
+    //   then fails only because execution is not wired yet;
+    // - the same tool without a rule is refused by default-deny;
+    // - an ask-first tool waits for approval, then passes the gate;
+    // - a never-tier tool is refused even with a rule and an approval;
+    // - every evaluation lands in the append-only activity log.
+    #[test]
+    fn tool_call_auto_allowed_passes_gate_but_execution_not_wired() {
+        let mut reg = Registry::new();
+        reg.allow_tool("read_file");
+        let err = reg.tool_call(&contract(), "read_file").unwrap_err();
+        assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
+        let entries = reg.activity_log();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].tool, "read_file");
+        assert_eq!(entries[0].decision, GateDecision::Allow);
+        assert_eq!(entries[0].result, "allowed");
+    }
+
+    #[test]
+    fn tool_call_auto_denied_by_default_policy() {
+        let mut reg = Registry::new();
+        let err = reg.tool_call(&contract(), "read_file").unwrap_err();
+        assert_eq!(err.code, ERR_TOOL_POLICY_DENIED);
+        assert!(err.message.contains("default-deny"));
+        assert_eq!(reg.activity_log().len(), 1);
+        assert_eq!(reg.activity_log()[0].result, "denied");
+    }
+
+    #[test]
+    fn tool_call_ask_first_needs_approval_then_passes_gate() {
+        let mut reg = Registry::new();
+        reg.allow_tool("send_message");
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+        assert_eq!(reg.activity_log()[0].result, "awaiting-approval");
+        reg.approve_tool("send_message", "k1", "zen");
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
+        let entries = reg.activity_log();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[1].seq, 2);
+        assert_eq!(entries[1].result, "allowed");
+        // A different idempotency key is a different call: still waiting.
+        let mut other = contract();
+        other.idempotency_key = "k2".to_string();
+        let err = reg.tool_call(&other, "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+    }
+
+    #[test]
+    fn tool_call_never_tier_denied_even_with_rule_and_approval() {
+        let mut reg = Registry::new();
+        for tool in [
+            "trade_securities",
+            "transfer_between_accounts",
+            "access_other_account",
+        ] {
+            reg.allow_tool(tool);
+            reg.approve_tool(tool, "k1", "zen");
+            let err = reg.tool_call(&contract(), tool).unwrap_err();
+            assert_eq!(err.code, ERR_APPROVAL_NEVER_DENIED, "{tool}");
+        }
+        let entries = reg.activity_log();
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|e| e.result == "denied"));
+        assert!(entries.iter().all(|e| e.decision == GateDecision::Deny));
+    }
+
+    #[test]
+    fn tool_call_unknown_tool_is_never_auto() {
+        let mut reg = Registry::new();
+        reg.allow_tool("edit_file");
+        // Unclassified + allowed by rule + no approval: ask-first,
+        // never auto.
+        let err = reg.tool_call(&contract(), "edit_file").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
     }
 
     /// BUG-09 (#24): subscribing to a terminal session returned Ok and

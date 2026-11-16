@@ -9,6 +9,29 @@ export { RawLog } from "./raw-log.ts";
 export type { RawEvent } from "./raw-log.ts";
 export { GATE_ORDER, assertGateOrder, executeThroughGate } from "./execution-gate.ts";
 export type { GateStep } from "./execution-gate.ts";
+export {
+  ActivityLog,
+  ApprovalStore,
+  ASK_FIRST_TOOLS,
+  AUTO_TOOLS,
+  NEVER_TOOLS,
+  classifyTool,
+  defaultToolPolicy,
+  describeTier,
+  evaluateToolCall,
+  gateToolCall,
+  validateToolPolicy,
+} from "./approval-gate.ts";
+export type {
+  ActivityEntry,
+  ActivityResult,
+  Approval,
+  ApprovalTier,
+  GateDecision,
+  GateEvaluation,
+  ToolCallInput,
+  ToolPolicy,
+} from "./approval-gate.ts";
 export { TOKEN_ECONOMIZER_MAX_REDIRECT, TOKEN_ECONOMIZER_LONG_TURN_RATIO, shouldStopTurn } from "./token-economizer.ts";
 export type { TurnSignal } from "./token-economizer.ts";
 export { setRootDir, resolveUnderRoot } from "./paths.ts";

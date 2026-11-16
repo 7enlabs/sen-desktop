@@ -8,6 +8,7 @@
 // P0-1 adds memory_store.rs (pure file memory) + memory.rs (its
 // wrappers) and telegram_client.rs (pure Bot API client + poll loop) +
 // telegram.rs (its wrappers).
+pub mod approval_gate;
 pub mod cli_bin;
 pub mod cli_settings;
 pub mod cli_spawn;

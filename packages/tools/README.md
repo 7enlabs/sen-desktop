@@ -12,10 +12,16 @@ Tool extensions and the permission layer for Sen Desktop.
 
 ## Status
 
-STUB. The hook frame and the minimal contract check exist; the real
-permission logic is not filled in, and no tool runs for real through it
-yet. No narrow Mika mode is applied, no mode switch mid-run, no disabling
-of the protection layer.
+FILLED IN (Sen P0-2): the hook evaluates the 3-tier approval gate
+from packages/core (auto / ask-first / never, default-deny policy)
+and records every evaluation in the activity log when one is passed
+in. A refused call throws FAIL-loud (`APPROVAL_REQUIRED`,
+`APPROVAL_NEVER_DENIED`, or `TOOL_POLICY_DENIED`); an allowed call
+returns its evaluation — permission granted, not executed. The
+backend registry is the enforcing side: its `tool_call` ends in
+`TOOL_EXECUTION_NOT_WIRED` after the gate passes, because real tool
+execution is a later phase. No narrow Mika mode is applied, no mode
+switch mid-run, no disabling of the protection layer.
 
 ## Package scope note
 
