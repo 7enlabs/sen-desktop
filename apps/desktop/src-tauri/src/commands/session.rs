@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
+use super::memory_store::MemoryStore;
 use super::registry::{ActionContract, Registry};
 use super::stream_json::SenEvent;
 
@@ -127,9 +128,19 @@ pub fn sen_session_create(
 /// second model call starts. When step 2 fails, the in-flight key is
 /// released before the error returns, so a retry with the same key
 /// still executes.
+///
+/// Memory (P0-1): the text the bridge runs is the memory context block
+/// + the user's text (MemoryStore::turn_prompt), never the bare text:
+/// the model always sees the current memory, including a `quên` that
+/// just deleted a fact. The idempotency key still uses the bare user
+/// text (begin_steer / complete_steer take `text`), so a memory edit
+/// between two identical steers replays the first turn instead of
+/// running a second one with the new memory — the replay rule is
+/// unchanged. When no memory store is configured, the bare text runs.
 fn run_steer_turn(
     app: &AppHandle,
     state: State<'_, Mutex<Registry>>,
+    memory: State<'_, Mutex<Option<MemoryStore>>>,
     session_id: &str,
     text: &str,
     kind: &str,
@@ -157,6 +168,16 @@ fn run_steer_turn(
         }
         super::registry::SteerStart::Run(bridge) => bridge,
     };
+    // P0-1: build the turn prompt (memory context block + user text)
+    // before the turn runs. The memory lock is held only for the
+    // prompt build, never across the turn itself.
+    let prompt = {
+        let guard = memory.lock().map_err(|e| e.to_string())?;
+        match guard.as_ref() {
+            Some(store) => store.turn_prompt(text),
+            None => text.to_string(),
+        }
+    };
     // BUG-11: the contract timeout_ms is the turn deadline, capped at
     // the 120s turn timeout inside the bridge (min(timeout_ms, 120s)
     // per tin 9566). Capture it before the turn runs lock-free below.
@@ -166,7 +187,7 @@ fn run_steer_turn(
         // Best effort: a listener that is gone must not fail the turn.
         let _ = app_emit.emit(SEN_SESSION_EVENT, &event);
     };
-    let turn = match bridge.run_turn_with_timeout(kind, text, timeout, &mut emit) {
+    let turn = match bridge.run_turn_with_timeout(kind, &prompt, timeout, &mut emit) {
         Ok(turn) => turn,
         Err(e) => {
             // The turn never ran to a result: release the in-flight key
@@ -197,11 +218,12 @@ fn run_steer_turn(
 pub fn sen_session_steer(
     app: AppHandle,
     state: State<'_, Mutex<Registry>>,
+    memory: State<'_, Mutex<Option<MemoryStore>>>,
     session_id: String,
     text: String,
     contract: ContractArgs,
 ) -> Result<SessionResult, String> {
-    run_steer_turn(&app, state, &session_id, &text, "steer", contract)
+    run_steer_turn(&app, state, memory, &session_id, &text, "steer", contract)
 }
 
 /// sen_session_follow_up: same gate and turn as steer, kind follow_up
@@ -210,11 +232,20 @@ pub fn sen_session_steer(
 pub fn sen_session_follow_up(
     app: AppHandle,
     state: State<'_, Mutex<Registry>>,
+    memory: State<'_, Mutex<Option<MemoryStore>>>,
     session_id: String,
     text: String,
     contract: ContractArgs,
 ) -> Result<SessionResult, String> {
-    run_steer_turn(&app, state, &session_id, &text, "follow_up", contract)
+    run_steer_turn(
+        &app,
+        state,
+        memory,
+        &session_id,
+        &text,
+        "follow_up",
+        contract,
+    )
 }
 
 /// sen_session_abort: escalates the running CLI turn first (SIGINT, 5s

@@ -5,12 +5,19 @@
 // cli_bin.rs, cli_settings.rs, cli_spawn.rs and stream_json.rs are the
 // pure-Rust CLI bridge: binary resolution, local settings, process
 // lifecycle, and stream-json event parsing.
+// P0-1 adds memory_store.rs (pure file memory) + memory.rs (its
+// wrappers) and telegram_client.rs (pure Bot API client + poll loop) +
+// telegram.rs (its wrappers).
 pub mod cli_bin;
 pub mod cli_settings;
 pub mod cli_spawn;
 pub mod events;
+pub mod memory;
+pub mod memory_store;
 pub mod registry;
 pub mod session;
 pub mod settings;
 pub mod stream_json;
+pub mod telegram;
+pub mod telegram_client;
 pub mod tools;

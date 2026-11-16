@@ -1,7 +1,8 @@
 // App entry: the Tauri webview loads this module from index.html, so
-// loading it starts the app. The UI shell is still a stub (no real UI
-// yet, no fake content), but the entry wires one real session through
-// the backend instead of holding an uncalled stub.
+// loading it starts the app. The UI is a real chat UI now (P0-1):
+// startChatUI renders the shared transcript, and bootChat wires one
+// session, one ChatSession (desktop + Telegram share it), and the
+// Telegram poll loop when a token is configured.
 //
 // Wiring (SDK move, tin 9328/9459: the Pi SDK is out of the webview):
 // - One SessionManager owns the session, created here and shared by
@@ -31,6 +32,20 @@
 //   stored); the key reaches the CLI through the environment on the
 //   backend side, never through the webview.
 //
+// P0-1 (chat + Telegram + file memory):
+// - ChatSession (../chat/chat.ts) owns the shared transcript and the
+//   send queue. Desktop sends and Telegram sends go through the same
+//   session, the same queue, and the same transcript, so both channels
+//   see the same context. Memory commands (/nhớ, /quên, ...) run
+//   locally in the chat layer and never reach the model.
+// - The Telegram poll loop (../chat/telegram.ts) starts only when a
+//   token is configured (sen_telegram_status). Without one, the desktop
+//   chat still works and the status line says so; the boot never fails
+//   for a missing token.
+// - The backend prepends the memory context block to every turn prompt
+//   (MemoryStore::turn_prompt), so the model always sees the current
+//   memory, including a `quên` that just deleted a fact.
+//
 // Still open, NOT decided here:
 // - This wiring is proven under node (tests) and by a successful vite
 //   build after the SDK move, not yet in a real webview (no Rust
@@ -44,6 +59,13 @@ import type { ActionContract } from "../ipc/types.ts";
 import type { SenEvent } from "../ipc/session-events.ts";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { SessionManager } from "../../../../packages/core/src/session.ts";
+import { ChatSession, type ChatChannel } from "../chat/chat.ts";
+import {
+  getTelegramStatus,
+  sendTelegramMessage,
+  startTelegramLoop,
+} from "../chat/telegram.ts";
+import { startChatUI, type ChatUI } from "./chat-ui.ts";
 
 export interface StartAppOptions {
   // Session id for the one app session. Defaults to a freshly
@@ -135,17 +157,103 @@ export async function startApp(
   };
 }
 
+// One contract per chat send (desktop or Telegram): fresh id and
+// idempotency key per send, so two sends never share a key even in the
+// same millisecond. The actor is the channel, so the backend record
+// says which channel a turn came from.
+function chatContract(
+  sessionId: string,
+  channel: ChatChannel,
+  purpose: string,
+): ActionContract {
+  const nonce =
+    sessionId +
+    "-" +
+    Date.now() +
+    "-" +
+    Math.random().toString(36).slice(2, 8);
+  return {
+    id: "chat-" + nonce,
+    capability: "sen.session",
+    capabilityVersion: "1",
+    actor: channel,
+    purpose,
+    phase: "live",
+    toolKind: "registered-tool",
+    sideEffect: "no-side-effect",
+    risk: "low",
+    idempotencyKey: "chat-" + nonce,
+    timeoutMs: 120000,
+    approvalRequired: false,
+    auditRequired: false,
+  };
+}
+
+// Boot the chat app (P0-1): one session, one shared ChatSession, the
+// chat UI, and the Telegram poll loop when a token is configured.
+// A missing Telegram token is not a boot failure: the desktop chat
+// still works and the status line says Telegram is not configured.
+async function bootChat(): Promise<void> {
+  const root = document.getElementById("app");
+  if (!root) {
+    throw new Error("No #app element, FAIL");
+  }
+  const sessionId = crypto.randomUUID();
+  const makeContract = (channel: ChatChannel, purpose: string) =>
+    chatContract(sessionId, channel, purpose);
+  let ui: ChatUI | null = null;
+  const chat = new ChatSession({
+    makeContract,
+    onTranscript: (entries) => ui?.render(entries),
+    onBusy: (busy) => ui?.setBusy(busy),
+    sendTelegram: async (chatId, text) => {
+      await sendTelegramMessage(
+        makeContract("telegram", "telegram send"),
+        chatId,
+        text,
+      );
+    },
+  });
+  const app = await startApp({
+    sessionId,
+    onEvent: (event) => chat.handleEvent(event),
+  });
+  chat.bind(app.sessionId);
+  ui = startChatUI(root, chat);
+  ui.setSession(app.sessionId);
+  ui.setTelegramStatus("Telegram: đang kiểm tra…");
+  try {
+    const status = await getTelegramStatus(
+      makeContract("telegram", "telegram status"),
+    );
+    if (status.configured) {
+      const scope = status.allowedChatIdSet
+        ? " (giới hạn 1 chat)"
+        : status.allowAnyChat
+          ? " (mọi chat, đã cho phép rõ)"
+          : " (không chat nào được phép)";
+      ui.setTelegramStatus("Telegram: đã kết nối" + scope);
+      startTelegramLoop(chat, makeContract);
+    } else {
+      ui.setTelegramStatus("Telegram: chưa cấu hình (SEN_TELEGRAM_BOT_TOKEN)");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ui.setTelegramStatus("Telegram: không kiểm tra được (" + message + ")");
+  }
+}
+
 // Boot: this module IS the app entry (index.html loads it), so loading
 // it in a real webview starts the app. Under node (tests) there is no
 // window, so nothing auto-starts there; tests call startApp directly.
 // A boot failure is reported in the shell and on the console, never
 // swallowed and never replaced with fake content.
 if (typeof window !== "undefined") {
-  startApp().catch((error: unknown) => {
+  bootChat().catch((error: unknown) => {
     const message =
       error instanceof Error ? error.message : String(error);
     // eslint-disable-next-line no-console
-    console.error("Sen failed to start a session: " + message);
+    console.error("Sen failed to start: " + message);
     const root = document.getElementById("app");
     if (root) {
       root.textContent = "Sen failed to start: " + message;

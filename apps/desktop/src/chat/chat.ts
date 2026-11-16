@@ -1,0 +1,477 @@
+// Shared chat session (P0-1): one agent context for the desktop chat
+// and the Telegram bridge.
+//
+// One ChatSession owns:
+// - the transcript both channels render from (desktop UI + Telegram
+//   replies are derived from the same entries),
+// - the send queue (one turn at a time: a second send waits for the
+//   first reply, so entries never overtake each other),
+// - the memory commands (executed locally, never sent to the model),
+// - the daily-log writes (user + assistant + memory-op lines).
+//
+// Turns run through the IPC bridge (steer first, follow_up after) on
+// the session startApp created. The assistant's reply text arrives as
+// a "result" SenEvent through handleEvent: send() waits for that event
+// (not just for the steer ack), so the transcript entry lands before
+// the next queued send runs. A turn that errors (steer throws, or the
+// result never arrives within the contract timeout + 10s) becomes a
+// system entry instead of a hang, and a Telegram turn also gets its
+// error text sent back to the chat.
+import { followUpSession, steerSession } from "../ipc/session-client.ts";
+import type { SenEvent } from "../ipc/session-events.ts";
+import type { ActionContract } from "../ipc/types.ts";
+import {
+  addMemory,
+  editMemory,
+  forgetMemoryByNumber,
+  forgetMemoryByText,
+  logMemory,
+  readMemory,
+  setSoul,
+  type LogChannel,
+  type LogKind,
+  type MemoryForgetResult,
+  type MemoryItemResult,
+  type MemoryReadResult,
+  type MemoryScope,
+  type SoulResult,
+} from "../ipc/memory-client.ts";
+import { COMMAND_USAGE, parseChatCommand, type ChatCommand } from "./commands.ts";
+
+export type ChatChannel = "desktop" | "telegram";
+export type TranscriptRole = "user" | "assistant" | "system";
+
+export interface TranscriptEntry {
+  id: number;
+  channel: ChatChannel;
+  role: TranscriptRole;
+  text: string;
+  ts: string;
+  telegramChatId?: number;
+}
+
+/// The memory operations the chat layer needs. The default is the real
+/// memory client; tests inject a fake.
+export interface MemoryClient {
+  read(contract: ActionContract): Promise<MemoryReadResult>;
+  add(
+    contract: ActionContract,
+    scope: MemoryScope,
+    text: string,
+  ): Promise<MemoryItemResult>;
+  forgetByNumber(
+    contract: ActionContract,
+    scope: MemoryScope,
+    number: number,
+  ): Promise<MemoryForgetResult>;
+  forgetByText(
+    contract: ActionContract,
+    scope: MemoryScope,
+    text: string,
+  ): Promise<MemoryForgetResult>;
+  edit(
+    contract: ActionContract,
+    scope: MemoryScope,
+    index: number,
+    text: string,
+  ): Promise<MemoryItemResult>;
+  setSoul(contract: ActionContract, text: string): Promise<SoulResult>;
+  log(
+    contract: ActionContract,
+    kind: LogKind,
+    channel: LogChannel,
+    text: string,
+  ): Promise<void>;
+}
+
+const realMemoryClient: MemoryClient = {
+  read: (contract) => readMemory(contract),
+  add: (contract, scope, text) => addMemory(contract, scope, text),
+  forgetByNumber: (contract, scope, number) =>
+    forgetMemoryByNumber(contract, scope, number),
+  forgetByText: (contract, scope, text) =>
+    forgetMemoryByText(contract, scope, text),
+  edit: (contract, scope, index, text) =>
+    editMemory(contract, scope, index, text),
+  setSoul: (contract, text) => setSoul(contract, text),
+  log: async (contract, kind, channel, text) => {
+    await logMemory(contract, kind, channel, text);
+  },
+};
+
+export interface ChatSessionOptions {
+  /// Build a fresh contract per send (unique id + idempotency key).
+  /// The actor is the channel ("desktop" | "telegram").
+  makeContract: (channel: ChatChannel, purpose: string) => ActionContract;
+  memory?: MemoryClient;
+  /// Send a reply back to a Telegram chat. Defaults to a no-op so a
+  /// session without Telegram still works; the app passes the real
+  /// sender at boot.
+  sendTelegram?: (chatId: number, text: string) => Promise<void>;
+  onTranscript?: (entries: TranscriptEntry[]) => void;
+  onBusy?: (busy: boolean) => void;
+}
+
+interface PendingTurn {
+  resolve: (result: { text: string; isError: boolean }) => void;
+  reject: (error: Error) => void;
+}
+
+export class ChatSession {
+  private readonly options: ChatSessionOptions;
+  private readonly memory: MemoryClient;
+  private entries: TranscriptEntry[] = [];
+  private nextId = 1;
+  private queue: Promise<void> = Promise.resolve();
+  private sessionId: string | null = null;
+  private started = false;
+  private busy = false;
+  private pending: PendingTurn | null = null;
+
+  constructor(options: ChatSessionOptions) {
+    this.options = options;
+    this.memory = options.memory ?? realMemoryClient;
+  }
+
+  bind(sessionId: string): void {
+    this.sessionId = sessionId;
+  }
+
+  getSessionId(): string | null {
+    return this.sessionId;
+  }
+
+  getTranscript(): TranscriptEntry[] {
+    return [...this.entries];
+  }
+
+  isBusy(): boolean {
+    return this.busy;
+  }
+
+  /// Feed a live session event into the chat. Only the "result" event
+  /// matters here: it is the authoritative reply text, and it resolves
+  /// the turn send() is waiting for. "message" events are intermediate
+  /// (the result carries the full text); "messageUpdate" deltas are
+  /// provisional. Events for another session are ignored.
+  handleEvent(event: SenEvent): void {
+    if (event.type !== "result") {
+      return;
+    }
+    if (this.sessionId === null || event.sessionId !== this.sessionId) {
+      return;
+    }
+    const pending = this.pending;
+    if (!pending) {
+      return;
+    }
+    this.pending = null;
+    pending.resolve({ text: event.text, isError: event.isError });
+  }
+
+  /// Queue one send (desktop or Telegram). Sends run strictly in
+  /// order; the returned promise resolves when this send is fully
+  /// handled (reply in the transcript, Telegram reply sent). It never
+  /// rejects: a failure becomes a system entry instead.
+  send(channel: ChatChannel, text: string, telegramChatId?: number): Promise<void> {
+    const run = this.queue.then(() =>
+      this.sendNow(channel, text, telegramChatId),
+    );
+    this.queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private append(
+    channel: ChatChannel,
+    role: TranscriptRole,
+    text: string,
+    telegramChatId?: number,
+  ): TranscriptEntry {
+    const entry: TranscriptEntry = {
+      id: this.nextId,
+      channel,
+      role,
+      text,
+      ts: new Date().toISOString(),
+      telegramChatId,
+    };
+    this.nextId += 1;
+    this.entries.push(entry);
+    this.options.onTranscript?.(this.getTranscript());
+    return entry;
+  }
+
+  private setBusy(busy: boolean): void {
+    if (this.busy === busy) {
+      return;
+    }
+    this.busy = busy;
+    this.options.onBusy?.(busy);
+  }
+
+  private async sendNow(
+    channel: ChatChannel,
+    text: string,
+    telegramChatId?: number,
+  ): Promise<void> {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return;
+    }
+    if (this.sessionId === null) {
+      this.append(channel, "system", "Chưa có phiên làm việc.", telegramChatId);
+      return;
+    }
+    const command = parseChatCommand(trimmed);
+    if (command) {
+      await this.executeCommand(channel, trimmed, command, telegramChatId);
+      return;
+    }
+    this.append(channel, "user", trimmed, telegramChatId);
+    await this.logBestEffort("user", channel, trimmed);
+    await this.runModelTurn(channel, trimmed, telegramChatId);
+  }
+
+  private async executeCommand(
+    channel: ChatChannel,
+    rawText: string,
+    command: ChatCommand,
+    telegramChatId?: number,
+  ): Promise<void> {
+    const contract = this.options.makeContract(channel, "memory command");
+    let reply: string;
+    try {
+      reply = await this.runCommand(contract, command);
+    } catch (error) {
+      reply =
+        "Không làm được: " +
+        (error instanceof Error ? error.message : String(error));
+    }
+    this.append(channel, "system", reply, telegramChatId);
+    await this.logBestEffort("memory", channel, rawText);
+    if (telegramChatId !== undefined) {
+      await this.sendTelegramBestEffort(telegramChatId, reply);
+    }
+  }
+
+  private async runCommand(
+    contract: ActionContract,
+    command: ChatCommand,
+  ): Promise<string> {
+    switch (command.kind) {
+      case "memory-add": {
+        const result = await this.memory.add(
+          contract,
+          command.scope,
+          command.text,
+        );
+        return command.scope === "user"
+          ? `Đã ghi về bạn: "${command.text}" (mục ${result.index}).`
+          : `Đã ghi nhớ: "${command.text}" (mục ${result.index}).`;
+      }
+      case "memory-forget": {
+        const result =
+          "number" in command.target
+            ? await this.memory.forgetByNumber(
+                contract,
+                command.scope,
+                command.target.number,
+              )
+            : await this.memory.forgetByText(
+                contract,
+                command.scope,
+                command.target.text,
+              );
+        return "number" in command.target
+          ? `Đã quên mục ${command.target.number}: "${result.removed}".`
+          : `Đã quên: "${result.removed}".`;
+      }
+      case "memory-edit": {
+        await this.memory.edit(
+          contract,
+          command.scope,
+          command.index,
+          command.text,
+        );
+        return `Đã sửa mục ${command.index} thành: "${command.text}".`;
+      }
+      case "soul-set": {
+        await this.memory.setSoul(contract, command.text);
+        return "Đã cập nhật tính cách.";
+      }
+      case "memory-list": {
+        const snapshot = await this.memory.read(contract);
+        return formatMemoryList(snapshot);
+      }
+      case "memory-log": {
+        const snapshot = await this.memory.read(contract);
+        if (snapshot.today.length === 0) {
+          return "Hôm nay chưa có sự kiện nào.";
+        }
+        return "Nhật ký hôm nay:\n" + snapshot.today.join("\n");
+      }
+      case "unknown":
+        return COMMAND_USAGE;
+    }
+  }
+
+  private async runModelTurn(
+    channel: ChatChannel,
+    text: string,
+    telegramChatId?: number,
+  ): Promise<void> {
+    const sessionId = this.sessionId as string;
+    const contract = this.options.makeContract(channel, "chat turn");
+    this.setBusy(true);
+    try {
+      const waiter = this.armResultWaiter(contract.timeoutMs + 10000);
+      // The waiter may reject (timeout) while the steer call below is
+      // still awaited; mark the rejection handled now so it never
+      // surfaces as an unhandled rejection — the await below still
+      // throws the same error when it runs.
+      waiter.catch(() => undefined);
+      try {
+        if (!this.started) {
+          await steerSession(contract, sessionId, text);
+          this.started = true;
+        } else {
+          await followUpSession(contract, sessionId, text);
+        }
+      } catch (error) {
+        // The turn failed before a result: release the waiter so the
+        // await below throws instead of hanging. If the result already
+        // arrived (pending is null), this is a no-op and the reply
+        // below still lands.
+        this.disarmResultWaiter(error);
+      }
+      let result: { text: string; isError: boolean };
+      try {
+        result = await waiter;
+      } catch (error) {
+        const message =
+          "Sen không trả lời được: " +
+          (error instanceof Error ? error.message : String(error));
+        this.append(channel, "system", message, telegramChatId);
+        if (telegramChatId !== undefined) {
+          await this.sendTelegramBestEffort(telegramChatId, message);
+        }
+        return;
+      }
+      this.append(channel, "assistant", result.text, telegramChatId);
+      await this.logBestEffort("assistant", channel, result.text);
+      if (telegramChatId !== undefined) {
+        await this.sendTelegramBestEffort(telegramChatId, result.text);
+      }
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  /// Arm the waiter for the turn's Result event. Resolves when the
+  /// event arrives; rejects when the contract timeout + 10s passes
+  /// without one (the bridge caps a turn at 120s, so this is only a
+  /// backstop, never the normal path).
+  private armResultWaiter(timeoutMs: number): Promise<{
+    text: string;
+    isError: boolean;
+  }> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending) {
+          this.pending = null;
+          reject(
+            new Error("hết thời gian chờ kết quả (quá timeout của phiên)."),
+          );
+        }
+      }, timeoutMs);
+      this.pending = {
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      };
+    });
+  }
+
+  /// Release the waiter with an error, if it is still armed. No-op
+  /// when the Result event already resolved it.
+  private disarmResultWaiter(error: unknown): void {
+    const pending = this.pending;
+    if (!pending) {
+      return;
+    }
+    this.pending = null;
+    pending.reject(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  private async logBestEffort(
+    kind: LogKind,
+    channel: LogChannel,
+    text: string,
+  ): Promise<void> {
+    try {
+      const contract = this.options.makeContract(channel, "memory log");
+      await this.memory.log(contract, kind, channel, text);
+    } catch (error) {
+      // The daily log is a side record: a failed write must not fail
+      // the turn or the command. It is reported on the console, never
+      // swallowed silently.
+      // eslint-disable-next-line no-console
+      console.error("Sen memory log failed: " + String(error));
+    }
+  }
+
+  private async sendTelegramBestEffort(
+    chatId: number,
+    text: string,
+  ): Promise<void> {
+    const send = this.options.sendTelegram;
+    if (!send) {
+      return;
+    }
+    try {
+      await send(chatId, text);
+    } catch (error) {
+      // The turn already succeeded and the transcript already has the
+      // reply; a failed delivery is reported in the transcript so the
+      // desktop user sees it instead of wondering why Telegram is quiet.
+      // eslint-disable-next-line no-console
+      console.error("Sen Telegram send failed: " + String(error));
+      this.append(
+        "telegram",
+        "system",
+        "Không gửi được trả lời về Telegram: " +
+          (error instanceof Error ? error.message : String(error)),
+        chatId,
+      );
+    }
+  }
+}
+
+function formatMemoryList(snapshot: MemoryReadResult): string {
+  const lines: string[] = [];
+  if (snapshot.memory.length === 0) {
+    lines.push("Bộ nhớ: (trống)");
+  } else {
+    lines.push("Bộ nhớ:");
+    snapshot.memory.forEach((item, i) => {
+      lines.push(`${i + 1}. ${item}`);
+    });
+  }
+  if (snapshot.user.length === 0) {
+    lines.push("Về bạn: (trống)");
+  } else {
+    lines.push("Về bạn:");
+    snapshot.user.forEach((item, i) => {
+      lines.push(`${i + 1}. ${item}`);
+    });
+  }
+  return lines.join("\n");
+}
