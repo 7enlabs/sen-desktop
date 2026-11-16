@@ -65,3 +65,42 @@ export type {
   DecisionProposal,
   ProposalStatus,
 } from "./proactive-inbox.ts";
+export {
+  HttpMcpTransport,
+  McpClient,
+  StdioMcpTransport,
+  buildDelegateArgv,
+  buildDelegatePrompt,
+  connectHttpMcp,
+  connectStdioMcp,
+  delegateToolCallToCliCore,
+  executeMcpTool,
+  isHttpServerConfig,
+  mcpConfigFileJson,
+  validateMcpServerConfig,
+  writeMcpConfigFile,
+  MCP_CLIENT_NAME,
+  MCP_CLIENT_VERSION,
+  MCP_DEFAULT_TIMEOUT_MS,
+  MCP_DELEGATE_TIMEOUT_MS,
+  MCP_PROTOCOL_VERSION,
+} from "./mcp-client.ts";
+export type {
+  CliDelegateInput,
+  CliDelegateResult,
+  McpClientOptions,
+  McpGateContext,
+  McpServerConfig,
+  McpTool,
+  McpToolCallInput,
+  McpToolResult,
+  McpTransport,
+} from "./mcp-client.ts";
+export {
+  SkillRegistry,
+  parseSkillFile,
+  skillBody,
+  validateSkill,
+  SKILL_NAME_PATTERN,
+} from "./skill-registry.ts";
+export type { ScanReport, Skill, SkillFile } from "./skill-registry.ts";
