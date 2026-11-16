@@ -60,3 +60,42 @@ jobs:
         run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
       - name: Check Rust code
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+
+  coverage:
+    name: Tauri coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri system dependencies
+        # Same set as the rust job: cargo-llvm-cov builds and runs the
+        # full test suite, so it needs the webview/gtk stacks too.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-tools-preview provides llvm-profdata/llvm-cov, which
+          # cargo-llvm-cov needs. Stable toolchain is unchanged.
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        # Official install method from the cargo-llvm-cov docs: downloads
+        # the prebuilt binary, no compile step, free (MIT/Apache-2.0).
+        uses: taiki-e/cargo-llvm-cov@v1
+      - name: Measure Tauri crate coverage
+        # Runs the crate test suite under source-based coverage, prints
+        # the summary table to the log, and writes lcov + text reports.
+        # The job fails if any test fails (cargo-llvm-cov propagates the
+        # test exit code). No minimum threshold is enforced yet: the job
+        # reports coverage, it does not gate on a number.
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --lcov --output-path coverage/lcov.info
+          cargo llvm-cov report --manifest-path apps/desktop/src-tauri/Cargo.toml --summary-only > coverage/coverage.txt
+          cat coverage/coverage.txt
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-coverage
+          path: coverage/
+          if-no-files-found: error
