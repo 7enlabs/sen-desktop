@@ -75,14 +75,27 @@ pub struct SessionResult {
     /// Version mismatches seen in the last turn (R2B-04, same rule as
     /// unknown_records; a record with no `v` field counts as one).
     pub version_mismatches: u64,
+    /// P0-3: the model-router route that ran the last turn (or the
+    /// session's route when no turn ran), so the frontend can show
+    /// the provider/model actually used and its cost.
+    pub route_id: String,
+    /// P0-3: cost label of that route ("0 đồng" for free/local).
+    pub cost: String,
 }
 
-fn result(session_id: &str, state: super::registry::SessionState) -> SessionResult {
+fn result(
+    session_id: &str,
+    state: super::registry::SessionState,
+    route_id: &str,
+    cost: &str,
+) -> SessionResult {
     SessionResult {
         session_id: session_id.to_string(),
         state: state.as_str().to_string(),
         unknown_records: 0,
         version_mismatches: 0,
+        route_id: route_id.to_string(),
+        cost: cost.to_string(),
     }
 }
 
@@ -90,13 +103,36 @@ fn result_with_counts(
     session_id: &str,
     state: super::registry::SessionState,
     turn: &super::cli_spawn::TurnResult,
+    route_id: &str,
+    cost: &str,
 ) -> SessionResult {
     SessionResult {
         session_id: session_id.to_string(),
         state: state.as_str().to_string(),
         unknown_records: turn.unknown_records,
         version_mismatches: turn.version_mismatches,
+        route_id: route_id.to_string(),
+        cost: cost.to_string(),
     }
+}
+
+/// Cost label for a session's current route (P0-3). Takes the
+/// already-locked registry: the caller holds the lock, so this never
+/// locks again. The cost comes from the router chain, falling back
+/// to "0 đồng" when the route is unknown (all built-in routes except
+/// BYOK cost 0, and a BYOK route reports its own label when found
+/// in the chain).
+fn route_cost(registry: &super::registry::Registry, session_id: &str) -> (String, String) {
+    let route_id = registry
+        .route_id(session_id)
+        .unwrap_or_else(|| "spark".to_string());
+    let cost = registry
+        .attempt_order()
+        .into_iter()
+        .find(|r| r.id == route_id)
+        .map(|r| r.cost_label().to_string())
+        .unwrap_or_else(|| "0 đồng".to_string());
+    (route_id, cost)
 }
 
 /// sen_session_create: backend record + one CLI bridge handle for the
@@ -111,7 +147,8 @@ pub fn sen_session_create(
     let next = registry
         .create(&session_id, &contract.to_registry())
         .map_err(|e| e.to_wire())?;
-    Ok(result(&session_id, next))
+    let (route_id, cost) = route_cost(&registry, &session_id);
+    Ok(result(&session_id, next, &route_id, &cost))
 }
 
 /// Run one turn for a session: validate + take the bridge (step 1), run
@@ -153,11 +190,24 @@ fn run_steer_turn(
             .map_err(|e| e.to_wire())?
     };
     let bridge = match start {
-        super::registry::SteerStart::Duplicate { state, turn } => {
+        super::registry::SteerStart::Duplicate {
+            state: session_state,
+            turn,
+        } => {
             // R2B-04: the recorded turn carries its counts, so a
             // replayed steer reports the same numbers as the turn
             // that originally ran.
-            return Ok(result_with_counts(session_id, state, &turn));
+            let (route_id, cost) = match state.lock() {
+                Ok(registry) => route_cost(&registry, session_id),
+                Err(_) => ("spark".to_string(), "0 đồng".to_string()),
+            };
+            return Ok(result_with_counts(
+                session_id,
+                session_state,
+                &turn,
+                &route_id,
+                &cost,
+            ));
         }
         super::registry::SteerStart::InFlight { .. } => {
             return Err(super::registry::CommandError::new(
@@ -187,16 +237,46 @@ fn run_steer_turn(
         // Best effort: a listener that is gone must not fail the turn.
         let _ = app_emit.emit(SEN_SESSION_EVENT, &event);
     };
-    let turn = match bridge.run_turn_with_timeout(kind, &prompt, timeout, &mut emit) {
-        Ok(turn) => turn,
-        Err(e) => {
-            // The turn never ran to a result: release the in-flight key
-            // (BUG-10 extra) so a retry with the same key still
-            // executes. A lock failure here must not mask the turn error.
-            if let Ok(mut registry) = state.lock() {
-                registry.release_steer(session_id, &contract.to_registry(), kind, text);
+    // P0-3 fallback: a turn that fails with a retryable code runs
+    // again on the next route in the chain (same loop as the
+    // test-only Registry::steer). A non-retryable failure returns at
+    // once. The in-flight key is released only when no route is left
+    // or the failure is not retryable, so a retry with the same key
+    // still executes.
+    let mut bridge = bridge;
+    let mut failed_route = match state.lock() {
+        Ok(registry) => registry
+            .route_id(session_id)
+            .unwrap_or_else(|| "spark".to_string()),
+        Err(_) => "spark".to_string(),
+    };
+    let turn = loop {
+        match bridge.run_turn_with_timeout(kind, &prompt, timeout, &mut emit) {
+            Ok(turn) => break turn,
+            Err(e) => {
+                if !super::model_router::is_retryable_error_code(&e.code) {
+                    if let Ok(mut registry) = state.lock() {
+                        registry.release_steer(session_id, &contract.to_registry(), kind, text);
+                    }
+                    return Err(format!("{}: {}", e.code, e.message));
+                }
+                let swapped = match state.lock() {
+                    Ok(mut registry) => registry.fallback_bridge(session_id, &failed_route),
+                    Err(_) => None,
+                };
+                match swapped {
+                    Some((next_bridge, next_route)) => {
+                        failed_route = next_route.id.clone();
+                        bridge = next_bridge;
+                    }
+                    None => {
+                        if let Ok(mut registry) = state.lock() {
+                            registry.release_steer(session_id, &contract.to_registry(), kind, text);
+                        }
+                        return Err(format!("{}: {}", e.code, e.message));
+                    }
+                }
             }
-            return Err(format!("{}: {}", e.code, e.message));
         }
     };
     let mut registry = state.lock().map_err(|e| e.to_string())?;
@@ -205,7 +285,11 @@ fn run_steer_turn(
         .map_err(|e| e.to_wire())?;
     // R2B-04: the turn's unknown/version counts travel to the frontend
     // with the session result instead of staying inside TurnResult.
-    Ok(result_with_counts(session_id, next, &turn))
+    // P0-3: the route that actually ran travels with them.
+    let (route_id, cost) = route_cost(&registry, session_id);
+    Ok(result_with_counts(
+        session_id, next, &turn, &route_id, &cost,
+    ))
 }
 
 /// sen_session_steer: gates on a Running session, then runs one CLI turn
@@ -277,5 +361,6 @@ pub fn sen_session_abort(
     let next = registry
         .complete_abort(&session_id, outcome)
         .map_err(|e| e.to_wire())?;
-    Ok(result(&session_id, next))
+    let (route_id, cost) = route_cost(&registry, &session_id);
+    Ok(result(&session_id, next, &route_id, &cost))
 }

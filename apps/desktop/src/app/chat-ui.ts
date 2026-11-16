@@ -11,6 +11,8 @@ export interface ChatUI {
   setBusy(busy: boolean): void;
   setSession(sessionId: string): void;
   setTelegramStatus(text: string): void;
+  // P0-3: the active model route + cost, e.g. "Model: spark · ... · 0 đồng".
+  setRouterStatus(text: string): void;
 }
 
 export function startChatUI(root: HTMLElement, chat: ChatSession): ChatUI {
@@ -21,7 +23,8 @@ export function startChatUI(root: HTMLElement, chat: ChatSession): ChatUI {
   status.className = "status";
   const sessionStatus = document.createElement("span");
   const telegramStatus = document.createElement("span");
-  status.append(sessionStatus, telegramStatus);
+  const routerStatus = document.createElement("span");
+  status.append(sessionStatus, telegramStatus, routerStatus);
   header.append(title, status);
 
   const messages = document.createElement("div");
@@ -86,6 +89,9 @@ export function startChatUI(root: HTMLElement, chat: ChatSession): ChatUI {
     },
     setTelegramStatus(text: string): void {
       telegramStatus.textContent = text;
+    },
+    setRouterStatus(text: string): void {
+      routerStatus.textContent = text;
     },
   };
 }

@@ -352,6 +352,23 @@ impl CliBridge {
         &self.session_id
     }
 
+    /// True once a turn on this handle ran to a result record: the CLI
+    /// session exists on disk from that point, so a later turn (or a
+    /// fallback bridge for the same session id) may resume it with -r.
+    pub fn has_started(&self) -> bool {
+        self.state.lock().map(|s| s.started).unwrap_or(false)
+    }
+
+    /// Mark this handle as resuming an existing CLI session (P0-3
+    /// fallback): the next turn uses -r instead of --session-id, so
+    /// the turn keeps the session history the failed bridge already
+    /// built. Only call when the previous bridge has_started().
+    pub fn mark_session_started(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.started = true;
+        }
+    }
+
     pub fn model(&self) -> &str {
         &self.model
     }

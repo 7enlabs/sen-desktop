@@ -17,7 +17,11 @@
 // result never arrives within the contract timeout + 10s) becomes a
 // system entry instead of a hang, and a Telegram turn also gets its
 // error text sent back to the chat.
-import { followUpSession, steerSession } from "../ipc/session-client.ts";
+import {
+  followUpSession,
+  steerSession,
+  type BackendSessionResult,
+} from "../ipc/session-client.ts";
 import type { SenEvent } from "../ipc/session-events.ts";
 import type { ActionContract } from "../ipc/types.ts";
 import {
@@ -37,6 +41,45 @@ import {
   type SoulResult,
 } from "../ipc/memory-client.ts";
 import { COMMAND_USAGE, parseChatCommand, type ChatCommand } from "./commands.ts";
+import {
+  describeRouterRoute,
+  type RouterSettingResult,
+} from "../ipc/settings-client.ts";
+
+/// The model-router calls the chat layer needs (Sen P0-3). The
+/// default is the real settings client, wired by the app at boot;
+/// tests inject a fake. A missing client means /model only reports
+/// the CLI free default, never a fake route list.
+export interface RouterClient {
+  getRouter(contract: ActionContract): Promise<RouterSettingResult>;
+  setPreferredRoute(
+    contract: ActionContract,
+    routeId: string,
+  ): Promise<RouterSettingResult>;
+}
+
+/// One-line router status for the UI status line, e.g.
+/// "Model: spark · google/gemini-4-argon:free · 0 đồng".
+export function formatRouterStatus(status: RouterSettingResult): string {
+  const active = status.routes.find((r) => r.id === status.activeRouteId);
+  const text = active
+    ? describeRouterRoute(active)
+    : status.activeRouteId;
+  return "Model: " + text;
+}
+
+/// Full router listing for the /model reply: active route first,
+/// then the rest of the chain in order, each with its cost.
+export function formatRouterList(status: RouterSettingResult): string {
+  const lines = status.routes.map((route) => {
+    const mark = route.id === status.activeRouteId ? "● " : "○ ";
+    return mark + describeRouterRoute(route);
+  });
+  const fallback = status.fallbackEnabled
+    ? "Lỗi ở một đường sẽ thử đường tiếp theo."
+    : "Fallback đang tắt: lỗi ở một đường sẽ báo lỗi luôn.";
+  return "Đường model:\n" + lines.join("\n") + "\n" + fallback;
+}
 
 export type ChatChannel = "desktop" | "telegram";
 export type TranscriptRole = "user" | "assistant" | "system";
@@ -104,12 +147,21 @@ export interface ChatSessionOptions {
   /// The actor is the channel ("desktop" | "telegram").
   makeContract: (channel: ChatChannel, purpose: string) => ActionContract;
   memory?: MemoryClient;
+  /// Model-router client (P0-3). When omitted, /model only reports
+  /// the CLI free default.
+  router?: RouterClient;
   /// Send a reply back to a Telegram chat. Defaults to a no-op so a
   /// session without Telegram still works; the app passes the real
   /// sender at boot.
   sendTelegram?: (chatId: number, text: string) => Promise<void>;
   onTranscript?: (entries: TranscriptEntry[]) => void;
   onBusy?: (busy: boolean) => void;
+  /// Router status line for the UI (P0-3). Called after a /model
+  /// change, by refreshRouterStatus(), and after every model turn
+  /// with the route that actually ran (rev2 F1: after a fallback the
+  /// preferred route is still the route that failed, so the turn
+  /// result — not the stored preference — decides the line).
+  onRouterStatus?: (text: string) => void;
 }
 
 interface PendingTurn {
@@ -147,6 +199,65 @@ export class ChatSession {
 
   isBusy(): boolean {
     return this.busy;
+  }
+
+  /// Report the route a finished turn actually ran on (P0-3 rev2,
+  /// F1). The steer/follow_up ack carries routeId/cost for the route
+  /// that ran; the stored preference may still name the route that
+  /// failed and fell back, so the ack — not a settings re-read —
+  /// decides the line. When the router client is available the ack's
+  /// route id is matched against the chain so the line keeps the
+  /// "provider · model · cost" shape; otherwise (no router, unknown
+  /// route, failed fetch) the line shows the route id and cost as
+  /// returned. Never throws: the turn already landed, and a status
+  /// update must not fail it. No-op when the ack carries no route
+  /// (a backend from before P0-3).
+  private async reportRanRoute(
+    turnResult: BackendSessionResult | undefined,
+  ): Promise<void> {
+    const routeId = turnResult?.routeId;
+    if (!routeId) {
+      return;
+    }
+    const cost = turnResult.cost ?? "0 đồng";
+    const router = this.options.router;
+    if (router) {
+      try {
+        const contract = this.options.makeContract(
+          "desktop",
+          "router status",
+        );
+        const status = await router.getRouter(contract);
+        if (status.routes.some((r) => r.id === routeId)) {
+          this.options.onRouterStatus?.(
+            formatRouterStatus({ ...status, activeRouteId: routeId }),
+          );
+          return;
+        }
+      } catch {
+        // Fall through to the plain line below: the turn already ran,
+        // the status line must not stay on the failed route.
+      }
+    }
+    this.options.onRouterStatus?.("Model: " + routeId + " · " + cost);
+  }
+
+  /// Fetch the router status and report it on the status line
+  /// (P0-3). Best effort: without a router client, or when the fetch
+  /// fails, the line says the model is unknown instead of guessing.
+  async refreshRouterStatus(): Promise<void> {
+    const router = this.options.router;
+    if (!router) {
+      this.options.onRouterStatus?.("Model: đường miễn phí của CLI");
+      return;
+    }
+    try {
+      const contract = this.options.makeContract("desktop", "router status");
+      const status = await router.getRouter(contract);
+      this.options.onRouterStatus?.(formatRouterStatus(status));
+    } catch {
+      this.options.onRouterStatus?.("Model: chưa rõ");
+    }
   }
 
   /// Feed a live session event into the chat. Only the "result" event
@@ -313,6 +424,32 @@ export class ChatSession {
         }
         return "Nhật ký hôm nay:\n" + snapshot.today.join("\n");
       }
+      case "model-show": {
+        const router = this.options.router;
+        if (!router) {
+          return "Bộ định tuyến chưa được nối. Mặc định: đường miễn phí của CLI.";
+        }
+        const status = await router.getRouter(contract);
+        return formatRouterList(status);
+      }
+      case "model-set": {
+        const router = this.options.router;
+        if (!router) {
+          return "Bộ định tuyến chưa được nối nên chưa đổi được đường.";
+        }
+        const status = await router.getRouter(contract);
+        const wanted = status.routes.find((r) => r.id === command.routeId);
+        if (!wanted) {
+          const ids = status.routes.map((r) => r.id).join(", ");
+          return `Không có đường "${command.routeId}". Các đường: ${ids}.`;
+        }
+        const next = await router.setPreferredRoute(contract, command.routeId);
+        this.options.onRouterStatus?.(formatRouterStatus(next));
+        return (
+          `Đã chọn đường ${describeRouterRoute(wanted)}. ` +
+          "Phiên đang chạy giữ đường cũ; phiên mới dùng đường này."
+        );
+      }
       case "unknown":
         return COMMAND_USAGE;
     }
@@ -333,12 +470,17 @@ export class ChatSession {
       // surfaces as an unhandled rejection — the await below still
       // throws the same error when it runs.
       waiter.catch(() => undefined);
+      // The steer/follow_up ack carries the route that actually ran
+      // (routeId/cost, P0-3). Keep it: after the reply lands, the
+      // status line must show that route, not the preferred one —
+      // after a fallback the two differ (rev2 F1).
+      let turnResult: BackendSessionResult | undefined;
       try {
         if (!this.started) {
-          await steerSession(contract, sessionId, text);
+          turnResult = await steerSession(contract, sessionId, text);
           this.started = true;
         } else {
-          await followUpSession(contract, sessionId, text);
+          turnResult = await followUpSession(contract, sessionId, text);
         }
       } catch (error) {
         // The turn failed before a result: release the waiter so the
@@ -365,6 +507,10 @@ export class ChatSession {
       if (telegramChatId !== undefined) {
         await this.sendTelegramBestEffort(telegramChatId, result.text);
       }
+      // The reply landed: the turn ran on turnResult's route (after
+      // a fallback, the next route in the chain). Show that route on
+      // the status line; never throws, never disturbs the transcript.
+      await this.reportRanRoute(turnResult);
     } finally {
       this.setBusy(false);
     }

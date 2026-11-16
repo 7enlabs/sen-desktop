@@ -64,6 +64,7 @@ use std::time::Duration;
 
 use super::cli_settings::{CliSettings, DEFAULT_MODEL};
 use super::cli_spawn::{AbortOutcome, BridgeError, CliBridge, TurnResult};
+use super::model_router::{next_route, resolve_attempt_order, Route, RouterConfig};
 use super::stream_json::SenEvent;
 
 // --- Session statechart (point 854, mirror of packages/core) ---
@@ -245,6 +246,9 @@ pub struct SessionRecord {
     pub state: SessionState,
     pub log: Vec<String>,
     pub subscribers: u32,
+    /// Active model-router route id for this session (P0-3). Changes
+    /// when a turn falls back to the next route.
+    pub route_id: String,
 }
 
 #[derive(Default)]
@@ -420,10 +424,11 @@ impl Registry {
     }
 
     /// sen_session_create: backend record only, state Running, plus one
-    /// CLI bridge handle for the session (model and base URL from local
-    /// settings, default free model and no base URL when nothing is
-    /// stored). No model call happens here: the handle spawns nothing
-    /// until the first steer.
+    /// CLI bridge handle for the session. P0-3: the bridge runs the
+    /// router's active route (model and base URL from the resolved
+    /// route; legacy stored model/base_url when no router is stored).
+    /// No model call happens here: the handle spawns nothing until
+    /// the first steer.
     pub fn create(
         &mut self,
         session_id: &str,
@@ -443,6 +448,7 @@ impl Registry {
             ));
         }
         let settings = self.settings_for_new_session();
+        let route = settings.active_route();
         self.sessions.insert(
             session_id.to_string(),
             SessionRecord {
@@ -450,13 +456,82 @@ impl Registry {
                 state: SessionState::Running,
                 log: vec!["session_create".to_string()],
                 subscribers: 0,
+                route_id: route.id.clone(),
             },
         );
         self.bridges.insert(
             session_id.to_string(),
-            Arc::new(self.new_bridge(session_id, &settings.model, settings.base_url.as_deref())),
+            Arc::new(self.new_bridge(session_id, &route.model, route.base_url.as_deref())),
         );
         Ok(SessionState::Running)
+    }
+
+    /// The session's active route id (P0-3), for the session result
+    /// the frontend shows. None when the session does not exist.
+    pub fn route_id(&self, session_id: &str) -> Option<String> {
+        self.sessions.get(session_id).map(|r| r.route_id.clone())
+    }
+
+    /// The router config behind this registry's settings (P0-3):
+    /// the stored router when a settings dir is set, else the
+    /// default chain. The caller never gets a paid route here:
+    /// validation already rejected paid routes at load/store time.
+    pub fn router_config(&self) -> RouterConfig {
+        match &self.settings_dir {
+            Some(dir) => CliSettings::load(dir).router.unwrap_or_default(),
+            None => RouterConfig::default(),
+        }
+    }
+
+    /// The attempt order for this registry's router (P0-3), first
+    /// route first. Used by the production wrapper and the test-only
+    /// steer() so both retry the same chain in the same order.
+    pub fn attempt_order(&self) -> Vec<Route> {
+        resolve_attempt_order(&self.router_config())
+    }
+
+    /// Swap a session's bridge to the next route after `failed_route_id`
+    /// (P0-3 fallback). Returns the new bridge and route, or None when
+    /// the chain is exhausted or fallback is disabled. When the failed
+    /// bridge already ran a turn to a result, the new bridge resumes
+    /// the same CLI session with -r, so the turn keeps its history;
+    /// when the failed bridge never started (e.g. auth failed on the
+    /// first turn), the new bridge starts a fresh CLI session and the
+    /// turn runs on the prompt alone (+ memory block). The session
+    /// record's route_id moves to the new route either way, so the
+    /// frontend always shows the route that actually ran.
+    pub fn fallback_bridge(
+        &mut self,
+        session_id: &str,
+        failed_route_id: &str,
+    ) -> Option<(Arc<CliBridge>, Route)> {
+        let config = self.router_config();
+        if !config.fallback_enabled {
+            return None;
+        }
+        let next = next_route(&config, failed_route_id)?;
+        let resume = self
+            .bridges
+            .get(session_id)
+            .map(|b| b.has_started())
+            .unwrap_or(false);
+        let bridge = self.new_bridge(session_id, &next.model, next.base_url.as_deref());
+        if resume {
+            bridge.mark_session_started();
+        }
+        let bridge = Arc::new(bridge);
+        self.bridges
+            .insert(session_id.to_string(), Arc::clone(&bridge));
+        // The session record's route_id moves to the new route, so
+        // the frontend always shows the route that actually ran. No
+        // log entry is pushed here on purpose (BUG-06): a steer that
+        // never runs to a result must leave no log entry, and a
+        // fallback swap is not a completed steer — the successful
+        // turn logs its own steer entry in complete_steer.
+        if let Some(record) = self.sessions.get_mut(session_id) {
+            record.route_id = next.id.clone();
+        }
+        Some((bridge, next))
     }
 
     /// sen_session_steer / sen_session_follow_up, step 1 of 3: validate
@@ -651,21 +726,42 @@ impl Registry {
                 ERR_DUPLICATE_STEER,
                 "Steer already running on this session, refused",
             )),
-            SteerStart::Run(bridge) => {
+            SteerStart::Run(mut bridge) => {
                 // BUG-11: the contract timeout_ms is the turn deadline, capped
                 // at the 120s turn timeout inside the bridge (min(timeout_ms,
                 // 120s) per tin 9566). A hanging turn is killed at that
                 // deadline instead of running to the cap or hanging forever.
-                let turn = match bridge.run_turn_with_timeout(
-                    kind,
-                    text,
-                    Duration::from_millis(contract.timeout_ms),
-                    emit,
-                ) {
-                    Ok(turn) => turn,
-                    Err(e) => {
-                        self.release_steer(session_id, contract, kind, text);
-                        return Err(bridge_error_to_command(e));
+                // P0-3 fallback: a turn that fails with a retryable code
+                // (auth/rate-limit/no-result/timeout/...) runs again on
+                // the next route in the chain, at most once per route.
+                // A non-retryable failure returns at once, never retried.
+                let mut failed_route = self
+                    .route_id(session_id)
+                    .unwrap_or_else(|| "spark".to_string());
+                let turn = loop {
+                    match bridge.run_turn_with_timeout(
+                        kind,
+                        text,
+                        Duration::from_millis(contract.timeout_ms),
+                        emit,
+                    ) {
+                        Ok(turn) => break turn,
+                        Err(e) => {
+                            if !super::model_router::is_retryable_error_code(&e.code) {
+                                self.release_steer(session_id, contract, kind, text);
+                                return Err(bridge_error_to_command(e));
+                            }
+                            match self.fallback_bridge(session_id, &failed_route) {
+                                Some((next_bridge, next_route)) => {
+                                    failed_route = next_route.id.clone();
+                                    bridge = next_bridge;
+                                }
+                                None => {
+                                    self.release_steer(session_id, contract, kind, text);
+                                    return Err(bridge_error_to_command(e));
+                                }
+                            }
+                        }
                     }
                 };
                 self.complete_steer(session_id, contract, kind, text, &turn)
@@ -939,6 +1035,7 @@ exit 0"#;
         CliSettings {
             model: "some/model:free".to_string(),
             base_url: None,
+            router: None,
         }
         .save(&dir)
         .unwrap();
@@ -958,6 +1055,7 @@ exit 0"#;
         CliSettings {
             model: "some/model:free".to_string(),
             base_url: Some("https://example.invalid/v1".to_string()),
+            router: None,
         }
         .save(&dir)
         .unwrap();
@@ -1391,10 +1489,16 @@ exit 1"#;
         assert_eq!(reg.get("s1").unwrap().log.len(), 3);
     }
 
-    // Only a turn that ran to a result is recorded: a failed first
-    // steer records nothing, so the retry with the same key still runs.
+    // P0-3 SUPERSEDES the pre-router reading of this test: a
+    // retryable failure (exit 1, no result = CLI_NO_RESULT) no longer
+    // ends the steer — the same steer falls back to the next route
+    // and succeeds there. The BUG-10 rule itself ("only a turn that
+    // ran to a result is recorded") still holds and is pinned by the
+    // R2B-02 error-turn test plus the non-retryable test below: a
+    // failure that no route can fix still records nothing, so a
+    // retry with the same key still runs the model.
     #[test]
-    fn steer_failed_turn_does_not_record_key() {
+    fn steer_retryable_failure_falls_back_within_the_same_steer() {
         let marker =
             std::env::temp_dir().join(format!("sen_reg_bug10_retry_{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
@@ -1412,11 +1516,60 @@ exit 0; else touch '{marker}'; exit 1; fi"#,
         let mut reg = Registry::new();
         reg.set_zen_bin(fake_zen("retry", &body));
         reg.create("s1", &contract()).unwrap();
+        // The first steer succeeds through the fallback (the failed
+        // first attempt emitted no events; the retry ran the happy
+        // turn), and the successful turn IS recorded: a second
+        // identical steer replays it with no events.
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 3, "fallback retry must run the model");
+        assert_eq!(reg.route_id("s1").as_deref(), Some("openrouter-free"));
+        assert_eq!(reg.get("s1").unwrap().log.len(), 2);
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(events.len(), 0, "success turn must still be cached");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    // P0-3: the BUG-10 "failed turn records nothing" rule, kept for a
+    // failure no route can fix (exit 4 = validation, not retryable):
+    // the first steer errors, records nothing, and the retry with the
+    // same key still runs the model instead of replaying.
+    #[test]
+    fn steer_non_retryable_failure_does_not_record_key() {
+        let marker =
+            std::env::temp_dir().join(format!("sen_reg_bug10_noretry_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // First run: no marker yet -> exit 4 with no result record.
+        // Later runs: marker exists -> the happy output.
+        let body = format!(
+            r#"if [ -f '{marker}' ]; then cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+{{"type":"assistant","uuid":"u1","session_id":"s1","message":{{"role":"assistant","content":"hello"}},"parent_tool_use_id":null,"v":1}}
+{{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0}},"model":"m:free","session_id":"s1","v":1}}
+EOF
+exit 0; else touch '{marker}'; cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+EOF
+exit 4; fi"#,
+            marker = marker.display()
+        );
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("noretry", &body));
+        reg.create("s1", &contract()).unwrap();
         let mut emit = |_ev: SenEvent| {};
         let err = reg
             .steer("s1", &contract(), "steer", "hi", &mut emit)
             .unwrap_err();
-        assert_eq!(err.code, "CLI_NO_RESULT");
+        assert_eq!(err.code, "CLI_VALIDATION");
         assert_eq!(reg.get("s1").unwrap().log.len(), 1);
         let mut events: Vec<SenEvent> = Vec::new();
         let mut emit = |ev: SenEvent| events.push(ev);
@@ -1725,5 +1878,97 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
     fn error_wire_form_keeps_code() {
         let err = CommandError::new("SOME_CODE", "detail");
         assert_eq!(err.to_wire(), "SOME_CODE: detail");
+    }
+
+    // P0-3: a turn that fails with a retryable code (exit 2 = auth,
+    // no result record) runs again on the next route in the chain and
+    // succeeds there. The session record moves to the new route; the
+    // fallback itself leaves no log entry (BUG-06: only a completed
+    // steer is recorded), and the retryable failure itself is not
+    // recorded as a completed steer.
+    #[test]
+    fn steer_retries_on_next_route_after_retryable_failure() {
+        let marker = std::env::temp_dir().join(format!("sen_reg_p03_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // First invocation: auth failure, no result (exit 2).
+        // Later invocations: the happy output.
+        let body = format!(
+            r#"if [ -f '{marker}' ]; then cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+{{"type":"assistant","uuid":"u1","session_id":"s1","message":{{"role":"assistant","content":"hello"}},"parent_tool_use_id":null,"v":1}}
+{{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0}},"model":"m:free","session_id":"s1","v":1}}
+EOF
+exit 0; else touch '{marker}'; cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+EOF
+exit 2; fi"#,
+            marker = marker.display()
+        );
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("p03retry", &body));
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.route_id("s1").as_deref(), Some("spark"));
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(reg.route_id("s1").as_deref(), Some("openrouter-free"));
+        assert!(marker.exists(), "fake binary must have run twice");
+        // The failed attempt emitted its init event; the retry ran
+        // the full happy turn (3 events). The turn recorded is the
+        // successful one, and the log holds only session_create +
+        // that turn (BUG-06: the failed attempt left no entry).
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[3], SenEvent::Result { .. }));
+        assert_eq!(reg.get("s1").unwrap().log.len(), 2);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    // P0-3: a non-retryable failure (exit 4 = validation) is never
+    // retried: the error returns at once and the route does not move.
+    #[test]
+    fn steer_does_not_retry_after_non_retryable_failure() {
+        let body = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}
+EOF
+exit 4"#;
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("p03noretry", body));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        let err = reg
+            .steer("s1", &contract(), "steer", "hi", &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, "CLI_VALIDATION");
+        assert_eq!(reg.route_id("s1").as_deref(), Some("spark"));
+        assert_eq!(reg.get("s1").unwrap().log.len(), 1);
+    }
+
+    // P0-3: create() resolves the preferred route from the stored
+    // router, and a session with no stored router keeps the legacy
+    // model/base_url as its implicit spark route.
+    #[test]
+    fn create_uses_the_preferred_route_from_the_router() {
+        let dir = std::env::temp_dir().join(format!("sen_reg_p03pref_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = RouterConfig::default();
+        config.preferred_route = Some("ollama".to_string());
+        CliSettings {
+            model: "some/model:free".to_string(),
+            base_url: None,
+            router: Some(config),
+        }
+        .save(&dir)
+        .unwrap();
+        let mut reg = Registry::with_settings_dir(dir.clone());
+        reg.create("s1", &contract()).unwrap();
+        let bridge = reg.bridge("s1").unwrap();
+        assert_eq!(bridge.model(), "llama3.1");
+        assert_eq!(bridge.base_url(), Some("http://127.0.0.1:11434/v1"));
+        assert_eq!(reg.route_id("s1").as_deref(), Some("ollama"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

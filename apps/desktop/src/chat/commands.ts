@@ -30,6 +30,11 @@ export type ChatCommand =
   | { kind: "soul-set"; text: string }
   | { kind: "memory-list" }
   | { kind: "memory-log" }
+  // P0-3: /model shows the active route + chain; /model <id> switches
+  // the preferred route (new sessions use it; a running session keeps
+  // its route). Never sent to the model.
+  | { kind: "model-show" }
+  | { kind: "model-set"; routeId: string }
   | { kind: "unknown"; text: string };
 
 function forgetTarget(
@@ -92,6 +97,13 @@ export function parseChatCommand(text: string): ChatCommand | null {
   if (/^\/nhật ký\s*$/.test(trimmed)) {
     return { kind: "memory-log" };
   }
+  if (/^\/model\s*$/.test(trimmed)) {
+    return { kind: "model-show" };
+  }
+  const modelSet = /^\/model\s+(\S+)\s*$/.exec(trimmed);
+  if (modelSet) {
+    return { kind: "model-set", routeId: modelSet[1] };
+  }
   if (trimmed.startsWith("/")) {
     return { kind: "unknown", text: trimmed };
   }
@@ -102,4 +114,5 @@ export function parseChatCommand(text: string): ChatCommand | null {
 export const COMMAND_USAGE =
   "Lệnh không rõ. Các lệnh: /nhớ <nội dung>, /tôi <nội dung>, " +
   "/quên <số hoặc chữ>, /quên tôi <số hoặc chữ>, /sửa <số> <nội dung>, " +
-  "/sửa tôi <số> <nội dung>, /sửa soul <nội dung>, /xem, /nhật ký.";
+  "/sửa tôi <số> <nội dung>, /sửa soul <nội dung>, /xem, /nhật ký, " +
+  "/model, /model <tên đường: spark, openrouter-free, ollama>.";

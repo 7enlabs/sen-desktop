@@ -78,6 +78,8 @@ fn main() {
             commands::settings::sen_settings_set_model,
             commands::settings::sen_settings_get_base_url,
             commands::settings::sen_settings_set_base_url,
+            commands::settings::sen_settings_get_router,
+            commands::settings::sen_settings_set_router,
             commands::memory::sen_memory_read,
             commands::memory::sen_memory_add,
             commands::memory::sen_memory_forget,

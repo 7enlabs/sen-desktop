@@ -18,6 +18,8 @@
 // any log line this module can produce.
 use std::path::{Path, PathBuf};
 
+use super::model_router::{default_routes, validate_router_config, Route, RouterConfig};
+
 /// The CLI's own free default model (zen-cli settings.rs:6).
 pub const DEFAULT_MODEL: &str = "google/gemini-4-argon:free";
 
@@ -30,6 +32,13 @@ pub struct CliSettings {
     /// Optional provider base URL (R2B-05). None means no --base-url
     /// flag: the CLI uses its own default endpoint.
     pub base_url: Option<String>,
+    /// Optional model router (Sen P0-3). None means the legacy
+    /// single-route behaviour: one implicit "spark" route from the
+    /// model/base_url above. Some means the router chain decides the
+    /// route for new sessions (preferred route first, then the chain
+    /// order); the legacy model/base_url are then only the fallback
+    /// when the router has no usable route.
+    pub router: Option<RouterConfig>,
 }
 
 impl Default for CliSettings {
@@ -37,6 +46,7 @@ impl Default for CliSettings {
         CliSettings {
             model: DEFAULT_MODEL.to_string(),
             base_url: None,
+            router: None,
         }
     }
 }
@@ -76,7 +86,50 @@ impl CliSettings {
             .map(str::trim)
             .filter(|u| !u.is_empty())
             .map(str::to_string);
-        CliSettings { model, base_url }
+        // P0-3: an invalid "router" object loads as None (legacy
+        // single-route behaviour) instead of failing the session: a
+        // bad router file must never fail session creation. A valid
+        // router object is kept as-is.
+        let router = value.get("router").and_then(|v| {
+            let parsed: Result<RouterConfig, _> = serde_json::from_value(v.clone());
+            match parsed {
+                Ok(config) if validate_router_config(&config).is_empty() => Some(config),
+                _ => None,
+            }
+        });
+        CliSettings {
+            model,
+            base_url,
+            router,
+        }
+    }
+
+    /// The active route for a new session (P0-3): the first usable
+    /// route of the stored router chain, or the legacy implicit
+    /// "spark" route (stored model/base_url) when no router is stored
+    /// or none of its routes is usable. Never fails: there is always
+    /// a route, so session creation never blocks on router state.
+    pub fn active_route(&self) -> Route {
+        if let Some(config) = &self.router {
+            if let Some(route) = super::model_router::select_route(config) {
+                return route;
+            }
+        }
+        Route {
+            id: "spark".to_string(),
+            provider: super::model_router::ProviderKind::Spark,
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            paid: false,
+            byok_approved: false,
+            key_env: None,
+        }
+    }
+
+    /// The full default router chain (P0-3), for settings screens
+    /// that list routes before the user stored anything.
+    pub fn default_router_routes() -> Vec<Route> {
+        default_routes()
     }
 
     /// Validate a model id: non-empty after trimming. The bridge never
@@ -123,6 +176,15 @@ impl CliSettings {
         if let Some(url) = base_url {
             value["base_url"] = serde_json::Value::String(url);
         }
+        // P0-3: the router object is written only when stored, so a
+        // file without a router stays a plain {"model": ...} file.
+        // The file never contains a key: a route carries only the env
+        // var NAME (key_env), never a value.
+        if let Some(router) = &self.router {
+            if let Ok(router_value) = serde_json::to_value(router) {
+                value["router"] = router_value;
+            }
+        }
         let text = match serde_json::to_string_pretty(&value) {
             Ok(text) => text,
             Err(e) => return Err(format!("Cannot serialize settings: {}", e)),
@@ -167,6 +229,7 @@ mod tests {
         let settings = CliSettings {
             model: "some/model:free".to_string(),
             base_url: None,
+            router: None,
         };
         settings.save(&dir).unwrap();
         assert_eq!(CliSettings::load(&dir), settings);
@@ -207,6 +270,7 @@ mod tests {
         let settings = CliSettings {
             model: "some/model:free".to_string(),
             base_url: Some("https://example.invalid/v1".to_string()),
+            router: None,
         };
         settings.save(&dir).unwrap();
         assert_eq!(CliSettings::load(&dir), settings);
@@ -232,6 +296,7 @@ mod tests {
             CliSettings {
                 model: "some/model:free".to_string(),
                 base_url: None,
+                router: None,
             }
         );
         std::fs::write(
@@ -269,6 +334,7 @@ mod tests {
         let settings = CliSettings {
             model: "some/model:free".to_string(),
             base_url: Some("   ".to_string()),
+            router: None,
         };
         settings.save(&dir).unwrap();
         let loaded = CliSettings::load(&dir);
@@ -276,6 +342,63 @@ mod tests {
         assert_eq!(loaded.model, "some/model:free");
         let text = std::fs::read_to_string(CliSettings::file_path(&dir)).unwrap();
         assert!(!text.contains("base_url"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P0-3: a stored router round-trips; the file carries the env var
+    // NAME (key_env) but never a key value.
+    #[test]
+    fn router_round_trips_and_file_has_no_key_value() {
+        let dir = tmpdir("router");
+        let mut config = RouterConfig::default();
+        config.preferred_route = Some("ollama".to_string());
+        let settings = CliSettings {
+            model: "some/model:free".to_string(),
+            base_url: None,
+            router: Some(config),
+        };
+        settings.save(&dir).unwrap();
+        let loaded = CliSettings::load(&dir);
+        assert_eq!(loaded, settings);
+        assert_eq!(loaded.active_route().id, "ollama");
+        let text = std::fs::read_to_string(CliSettings::file_path(&dir)).unwrap();
+        assert!(text.contains("\"router\""));
+        assert!(!text.to_lowercase().contains("api_key"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P0-3: an old file without "router" loads with router None, and
+    // the active route is the legacy implicit spark route.
+    #[test]
+    fn load_file_without_router_uses_legacy_route() {
+        let dir = tmpdir("norouter");
+        std::fs::write(
+            CliSettings::file_path(&dir),
+            "{\"model\":\"some/model:free\"}",
+        )
+        .unwrap();
+        let loaded = CliSettings::load(&dir);
+        assert_eq!(loaded.router, None);
+        let route = loaded.active_route();
+        assert_eq!(route.id, "spark");
+        assert_eq!(route.model, "some/model:free");
+        assert_eq!(route.cost_label(), "0 đồng");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P0-3: an invalid stored router loads as None instead of failing
+    // the session; the legacy route applies.
+    #[test]
+    fn load_invalid_router_falls_back_to_legacy() {
+        let dir = tmpdir("badrouter");
+        std::fs::write(
+            CliSettings::file_path(&dir),
+            "{\"model\":\"some/model:free\",\"router\":{\"routes\":[]}}",
+        )
+        .unwrap();
+        let loaded = CliSettings::load(&dir);
+        assert_eq!(loaded.router, None);
+        assert_eq!(loaded.active_route().id, "spark");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -61,6 +61,10 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { SessionManager } from "../../../../packages/core/src/session.ts";
 import { ChatSession, type ChatChannel } from "../chat/chat.ts";
 import {
+  getRouterSetting,
+  setRouterSetting,
+} from "../ipc/settings-client.ts";
+import {
   getTelegramStatus,
   sendTelegramMessage,
   startTelegramLoop,
@@ -204,8 +208,16 @@ async function bootChat(): Promise<void> {
   let ui: ChatUI | null = null;
   const chat = new ChatSession({
     makeContract,
+    // P0-3: the router client is the real settings backend; /model
+    // reads and switches the preferred route through it.
+    router: {
+      getRouter: (contract) => getRouterSetting(contract),
+      setPreferredRoute: (contract, routeId) =>
+        setRouterSetting(contract, { preferredRoute: routeId }),
+    },
     onTranscript: (entries) => ui?.render(entries),
     onBusy: (busy) => ui?.setBusy(busy),
+    onRouterStatus: (text) => ui?.setRouterStatus(text),
     sendTelegram: async (chatId, text) => {
       await sendTelegramMessage(
         makeContract("telegram", "telegram send"),
@@ -221,6 +233,8 @@ async function bootChat(): Promise<void> {
   chat.bind(app.sessionId);
   ui = startChatUI(root, chat);
   ui.setSession(app.sessionId);
+  ui.setRouterStatus("Model: đang kiểm tra…");
+  void chat.refreshRouterStatus();
   ui.setTelegramStatus("Telegram: đang kiểm tra…");
   try {
     const status = await getTelegramStatus(

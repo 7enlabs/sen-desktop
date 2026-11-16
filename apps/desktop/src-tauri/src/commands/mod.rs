@@ -14,6 +14,7 @@ pub mod cli_spawn;
 pub mod events;
 pub mod memory;
 pub mod memory_store;
+pub mod model_router;
 pub mod registry;
 pub mod session;
 pub mod settings;
