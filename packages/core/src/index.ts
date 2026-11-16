@@ -35,3 +35,33 @@ export type {
 export { TOKEN_ECONOMIZER_MAX_REDIRECT, TOKEN_ECONOMIZER_LONG_TURN_RATIO, shouldStopTurn } from "./token-economizer.ts";
 export type { TurnSignal } from "./token-economizer.ts";
 export { setRootDir, resolveUnderRoot } from "./paths.ts";
+export {
+  DECISION_MARKERS,
+  buildMorningBrief,
+  emailNeedsDecision,
+  renderMorningBriefText,
+  validateEmails,
+  validateEvents,
+} from "./morning-brief.ts";
+export type {
+  CalendarEvent,
+  DeadlineItem,
+  EmailItem,
+  MorningBrief,
+  BuildMorningBriefInput,
+  ScheduleConflict,
+} from "./morning-brief.ts";
+export {
+  applyDecision,
+  idempotencyKeyFor,
+  proposalIdForEmail,
+  proposeDecisions,
+  toolNameForAction,
+} from "./proactive-inbox.ts";
+export type {
+  ApplyDecisionInput,
+  ApplyDecisionResult,
+  DecisionAction,
+  DecisionProposal,
+  ProposalStatus,
+} from "./proactive-inbox.ts";
