@@ -81,7 +81,7 @@ jobs:
       - name: Install cargo-llvm-cov
         # Official install method from the cargo-llvm-cov docs: downloads
         # the prebuilt binary, no compile step, free (MIT/Apache-2.0).
-        uses: taiki-e/cargo-llvm-cov@v1
+        uses: taiki-e/cargo-llvm-cov@v0.9.1
       - name: Measure Tauri crate coverage
         # Runs the crate test suite under source-based coverage, prints
         # the summary table to the log, and writes lcov + text reports.
