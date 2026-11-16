@@ -21,7 +21,7 @@ pub const ERR_MEMORY_NOT_CONFIGURED: &str = "MEMORY_NOT_CONFIGURED";
 fn store<'a>(
     state: State<'a, Mutex<Option<MemoryStore>>>,
 ) -> Result<std::sync::MutexGuard<'a, Option<MemoryStore>>, String> {
-    state.lock().map_err(|e| e.to_string())
+    state.inner().lock().map_err(|e| e.to_string())
 }
 
 fn scope_of(value: &str) -> Result<Scope, String> {

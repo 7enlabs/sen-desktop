@@ -65,7 +65,7 @@ impl TelegramState {
 fn poller_or_fail<'a>(
     state: State<'a, Mutex<TelegramState>>,
 ) -> Result<std::sync::MutexGuard<'a, TelegramState>, String> {
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
+    let mut guard = state.inner().lock().map_err(|e| e.to_string())?;
     if guard.poller.is_none() {
         let client = TelegramClient::from_env()?.ok_or_else(|| {
             format!(
