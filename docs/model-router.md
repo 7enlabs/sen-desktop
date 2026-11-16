@@ -1,7 +1,7 @@
 # Sen P0-3 — Model router (BYOK + free/local routes)
 
-Status: PRODUCER BUNDLE, 16/11/2026. Independent verification by the
-seat (SD Leader review + PR) still pending. No merge, no push.
+Status: PRODUCER BUNDLE, 16/11/2026. Verification by a verifier
+other than the producer still pending. No merge, no push.
 
 ## OBSERVABLE_SUCCESS
 
@@ -153,15 +153,15 @@ non-retryable codes.
 | # | Command | Result |
 | --- | --- | --- |
 | 1 | `npm test` (baseline, before changes) | 102 pass, 0 fail |
-| 2 | `node --test apps/desktop/tests/model-router.test.ts` | 14 pass, 0 fail |
-| 3 | `npm test` (after changes) | 116 pass, 0 fail |
+| 2 | `node --test apps/desktop/tests/model-router.test.ts` | 15 pass, 0 fail |
+| 3 | `npm test` (after changes) | 117 pass, 0 fail |
 | 4 | `npm run build --prefix apps/desktop` | vite build green |
 | 5 | `cargo test --offline` in `/tmp/sen-rust-check` (pure modules) | 100 pass, 0 fail |
 | 6 | `rustfmt --edition 2021 --check` on the 8 touched Rust files | clean |
 
 ### 4. EVIDENCE
 
-- TS suite: 116 pass / 0 fail (102 baseline + 14 new in
+- TS suite: 117 pass / 0 fail (102 baseline + 15 new in
   `apps/desktop/tests/model-router.test.ts`).
 - Rust pure-module harness (`/tmp/sen-rust-check`, same module
   sources copied from the worktree, deps serde 1.0.229 /
@@ -200,13 +200,13 @@ non-retryable codes.
   Spark): no live call was made; the fallback path is proven only
   against fake `zen` binaries in the Rust tests.
 - Independent verification (producer ≠ verifier): this bundle is
-  the producer's work; the seat verifies independently.
+  the producer's work; a verifier other than the producer checks it.
 
 ## Handoff
 
 | Check | Verdict | Evidence |
 | --- | --- | --- |
-| `npm test` (TS, incl. 14 new) | PASS | 116 pass / 0 fail |
+| `npm test` (TS, incl. 15 new) | PASS | 117 pass / 0 fail |
 | `npm run build --prefix apps/desktop` | PASS | vite build green, 21.41 kB js |
 | Rust pure modules (`cargo test`, scratch harness) | PASS | 100 pass / 0 fail |
 | `rustfmt --check` (8 touched Rust files) | PASS | clean |

@@ -11,6 +11,10 @@ import the Pi SDK.
 - `execution-gate.ts`: the single 6-step execution gate in fixed order
   (protect, lock check, irreversible-and-consent check, execute,
   post-check, record).
+- `approval-gate.ts` (Sen P0-2): the 3-tier approval gate (auto /
+  ask-first / never) + default-deny tool policy + append-only
+  activity log + approval store. Rust mirror:
+  `apps/desktop/src-tauri/src/commands/approval_gate.rs`.
 - `token-economizer.ts`: the point-856 stop-turn rule (at most 1 redirect,
   long-turn ratio 2.5).
 - `paths.ts`: the single path variable; no path joining by string.
@@ -20,8 +24,9 @@ import the Pi SDK.
 ## Status
 
 - Real logic: statechart table, gate order + order check, stop-turn judge
-  function, path variable. Covered by `tests/logic.test.ts` (6 tests,
-  run green with node).
+  function, path variable, approval gate (3 tiers, default-deny policy,
+  append-only activity log). Covered by `tests/logic.test.ts` (6 tests,
+  run green with node) and `apps/desktop/tests/approval-gate.test.ts`.
 - Still stubs: the real createAgentSession import, the real gate steps,
   the real detection function. Verified in the install round:
   createAgentSession is exported by pi-coding-agent, not by pi-agent-core;
