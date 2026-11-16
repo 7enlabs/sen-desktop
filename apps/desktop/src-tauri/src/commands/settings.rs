@@ -13,6 +13,10 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
 use super::cli_settings::CliSettings;
+use super::model_router::{
+    key_env_present, resolve_attempt_order, validate_router_config, ProviderKind, Route,
+    RouterConfig,
+};
 use super::registry::{validate_contract, Registry};
 use super::session::ContractArgs;
 
@@ -134,4 +138,115 @@ pub fn sen_settings_set_base_url(
         registry.set_settings_dir(dir);
     }
     Ok(BaseUrlSettingResult { base_url })
+}
+
+/// P0-3: the model-router settings (routes, preference, fallback,
+/// BYOK approval) as the frontend sees them. `byok_key_present` is a
+/// boolean only: true when a BYOK route's named env var is set and
+/// non-empty. No key value ever travels in either direction.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouterSettingResult {
+    pub routes: Vec<Route>,
+    pub preferred_route: Option<String>,
+    pub fallback_enabled: bool,
+    pub byok_approved: bool,
+    pub byok_key_present: bool,
+    pub active_route_id: String,
+}
+
+fn router_result(config: &RouterConfig) -> RouterSettingResult {
+    let byok_key_present = config.routes.iter().any(|route| {
+        route.provider == ProviderKind::Byok
+            && route
+                .key_env
+                .as_ref()
+                .map(|env| key_env_present(env))
+                .unwrap_or(false)
+    });
+    let active_route_id = resolve_attempt_order(config)
+        .into_iter()
+        .next()
+        .map(|route| route.id)
+        .unwrap_or_else(|| "spark".to_string());
+    RouterSettingResult {
+        routes: config.routes.clone(),
+        preferred_route: config.preferred_route.clone(),
+        fallback_enabled: config.fallback_enabled,
+        byok_approved: config.byok_approved,
+        byok_key_present,
+        active_route_id,
+    }
+}
+
+/// sen_settings_get_router: the stored router, or the default chain
+/// when nothing is stored. Never fails for a missing file: the
+/// default chain applies.
+#[tauri::command]
+pub fn sen_settings_get_router(
+    app: AppHandle,
+    contract: ContractArgs,
+) -> Result<RouterSettingResult, String> {
+    validate_contract(&contract.to_registry()).map_err(|e| e.to_wire())?;
+    let config = match settings_dir(&app) {
+        Some(dir) => CliSettings::load(&dir).router.unwrap_or_default(),
+        None => RouterConfig::default(),
+    };
+    Ok(router_result(&config))
+}
+
+/// Partial router update: only the fields present in `args` change.
+/// A supplied `routes` replaces the whole chain. The merged config
+/// is validated before anything is stored: a paid route or a BYOK
+/// route without approval is refused, never stored.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRouterArgs {
+    pub preferred_route: Option<Option<String>>,
+    pub fallback_enabled: Option<bool>,
+    pub byok_approved: Option<bool>,
+    pub routes: Option<Vec<Route>>,
+}
+
+/// sen_settings_set_router: store a router change for later turns.
+/// A running session keeps the route it started with; the new chain
+/// applies to sessions created after the change (and to fallback
+/// swaps, which read the stored chain). Refuses an invalid merged
+/// config.
+#[tauri::command]
+pub fn sen_settings_set_router(
+    app: AppHandle,
+    state: State<'_, Mutex<Registry>>,
+    args: SetRouterArgs,
+    contract: ContractArgs,
+) -> Result<RouterSettingResult, String> {
+    validate_contract(&contract.to_registry()).map_err(|e| e.to_wire())?;
+    let dir = settings_dir(&app)
+        .ok_or_else(|| "INVALID_CONTRACT: app config dir is not available, FAIL".to_string())?;
+    let mut settings = CliSettings::load(&dir);
+    let mut config = settings.router.clone().unwrap_or_default();
+    if let Some(preferred) = args.preferred_route {
+        config.preferred_route = preferred.filter(|p| !p.trim().is_empty());
+    }
+    if let Some(fallback) = args.fallback_enabled {
+        config.fallback_enabled = fallback;
+    }
+    if let Some(approved) = args.byok_approved {
+        config.byok_approved = approved;
+    }
+    if let Some(routes) = args.routes {
+        config.routes = routes;
+    }
+    let errors = validate_router_config(&config);
+    if !errors.is_empty() {
+        return Err(format!("INVALID_CONTRACT: {}", errors.join("; ")));
+    }
+    settings.router = Some(config.clone());
+    settings
+        .save(&dir)
+        .map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
+    if let Ok(mut registry) = state.lock() {
+        registry.set_settings_dir(dir);
+    }
+    Ok(router_result(&config))
 }

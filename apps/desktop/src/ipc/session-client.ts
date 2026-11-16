@@ -44,6 +44,11 @@ export interface BackendSessionResult {
   // ran: create/abort). The backend always sends both numbers.
   unknownRecords: number;
   versionMismatches: number;
+  // P0-3: the router route that ran the last turn (or the session's
+  // route when no turn ran) and its cost label. Optional so a backend
+  // from before P0-3 still validates.
+  routeId?: string;
+  cost?: string;
 }
 
 export interface BackendSubscribeResult {
@@ -63,7 +68,9 @@ function asSessionResult(value: unknown, expectedId: string): BackendSessionResu
     typeof res.sessionId !== "string" ||
     typeof res.state !== "string" ||
     typeof res.unknownRecords !== "number" ||
-    typeof res.versionMismatches !== "number"
+    typeof res.versionMismatches !== "number" ||
+    (res.routeId !== undefined && typeof res.routeId !== "string") ||
+    (res.cost !== undefined && typeof res.cost !== "string")
   ) {
     throw new Error(
       "Backend session result malformed, FAIL: " + JSON.stringify(value),

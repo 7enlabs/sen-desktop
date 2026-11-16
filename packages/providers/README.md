@@ -15,6 +15,16 @@ Pi version lock and model channel declarations for Sen Desktop.
 STUB. ModelRuntime is not filled in. No SDK import here: only
 packages/core may import the SDK.
 
+## Model router (Sen P0-3)
+
+`src/router.ts` is real, tested logic (see `docs/model-router.md`):
+the router picks a (provider, model, base URL) route for each agent
+chat turn from the free-only chain spark → openrouter-free → ollama,
+with BYOK only on explicit user approval and a paid route never
+usable. It holds no key and makes no network call; the model call
+itself still runs through the CLI bridge. The Rust mirror lives in
+`apps/desktop/src-tauri/src/commands/model_router.rs`.
+
 ## Package scope note
 
 The `@sen/providers` name is a PROPOSAL pending SD Leader confirmation at

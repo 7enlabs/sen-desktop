@@ -8,6 +8,26 @@
 // section 3 point 4.
 export const PINNED_PI_VERSION = "1.5.0";
 
+export {
+  OPENROUTER_BASE_URL,
+  OLLAMA_BASE_URL,
+  FREE_DEFAULT_MODEL,
+  OLLAMA_DEFAULT_MODEL,
+  MAX_ATTEMPTS,
+  defaultRoutes,
+  defaultRouterConfig,
+  describeRoute,
+  errorCodeOf,
+  isRetryableErrorCode,
+  isRouteUsable,
+  nextRoute,
+  resolveAttemptOrder,
+  routeCostLabel,
+  selectRoute,
+  validateRouterConfig,
+} from "./router.ts";
+export type { ProviderKind, Route, RouterConfig } from "./router.ts";
+
 export interface ModelRuntime {
   pinnedPiVersion: string;
 }
