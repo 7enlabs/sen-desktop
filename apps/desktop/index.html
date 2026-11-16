@@ -1,15 +1,31 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="vi">
 <head>
 <meta charset="utf-8">
 <title>Sen Desktop</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; color: #1a1a1a; background: #fff; }
+  #app { display: flex; flex-direction: column; height: 100%; max-width: 800px; margin: 0 auto; }
+  header { padding: 12px 16px; border-bottom: 1px solid #e0e0e0; }
+  header h1 { margin: 0; font-size: 20px; }
+  header .status { margin-top: 4px; font-size: 12px; color: #666; display: flex; gap: 16px; flex-wrap: wrap; }
+  .messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 80%; padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: #e3f0ff; }
+  .msg.assistant { align-self: flex-start; background: #f2f2f2; }
+  .msg.system { align-self: center; background: none; color: #666; font-size: 13px; max-width: 100%; }
+  .msg .channel { display: block; font-size: 11px; color: #666; margin-bottom: 2px; }
+  .typing { padding: 0 16px 8px; font-size: 13px; color: #666; }
+  .composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #e0e0e0; }
+  .composer input { flex: 1; padding: 8px 12px; font-size: 15px; border: 1px solid #ccc; border-radius: 8px; }
+  .composer button { padding: 8px 16px; font-size: 15px; border: 1px solid #ccc; border-radius: 8px; background: #f2f2f2; cursor: pointer; }
+</style>
 </head>
 <body>
-<!-- STUB - UI shell NOT FILLED IN YET. No fake content. -->
-<!-- Vite entry (bundler round, tin 9313): this file lives at the Vite root
-     (apps/desktop/), so Vite serves it at / and bundles it to dist/.
-     It used to live at src/app/index.html and load ./main.ts directly,
-     which no bundler can serve; the module itself is unchanged. -->
+<!-- Chat shell (P0-1): the UI is built by src/app/chat-ui.ts into #app.
+     The message list starts empty: no fake content, no placeholder. -->
 <div id="app"></div>
 <script type="module" src="/src/app/main.ts"></script>
 </body>
