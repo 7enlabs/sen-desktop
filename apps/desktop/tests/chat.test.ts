@@ -379,13 +379,43 @@ test("chat: a failed steer becomes a system entry, and Telegram gets the error t
   assert.equal(last.text.includes("boom"), true);
 });
 
-test("chat: an is_error result is the model's answer, not a system entry", async () => {
+test("chat: an is_error result becomes a system entry, never an assistant reply", async () => {
   const h = makeChat();
   h.fail.errorResult = true;
   await h.chat.send("desktop", "hi");
   assert.deepEqual(view(h.chat.getTranscript()), [
     { role: "user", channel: "desktop", text: "hi" },
-    { role: "assistant", channel: "desktop", text: "HTTP 401: bad key" },
+    {
+      role: "system",
+      channel: "desktop",
+      text: "Sen gặp lỗi: HTTP 401: bad key",
+    },
+  ]);
+  // The error text is not logged as an assistant line in the daily
+  // log: only the user line was logged.
+  assert.deepEqual(
+    h.memory.logs.map((entry) => entry.kind),
+    ["user"],
+  );
+});
+
+test("chat: an is_error Telegram turn reports the error, never sends it as a reply", async () => {
+  const h = makeChat();
+  h.fail.errorResult = true;
+  await h.chat.send("telegram", "hi", 100);
+  assert.deepEqual(view(h.chat.getTranscript()), [
+    { role: "user", channel: "telegram", telegramChatId: 100, text: "hi" },
+    {
+      role: "system",
+      channel: "telegram",
+      telegramChatId: 100,
+      text: "Sen gặp lỗi: HTTP 401: bad key",
+    },
+  ]);
+  // Telegram gets the labelled error notice, not the raw error text
+  // as if it were the model's reply.
+  assert.deepEqual(h.sent, [
+    { chatId: 100, text: "Sen gặp lỗi: HTTP 401: bad key" },
   ]);
 });
 
