@@ -157,8 +157,10 @@ pub fn sen_session_create(
 /// through the `emit` callback while the turn runs; a failed emit never
 /// fails the turn (the event is already recorded in the turn result).
 /// When step 1 reports Duplicate (BUG-10, #25: this exact steer already
-/// completed on the session), the recorded result is returned at once:
-/// no model call runs, no log entry is pushed, no event is emitted.
+/// completed on the session), the recorded result is returned at once
+/// and the cached result event is replayed (CI P2-2), so a caller
+/// waiting for that event resolves instead of timing out: no model
+/// call runs, no log entry is pushed.
 /// When step 1 reports InFlight (BUG-10 extra, tin 9645/9650: the same
 /// steer is already running on the session), the steer is refused with
 /// DUPLICATE_STEER: there is no recorded result to replay yet, so no
@@ -197,6 +199,15 @@ fn run_steer_turn(
             // R2B-04: the recorded turn carries its counts, so a
             // replayed steer reports the same numbers as the turn
             // that originally ran.
+            // CI P2-2: replay the cached result event before
+            // returning the ack. The caller (chat.ts) arms its waiter
+            // before invoking, so without this event it waits the full
+            // timeout and reports "Sen không trả lời được" even though
+            // the steer already completed. Best effort, like the live
+            // path: a gone listener must not fail the replay. No model
+            // call runs, no log entry is pushed, and the idempotency
+            // record is untouched.
+            let _ = app.emit(SEN_SESSION_EVENT, &turn.result_event());
             let (route_id, cost) = match state.lock() {
                 Ok(registry) => route_cost(&registry, session_id),
                 Err(_) => ("spark".to_string(), "0 đồng".to_string()),

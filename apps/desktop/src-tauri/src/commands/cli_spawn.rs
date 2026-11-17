@@ -37,7 +37,9 @@
 //   After the read loop ends (EOF) the turn waits for the child only up
 //   to the 180s process-kill backstop (PROCESS_KILL_BACKSTOP, R2B-06),
 //   then kills it, so a CLI that closed stdout but stays alive cannot
-//   hang the turn forever. The IPC contract
+//   hang the turn forever — and the wait is additionally bounded by
+//   the time left on the turn deadline (P2-B), so the whole turn
+//   never runs past it. The IPC contract
 //   timeout_ms is the per-turn deadline, capped at the 120s turn
 //   timeout: the effective deadline is min(timeout_ms, 120s) (BUG-11
 //   fix). A turn never runs longer than 120s, and a shorter contract
@@ -230,6 +232,27 @@ pub struct TurnResult {
     pub records_seen: u64,
     pub unknown_records: u64,
     pub version_mismatches: u64,
+}
+
+impl TurnResult {
+    /// Rebuild the Result event this turn emitted live (CI P2-2). A
+    /// cached TurnResult carries every field of the Result event
+    /// (session, subtype, error flag, text, turns, usage, duration,
+    /// model), so a Duplicate replay can re-deliver an event identical
+    /// to the first delivery — no field is invented, and no
+    /// intermediate event (SessionStart, Message) is replayed.
+    pub fn result_event(&self) -> SenEvent {
+        SenEvent::Result {
+            session_id: self.session_id.clone(),
+            subtype: self.subtype.clone(),
+            is_error: self.is_error,
+            text: self.text.clone(),
+            num_turns: self.num_turns,
+            usage: self.usage.clone(),
+            duration_ms: self.duration_ms,
+            model: self.model.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -683,7 +706,7 @@ impl CliBridge {
         // taken it already; then the exit code is unknown to this path.
         // Rust P1-2: take the child out of the slot and drop the lock
         // BEFORE waiting for it. Holding `child_slot` across the wait
-        // (up to 180s in `wait_child_after_eof`) blocked `abort()`,
+        // (up to the backstop in `wait_child_after_eof`) blocked `abort()`,
         // which needs the same lock to reach the child — exactly when
         // abort exists to be used. Only the `Child` is kept, never
         // the lock, on both wait paths below.
@@ -701,8 +724,9 @@ impl CliBridge {
             // loop is bounded on both paths. With a result record
             // in hand, poll for a quick exit up to RESULT_EXIT_GRACE
             // (500ms, keeps the real exit code), then SIGKILL and
-            // reap. Without a result record, go through the 180s
-            // process-kill backstop (wait_child_after_eof) — never
+            // reap. Without a result record, go through the
+            // process-kill backstop (wait_child_after_eof), bounded
+            // by the time left on the turn deadline (P2-B) — never
             // an unbounded child.wait(), or R2B-06 would lose its
             // effect exactly in the lingering-child case R2B-09
             // fixes.
@@ -732,7 +756,7 @@ impl CliBridge {
                         }
                     }
                 } else {
-                    self.wait_child_after_eof(&mut child)
+                    self.wait_child_after_eof(&mut child, deadline)
                 }
             }
             None => None,
@@ -815,19 +839,34 @@ impl CliBridge {
     }
 
     /// Wait for the child after the read loop ended (EOF), bounded by
-    /// the process-kill backstop (R2B-06): a CLI that closed stdout but
-    /// stays alive must not hang the turn forever on `child.wait()`.
-    /// Polls `try_wait()` every 50ms (same cadence as the abort poll);
-    /// a child that already exited returns at once with no waiting.
-    /// Past the deadline the child is SIGKILLed and reaped, and the
-    /// turn keeps the result record it already has. An abort requested
-    /// while waiting is noticed within one poll (P1-2): the turn owns
-    /// the child now, so abort() signals through the aborted flag and
-    /// the wait kills the child at once. Returns the exit code, or None
-    /// when the child was killed (signal death has no code) or the code
-    /// is unknown.
-    fn wait_child_after_eof(&self, child: &mut Child) -> Option<i32> {
-        let deadline = std::time::Instant::now() + self.process_kill_backstop;
+    /// the process-kill backstop (R2B-06) AND by the time left on the
+    /// turn deadline (P2-B), whichever is sooner: a CLI that closed
+    /// stdout but stays alive must not hang the turn forever on
+    /// `child.wait()`, and must not stretch the turn past the
+    /// deadline the turn promised (min(contract timeout, 120s)).
+    /// Before P2-B the wait used the backstop alone, so a turn could
+    /// run to ~300s (120s of output + 180s of waiting) — past the
+    /// frontend's 120s invoke timeout and 130s result waiter, with
+    /// the next turn failing as CLI_TURN_IN_PROGRESS until the
+    /// lingering turn finally ended. Polls `try_wait()` every 50ms
+    /// (same cadence as the abort poll); a child that already exited
+    /// returns at once with no waiting. Past the deadline the child
+    /// is SIGKILLed and reaped, and the turn fails as CLI_NO_RESULT
+    /// with the exit code (or lack of one) recorded. An abort
+    /// requested while waiting is noticed within one poll (P1-2):
+    /// the turn owns the child now, so abort() signals through the
+    /// aborted flag and the wait kills the child at once. Returns
+    /// the exit code, or None when the child was killed (signal death
+    /// has no code) or the code is unknown.
+    fn wait_child_after_eof(
+        &self,
+        child: &mut Child,
+        turn_deadline: std::time::Instant,
+    ) -> Option<i32> {
+        let deadline = std::cmp::min(
+            turn_deadline,
+            std::time::Instant::now() + self.process_kill_backstop,
+        );
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => return status.code(),
@@ -1138,6 +1177,42 @@ exit 0"#;
         assert!(matches!(events[0], SenEvent::SessionStart { .. }));
         assert!(matches!(events[1], SenEvent::Message { .. }));
         assert!(matches!(events[2], SenEvent::Result { .. }));
+    }
+
+    // CI P2-2: a cached TurnResult must rebuild the exact Result event
+    // the live turn emitted, so a Duplicate replay can re-deliver it
+    // to a caller waiting on the event (chat.ts armResultWaiter).
+    #[test]
+    fn turn_result_replays_as_identical_result_event() {
+        let (result, events) = run_collect(fake_zen("replay", HAPPY_BODY), "steer", "hi");
+        let result = result.unwrap();
+        let replayed = result.result_event();
+        // Byte-identical to the Result event the live turn emitted.
+        assert_eq!(replayed, events[2]);
+        if let SenEvent::Result {
+            session_id,
+            subtype,
+            is_error,
+            text,
+            num_turns,
+            usage,
+            duration_ms,
+            model,
+        } = &replayed
+        {
+            assert_eq!(session_id, "s1");
+            assert_eq!(subtype, "success");
+            assert!(!is_error);
+            assert_eq!(text, "hello");
+            assert_eq!(*num_turns, 1);
+            assert_eq!(usage.input_tokens, 3);
+            assert_eq!(usage.output_tokens, 2);
+            assert_eq!(usage.cache_read_input_tokens, 0);
+            assert_eq!(*duration_ms, 7);
+            assert_eq!(model, "m:free");
+        } else {
+            panic!("replayed event must be a Result event");
+        }
     }
 
     #[test]
@@ -1576,6 +1651,67 @@ sleep 30"#;
         // refusing with CLI_TURN_IN_PROGRESS.
         let second = bridge.run_turn("follow_up", "again", &mut emit);
         assert!(second.is_ok() || second.unwrap_err().code != ERR_CLI_TURN_IN_PROGRESS);
+    }
+
+    #[test]
+    fn eof_lingering_child_is_bounded_by_turn_deadline() {
+        // P2-B: a CLI that closes stdout but stays alive, with no
+        // result record, must end the turn at the turn deadline — not
+        // after the 180s process-kill backstop. The fake prints init,
+        // closes stdout at once, then lingers 30s. With a 300ms turn
+        // timeout and a 5s test backstop the turn must fail as
+        // CLI_NO_RESULT (the real error: output ended with no result)
+        // in well under 2s. Before the fix the turn waited out the
+        // whole 5s backstop, so the elapsed assertion fails.
+        let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
+exec 1>&-
+sleep 30"#;
+        let bin = fake_zen("eof_linger_nodeadline", body);
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None)
+            .with_turn_timeout(Duration::from_millis(300))
+            .with_process_kill_backstop(Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        let mut emit = |_ev: SenEvent| {};
+        let err = bridge.run_turn("steer", "hi", &mut emit).unwrap_err();
+        assert_eq!(err.code, ERR_CLI_NO_RESULT);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "turn took {:?} with a 300ms deadline and a 5s backstop: the EOF wait ignored the turn deadline",
+            started.elapsed()
+        );
+        // The handle is not stuck: a second turn proceeds instead of
+        // refusing with CLI_TURN_IN_PROGRESS.
+        let second = bridge.run_turn("follow_up", "again", &mut emit);
+        assert!(second.is_ok() || second.unwrap_err().code != ERR_CLI_TURN_IN_PROGRESS);
+    }
+
+    #[test]
+    fn eof_near_deadline_does_not_extend_turn_past_deadline() {
+        // P2-B worst case: the CLI dribbles output until just before
+        // the turn deadline, then closes stdout and lingers. The
+        // backstop wait after EOF must be bounded by the time left on
+        // the turn deadline, so the turn still ends at ~1s, not at
+        // 200ms of output + the whole 5s backstop. Before the fix the
+        // turn took ~5.2s, so the elapsed assertion fails. The 1s
+        // deadline (vs 200ms of output) leaves a wide margin for a
+        // slow spawn, so the test does not depend on scheduling luck.
+        let body = r#"echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
+sleep 0.2
+exec 1>&-
+sleep 30"#;
+        let bin = fake_zen("eof_linger_late", body);
+        let bridge = CliBridge::new(Some(bin), "s1", "m:free", None)
+            .with_turn_timeout(Duration::from_secs(1))
+            .with_process_kill_backstop(Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        let mut emit = |_ev: SenEvent| {};
+        let err = bridge.run_turn("steer", "hi", &mut emit).unwrap_err();
+        assert_eq!(err.code, ERR_CLI_NO_RESULT);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "turn took {:?} with a 1s deadline and a 5s backstop: the EOF wait extended the turn past its deadline",
+            started.elapsed()
+        );
     }
 
     #[test]
