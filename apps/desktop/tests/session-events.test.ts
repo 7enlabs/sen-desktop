@@ -11,6 +11,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import type { Event } from "@tauri-apps/api/event";
 import {
   listenSessionEvents,
   setEventListen,
@@ -24,10 +25,10 @@ type SendFn = (payload: unknown) => void;
 // Captures the subscribed handler so the test can send payloads through
 // it like the Tauri backend would.
 function fakeListen(captured: { send?: SendFn }): EventListen {
-  return async (event, handler) => {
+  return async <T>(event: string, handler: (e: Event<T>) => void) => {
     assert.equal(event, SEN_SESSION_EVENT);
     captured.send = (payload: unknown) => {
-      handler({ payload, event, id: 1 });
+      handler({ payload, event, id: 1 } as Event<T>);
     };
     let unlistened = false;
     return () => {

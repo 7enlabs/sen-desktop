@@ -34,6 +34,17 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Typecheck frontend + core
+        # tsc --noEmit over the workspace tsconfig. vite build alone
+        # does NOT typecheck (esbuild only strips types), and node
+        # --test erases type-only imports without resolving them, so
+        # without this step a type error or a wrong import path merges
+        # green. See CI P1-1 (bug hunt 2026-11-17).
+        run: pnpm typecheck
+      - name: Build frontend
+        # vite build must pass too: a broken vite.config.ts or a
+        # failed bundle is invisible to node --test.
+        run: pnpm build
       - name: Run node test suite
         # Root script "test" runs every suite (packages/core plus
         # apps/desktop, 7 files); the test:* scripts are subsets for
