@@ -335,8 +335,10 @@ impl SteerKey {
 /// What begin_steer hands back (BUG-10, #25). Run means the turn must
 /// still execute on the bridge; Duplicate means this exact steer already
 /// completed on this session, and the caller returns the recorded turn
-/// result without running the model, pushing a log entry, or emitting
-/// events. InFlight (BUG-10 extra, tin 9645/9650) means the same steer
+/// result without running the model or pushing a log entry, replaying
+/// the cached result event (CI P2-2) so a caller waiting for it
+/// resolves instead of timing out. InFlight (BUG-10 extra, tin
+/// 9645/9650) means the same steer
 /// is ALREADY RUNNING on this session right now: there is no recorded
 /// result to replay yet, so the caller refuses it outright
 /// (DUPLICATE_STEER) instead of starting a second model call for the
@@ -728,8 +730,9 @@ impl Registry {
     /// Run a whole turn in one call (tests only): begin, turn, complete.
     /// Production wrappers use the three steps separately so the turn
     /// runs without the registry lock held. Events go to `emit`. A
-    /// duplicate steer returns the recorded result with no turn run and
-    /// no events (BUG-10, #25); a steer already running elsewhere is
+    /// duplicate steer returns the recorded result with no turn run,
+    /// replaying exactly the cached Result event and nothing else
+    /// (CI P2-2; BUG-10, #25); a steer already running elsewhere is
     /// refused (BUG-10 extra, tin 9645/9650); a failed turn releases
     /// its in-flight key, so the retry still executes.
     #[cfg(test)]
@@ -742,7 +745,13 @@ impl Registry {
         emit: &mut dyn FnMut(SenEvent),
     ) -> Result<SessionState, CommandError> {
         match self.begin_steer(session_id, contract, kind, text)? {
-            SteerStart::Duplicate { state, .. } => Ok(state),
+            SteerStart::Duplicate { state, turn } => {
+                // CI P2-2: mirror of run_steer_turn — replay the
+                // cached Result event so a caller waiting for it
+                // resolves. No model run, no log entry, no other event.
+                emit(turn.result_event());
+                Ok(state)
+            }
             SteerStart::InFlight { .. } => Err(CommandError::new(
                 ERR_DUPLICATE_STEER,
                 "Steer already running on this session, refused",
@@ -1214,20 +1223,24 @@ exit 1"#;
     }
 
     // BUG-10 (#25): a second steer with the same key + contract + text
-    // replays the recorded result: no model run (no events), no extra
-    // log entry, and begin_steer reports the recorded turn itself.
+    // replays the recorded result: no model run, no extra log entry,
+    // and begin_steer reports the recorded turn itself.
+    // CI P2-2: the replay re-emits exactly the cached Result event
+    // (identical to the live turn's), so a caller waiting for it
+    // (chat.ts armResultWaiter) resolves instead of timing out after
+    // 130s. Nothing else is re-emitted: no SessionStart, no Message.
     #[test]
     fn steer_duplicate_key_replays_without_rerunning() {
         let mut reg = Registry::new();
         reg.set_zen_bin(fake_zen("dup", HAPPY_BODY));
         reg.create("s1", &contract()).unwrap();
-        let mut events: Vec<SenEvent> = Vec::new();
-        let mut emit = |ev: SenEvent| events.push(ev);
+        let mut first_events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| first_events.push(ev);
         assert_eq!(
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
             Ok(SessionState::Running)
         );
-        assert_eq!(events.len(), 3);
+        assert_eq!(first_events.len(), 3);
         assert_eq!(reg.get("s1").unwrap().log.len(), 2);
         let mut events: Vec<SenEvent> = Vec::new();
         let mut emit = |ev: SenEvent| events.push(ev);
@@ -1235,7 +1248,11 @@ exit 1"#;
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
             Ok(SessionState::Running)
         );
-        assert_eq!(events.len(), 0, "duplicate steer must emit no events");
+        assert_eq!(events.len(), 1, "duplicate steer must replay one event");
+        assert_eq!(
+            events[0], first_events[2],
+            "replayed event must be identical to the live Result event"
+        );
         assert_eq!(
             reg.get("s1").unwrap().log.len(),
             2,
@@ -1313,19 +1330,19 @@ exit 1; fi"#,
         // Steer 2, same key + contract + text: must run the model
         // again (events emitted, fake binary ran a second time and
         // returned the happy result), not replay the error.
-        let mut events: Vec<SenEvent> = Vec::new();
-        let mut emit = |ev: SenEvent| events.push(ev);
+        let mut retry_events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| retry_events.push(ev);
         assert_eq!(
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
             Ok(SessionState::Running)
         );
         assert_eq!(
-            events.len(),
+            retry_events.len(),
             3,
             "retry after an error turn must run the model"
         );
         assert!(matches!(
-            events[2],
+            retry_events[2],
             SenEvent::Result {
                 is_error: false,
                 ..
@@ -1334,14 +1351,19 @@ exit 1; fi"#,
         assert!(marker.exists(), "fake binary must have run a second time");
         assert_eq!(reg.get("s1").unwrap().log.len(), 3);
         // The successful retry IS cached: a third identical steer
-        // replays it (BUG-10 behaviour, unchanged).
+        // replays it (BUG-10 behaviour, unchanged) — CI P2-2: as one
+        // replayed Result event identical to the retry's, not silence.
         let mut events: Vec<SenEvent> = Vec::new();
         let mut emit = |ev: SenEvent| events.push(ev);
         assert_eq!(
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
             Ok(SessionState::Running)
         );
-        assert_eq!(events.len(), 0, "success turn must still be cached");
+        assert_eq!(events.len(), 1, "success turn must still be cached");
+        assert_eq!(
+            events[0], retry_events[2],
+            "replayed event must be identical to the live Result event"
+        );
         let _ = std::fs::remove_file(&marker);
     }
 
@@ -1606,14 +1628,14 @@ exit 0; else touch '{marker}'; exit 1; fi"#,
         // The first steer succeeds through the fallback (the failed
         // first attempt emitted no events; the retry ran the happy
         // turn), and the successful turn IS recorded: a second
-        // identical steer replays it with no events.
-        let mut events: Vec<SenEvent> = Vec::new();
-        let mut emit = |ev: SenEvent| events.push(ev);
+        // identical steer replays it as one Result event (CI P2-2).
+        let mut first_events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| first_events.push(ev);
         assert_eq!(
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
             Ok(SessionState::Running)
         );
-        assert_eq!(events.len(), 3, "fallback retry must run the model");
+        assert_eq!(first_events.len(), 3, "fallback retry must run the model");
         assert_eq!(reg.route_id("s1").as_deref(), Some("openrouter-free"));
         assert_eq!(reg.get("s1").unwrap().log.len(), 2);
         let mut events: Vec<SenEvent> = Vec::new();
@@ -1622,7 +1644,11 @@ exit 0; else touch '{marker}'; exit 1; fi"#,
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
             Ok(SessionState::Running)
         );
-        assert_eq!(events.len(), 0, "success turn must still be cached");
+        assert_eq!(events.len(), 1, "success turn must still be cached");
+        assert_eq!(
+            events[0], first_events[2],
+            "replayed event must be identical to the live Result event"
+        );
         let _ = std::fs::remove_file(&marker);
     }
 
