@@ -796,7 +796,10 @@ export async function executeMcpTool(
 export interface CliDelegateInput {
   /** Path to the zen binary (default "zen" on PATH). */
   zenBin?: string;
-  /** Session id for --session-id / -r; a fresh id when absent. */
+  /** Session id for --session-id / -r; a fresh bare UUID when absent.
+   * A caller-supplied id must be a valid UUID: the CLI parses
+   * --session-id with Uuid::parse_str and rejects anything else
+   * (exit 4, "must be a valid UUID"). */
   sessionId?: string;
   /** Resume an existing CLI session instead of starting one. */
   resume?: boolean;
@@ -889,6 +892,21 @@ interface StreamJsonLine {
 }
 
 /**
+ * True when `value` is a UUID the CLI accepts for --session-id:
+ * the hyphenated form `randomUUID()` produces, or the 32-hex simple
+ * form. Mirrors the CLI's `Uuid::parse_str` (zen-cli cli.rs
+ * `parse_session_uuid`): anything else is rejected at parse time
+ * with exit 4 ("must be a valid UUID").
+ */
+export function isValidUuid(value: string): boolean {
+  return (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    ) || /^[0-9a-f]{32}$/i.test(value)
+  );
+}
+
+/**
  * Delegate one MCP tool call to the ZenCore CLI core: write the
  * server config to a temp file, run `zen -p --output-format
  * stream-json --bare --setting-sources "" --mcp-config <file>`
@@ -914,7 +932,15 @@ export async function delegateToolCallToCliCore(
   if (!input.tool.trim()) {
     throw new Error("MCP_VALIDATION: tool must be non-empty");
   }
-  const sessionId = input.sessionId ?? `sen-mcp-${randomUUID()}`;
+  // The CLI parses --session-id with Uuid::parse_str and rejects
+  // anything that is not a UUID (exit 4). The default is therefore
+  // a bare randomUUID(), and a caller-supplied id is validated here,
+  // before any spawn, so a bad id fails fast instead of failing the
+  // turn after the CLI has started (P0-1).
+  const sessionId = input.sessionId ?? randomUUID();
+  if (!isValidUuid(sessionId)) {
+    throw new Error("MCP_VALIDATION: sessionId must be a valid UUID");
+  }
   const timeoutMs = input.timeoutMs ?? MCP_DELEGATE_TIMEOUT_MS;
   const { dir, path } = writeMcpConfigFile(
     input.serverName,
