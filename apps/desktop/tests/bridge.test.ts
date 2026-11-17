@@ -274,3 +274,74 @@ test("session-client unsubscribe (BUG-09): returns remaining count, mismatch ref
   await assert.rejects(() => unsubscribeSession(contract(), "s1"), /malformed/);
   setBridgeTransport(null);
 });
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// P1-2: invoke() must enforce contract.timeoutMs. A transport that
+// never settles used to hang the caller forever and leak the promise
+// (chat waiter timed out, but the steer stayed in-flight and the next
+// turn on the same session failed with CLI_TURN_IN_PROGRESS).
+test("bridge P1-2: invoke rejects with IPC_TIMEOUT when the transport hangs", async () => {
+  setBridgeTransport(() => new Promise(() => undefined));
+  const c = contract();
+  c.timeoutMs = 50;
+  const started = Date.now();
+  await assert.rejects(
+    () => invoke("sen_session_steer", { contract: c, session_id: "s1", text: "hi" }),
+    /IPC_TIMEOUT: sen_session_steer did not respond within 50ms/,
+  );
+  // Rejected promptly at the contract timeout, not after an unbounded wait.
+  assert.ok(Date.now() - started < 1000, `took ${Date.now() - started}ms`);
+  setBridgeTransport(null);
+});
+
+test("bridge P1-2: timeout uses the contract timeoutMs, not a fixed value", async () => {
+  setBridgeTransport(() => sleep(80).then(() => ({ ok: true })));
+  const slow = contract();
+  slow.timeoutMs = 200;
+  assert.deepEqual(
+    await invoke("sen_session_create", { contract: slow, session_id: "s1" }),
+    { ok: true },
+  );
+  const fast = contract();
+  fast.timeoutMs = 30;
+  await assert.rejects(
+    () => invoke("sen_session_create", { contract: fast, session_id: "s1" }),
+    /IPC_TIMEOUT/,
+  );
+  setBridgeTransport(null);
+});
+
+test("bridge P1-2: a fast transport resolves and the timer never fires late", async () => {
+  setBridgeTransport(async () => ({ ok: true }));
+  const c = contract();
+  c.timeoutMs = 30;
+  assert.deepEqual(
+    await invoke("sen_session_create", { contract: c, session_id: "s1" }),
+    { ok: true },
+  );
+  // If the timer were not cleared, its rejection would surface as an
+  // unhandled rejection and fail this test file.
+  await sleep(120);
+  setBridgeTransport(null);
+});
+
+test("bridge P1-2: a late transport rejection after timeout is swallowed", async () => {
+  setBridgeTransport(() =>
+    sleep(100).then(() => {
+      throw new Error("late backend failure");
+    }),
+  );
+  const c = contract();
+  c.timeoutMs = 20;
+  await assert.rejects(
+    () => invoke("sen_session_steer", { contract: c, session_id: "s1", text: "hi" }),
+    /IPC_TIMEOUT/,
+  );
+  // The transport rejects 80ms after the timeout won the race. If that
+  // late rejection were unhandled, node would fail this test file.
+  await sleep(200);
+  setBridgeTransport(null);
+});
