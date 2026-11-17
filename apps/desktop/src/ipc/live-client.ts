@@ -73,11 +73,22 @@ export async function attachLiveSession(
     manager.rawLog.append(sessionId, "session_event", event);
     options.onEvent?.(event);
   });
+  // P1-3: whether createSession returned decides if a rollback is
+  // owed. A create failure leaves nothing behind (no backend session,
+  // no local record), so there is nothing to roll back. A subscribe
+  // failure after a successful create is different: the backend
+  // session + local Running record already exist, and the old code
+  // only dropped the listener, leaving a live orphan behind.
+  let createSucceeded = false;
   try {
     // Backend + local record (createSession: backend ack, then the
     // local Running record, with mismatch refused), then the backend
-    // subscription. A backend failure leaves no local record behind.
+    // subscription. A create failure leaves no local record behind;
+    // a subscribe failure after a successful create is rolled back
+    // in the catch below (abort: backend + local to Cancelled), so
+    // no live session survives a failed attach either.
     const created = await createSession(manager, contract, sessionId);
+    createSucceeded = true;
     const sub = await subscribeSession(contract, sessionId);
     return {
       sessionId,
@@ -90,6 +101,33 @@ export async function attachLiveSession(
     // drop the listener so no orphan listens past the failed attach.
     if (unlisten) {
       unlisten();
+    }
+    // P1-3 rollback: subscribe failed after create succeeded, so a
+    // backend session + local Running record exist with no subscriber
+    // and no close path to reach them — a retry with the same id hit
+    // DUPLICATE_SESSION and a retry with a new id orphaned the old
+    // session forever. Abort the created session before throwing:
+    // the backend moves to Cancelled (the abort itself resets the
+    // subscriber count to 0) and the local record moves to terminal
+    // Cancelled, so no live session remains on either side. No
+    // separate unsubscribe is needed: the failed subscribe recorded
+    // no subscriber. The rollback is best-effort — if the abort
+    // itself fails, the original subscribe error is still the one
+    // that propagates, so the cause of the failed attach is not
+    // masked by the failed cleanup.
+    // The rollback cannot free the id for reuse: both sides keep the
+    // Cancelled record and refuse re-create (BUG-04 locally,
+    // ERR_DUPLICATE_SESSION in the registry), so a retry must use a
+    // new id — startApp already mints one with randomUUID() when
+    // none is given. Freeing the id needs a backend delete/evict
+    // command, which does not exist on this base.
+    if (createSucceeded) {
+      try {
+        await abortSession(manager, contract, sessionId);
+      } catch {
+        // Best-effort rollback: the subscribe error below is the one
+        // the caller must see.
+      }
     }
     throw error;
   }
