@@ -109,6 +109,47 @@ test("delegate: argv carries the bridge flags, --mcp-config, and the prompt last
   assert.ok(!resumed.includes("--session-id"));
 });
 
+// buildDelegateArgv: `--` separates a hyphen-leading prompt from the
+// flags, so the CLI parses it as the prompt, never as a flag. The
+// prompt is built by buildDelegatePrompt (always prefixed with
+// `Call the MCP tool ...`), so the lock is on the separator position:
+// whatever the prompt's first character, it is the last argv element
+// and `--` is immediately before it, in both the fresh and the
+// resumed form. The tool/args below carry hyphen-leading user text
+// ("- fix bug", "--help") to show it still travels as one positional
+// element after `--`.
+test("delegate: argv separates a hyphen-leading prompt with --", () => {
+  for (const tool of ["- fix bug", "--help"]) {
+    const argv = buildDelegateArgv(
+      {
+        serverName: "fake",
+        serverConfig: SERVER,
+        tool,
+        arguments: { q: tool },
+      },
+      "/tmp/x/mcp-servers.json",
+      "s-1",
+    );
+    assert.equal(argv[argv.length - 2], "--");
+    assert.equal(argv[argv.length - 1], buildDelegatePrompt("fake", tool, { q: tool }));
+    assert.equal(argv.filter((el) => el === "--").length, 1);
+    const resumed = buildDelegateArgv(
+      {
+        serverName: "fake",
+        serverConfig: SERVER,
+        tool,
+        arguments: { q: tool },
+        resume: true,
+      },
+      "/tmp/x/mcp-servers.json",
+      "s-1",
+    );
+    assert.equal(resumed[resumed.length - 2], "--");
+    assert.equal(resumed[resumed.length - 1], buildDelegatePrompt("fake", tool, { q: tool }));
+    assert.ok(resumed.includes("-r"));
+  }
+});
+
 test("delegate: the written config file parses as zen-mcp expects", () => {
   const { dir, path } = writeMcpConfigFile("fake", SERVER);
   try {
@@ -155,6 +196,9 @@ test("delegate: a success turn returns the result record text", async () => {
     assert.ok(argv[at + 1]?.endsWith("mcp-servers.json"));
     assert.ok(argv.includes("--session-id"));
     assert.ok(argv[argv.length - 1]?.includes('"echo"'));
+    // The prompt is the last argv element, preceded by `--`, so a
+    // hyphen-leading prompt is a positional, never a flag.
+    assert.equal(argv[argv.length - 2], "--");
   });
   rmSync(dirname(argvFile), { recursive: true, force: true });
 });
