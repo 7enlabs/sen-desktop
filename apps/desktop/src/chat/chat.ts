@@ -13,9 +13,10 @@
 // the session startApp created. The assistant's reply text arrives as
 // a "result" SenEvent through handleEvent: send() waits for that event
 // (not just for the steer ack), so the transcript entry lands before
-// the next queued send runs. A turn that errors (steer throws, or the
-// result never arrives within the contract timeout + 10s) becomes a
-// system entry instead of a hang, and a Telegram turn also gets its
+// the next queued send runs. A turn that errors (steer throws, the
+// result never arrives within the contract timeout + 10s, or the
+// result record carries isError) becomes a system entry instead of a
+// hang or a fake assistant reply, and a Telegram turn also gets its
 // error text sent back to the chat.
 import {
   followUpSession,
@@ -496,6 +497,26 @@ export class ChatSession {
         const message =
           "Sen không trả lời được: " +
           (error instanceof Error ? error.message : String(error));
+        this.append(channel, "system", message, telegramChatId);
+        if (telegramChatId !== undefined) {
+          await this.sendTelegramBestEffort(telegramChatId, message);
+        }
+        return;
+      }
+      if (result.isError) {
+        // P1-1: an error result is not the model's answer. The result
+        // record is the only event the frontend gets for the turn
+        // (cli_spawn.rs returns Ok(TurnResult) even when the record
+        // carries is_error=true, and session.rs does not retry), so
+        // the branch must happen here. The error text must not land
+        // in the transcript as an assistant entry — both the desktop
+        // UI and the Telegram bridge render assistant entries as real
+        // replies — and it must not go to Telegram as a reply either.
+        // Report it as a system entry instead, like the failed-steer
+        // and timeout paths above, so both channels see the failure
+        // for what it is. The error text is not logged as an
+        // assistant line in the daily log either.
+        const message = "Sen gặp lỗi: " + result.text;
         this.append(channel, "system", message, telegramChatId);
         if (telegramChatId !== undefined) {
           await this.sendTelegramBestEffort(telegramChatId, message);
