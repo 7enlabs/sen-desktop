@@ -844,7 +844,10 @@ export function buildDelegatePrompt(
  * CLI bridge (cli_spawn.rs): -p, stream-json, --bare,
  * --setting-sources "", plus --mcp-config <file> so the CLI core
  * starts the server with its own zen-mcp manager. The prompt is
- * the last argv element; flags never follow it.
+ * the last argv element, preceded by `--` so a prompt starting
+ * with `-` is passed as the prompt value, never parsed as a CLI
+ * flag (same fix as Rust P1-1 in cli_spawn.rs build_cli_argv).
+ * Flags never follow it.
  */
 export function buildDelegateArgv(
   input: CliDelegateInput,
@@ -872,6 +875,12 @@ export function buildDelegateArgv(
   } else {
     argv.push("--session-id", sessionId);
   }
+  // `--` ends flag parsing, so the prompt that follows is always the
+  // positional prompt, even when it starts with `-`. The prompt is
+  // built by buildDelegatePrompt from server/tool/args, which can
+  // carry user text; without the separator a prompt starting with
+  // `-` (e.g. "- fix bug", "--help") would be parsed as a CLI flag.
+  argv.push("--");
   argv.push(
     buildDelegatePrompt(
       input.serverName,
