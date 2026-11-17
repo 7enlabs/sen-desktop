@@ -106,6 +106,11 @@ export interface ApplyDecisionInput {
   log: ActivityLog;
   proposal: DecisionProposal;
   actor: string;
+  /** The live session applying the proposal (a UUID, the CLI
+   * --session-id / SessionManager key). The approval must belong
+   * to this session: a grant from another session never applies
+   * a proposal here. */
+  sessionId: string;
 }
 
 export interface ApplyDecisionResult {
@@ -156,6 +161,7 @@ export function applyDecision(input: ApplyDecisionInput): ApplyDecisionResult {
     actor: input.actor,
     tool: toolName,
     idempotencyKey: proposal.idempotencyKey,
+    sessionId: input.sessionId,
   });
   if (evaluation.decision !== "allow") {
     if (evaluation.decision === "ask-first") {

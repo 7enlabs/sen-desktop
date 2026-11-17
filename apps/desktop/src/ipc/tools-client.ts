@@ -1,10 +1,12 @@
 // Frontend client for the P0-2 approval gate (tin 13895).
-// Two calls, both through the bridge like every other client:
+// Three calls, all through the bridge like every other client:
 // - approveTool: grant one approval (one tool + one idempotency key,
 //   by a named granter). This is the tier-2 approval path: a
 //   send / buy / sign / delete call waits for this before it runs.
+// - revokeTool: revoke one approval (one tool + one idempotency
+//   key); the next call with that tool + key waits again.
 // - getActivityLog: read back the append-only activity log.
-// No key, token, or credential travels through either call.
+// No key, token, or credential travels through any call.
 import { invoke } from "./bridge.ts";
 import type { ActionContract } from "./types.ts";
 
@@ -13,6 +15,9 @@ export interface Approval {
   idempotencyKey: string;
   grantedBy: string;
   grantedAt: string;
+  /** Epoch seconds after which the grant no longer counts (P1-4:
+   * the Rust grant expires APPROVAL_TTL_SECS after it is granted). */
+  expiresAtSecs: number;
 }
 
 export type ApprovalTier = "auto" | "ask-first" | "never";
@@ -41,7 +46,9 @@ function asApproval(value: unknown): Approval {
     typeof res.grantedBy !== "string" ||
     !res.grantedBy ||
     typeof res.grantedAt !== "string" ||
-    !res.grantedAt
+    !res.grantedAt ||
+    typeof res.expiresAtSecs !== "number" ||
+    !Number.isFinite(res.expiresAtSecs)
   ) {
     throw new Error(
       "Backend approval malformed, FAIL: " + JSON.stringify(value),
@@ -63,6 +70,28 @@ export async function approveTool(
     args: { toolName, idempotencyKey, grantedBy },
   });
   return asApproval(raw);
+}
+
+/// Revoke one approval (one tool + one idempotency key): the next
+/// call with that tool + key waits for a fresh approval. Returns
+/// true when a live grant was removed, false when there was none
+/// (already spent, expired, or never granted). Revoking a grant
+/// never touches the activity log: the log has no delete path.
+export async function revokeTool(
+  contract: ActionContract,
+  toolName: string,
+  idempotencyKey: string,
+): Promise<boolean> {
+  const raw = await invoke("sen_tool_revoke", {
+    contract,
+    args: { toolName, idempotencyKey },
+  });
+  if (typeof raw !== "boolean") {
+    throw new Error(
+      "Backend revoke answer malformed, FAIL: " + JSON.stringify(raw),
+    );
+  }
+  return raw;
 }
 
 function asActivityEntry(value: unknown): ActivityEntry {

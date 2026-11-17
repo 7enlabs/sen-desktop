@@ -74,6 +74,7 @@ fn main() {
             commands::session::sen_session_abort,
             commands::tools::sen_tool_call,
             commands::tools::sen_tool_approve,
+            commands::tools::sen_tool_revoke,
             commands::tools::sen_tool_activity_log,
             commands::events::sen_events_subscribe,
             commands::events::sen_events_unsubscribe,

@@ -38,6 +38,12 @@ export interface ToolCallEvent {
   toolName: string;
   /** Who is asking for the tool; "unknown-actor" when not given. */
   actor?: string;
+  /** The live session asking for the tool (a UUID, the same id
+   * the CLI session and the SessionManager use). Required: a
+   * grant belongs to one session, so a call with no session id
+   * can never match a grant and fails loud instead of running
+   * on a grant from another session. */
+  sessionId?: string;
 }
 
 export interface ToolGateContext {
@@ -73,6 +79,9 @@ export function onToolCall(
   if (!event.toolName.trim()) {
     throw new Error("Tool call missing tool name, FAIL");
   }
+  if (!event.sessionId?.trim()) {
+    throw new Error("Tool call missing session id, FAIL");
+  }
   const policy = gate.policy ?? defaultToolPolicy();
   const approvals = gate.approvals ?? new ApprovalStore();
   const actor = event.actor ?? "unknown-actor";
@@ -80,6 +89,7 @@ export function onToolCall(
     actor,
     tool: event.toolName,
     idempotencyKey: event.contract.idempotencyKey,
+    sessionId: event.sessionId,
   });
   if (gate.log) {
     gate.log.record({
@@ -101,7 +111,7 @@ export function onToolCall(
     // one grant authorizes exactly one call, so the same tool +
     // key cannot pass this hook again on an old approval.
     if (evaluation.tier === "ask-first") {
-      approvals.consume(event.toolName, event.contract.idempotencyKey);
+      approvals.consume(event.toolName, event.contract.idempotencyKey, event.sessionId);
     }
     return evaluation;
   }

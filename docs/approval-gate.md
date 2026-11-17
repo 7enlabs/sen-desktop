@@ -13,6 +13,16 @@ other than the producer still pending. No merge, no push.
   until an approval is granted for that exact tool + idempotency
   key; after `sen_tool_approve` it passes the gate. It never runs
   on the sly while waiting.
+- An approval belongs to one session: granted for session A, it
+  never authorizes a call in session B, even with the same tool +
+  idempotency key. The session id is the live session's id (the
+  CLI `--session-id` UUID / SessionManager key), never invented
+  by the gate.
+- A grant can be taken back: `sen_tool_revoke` (frontend
+  `revokeTool`) removes one approval, true when a live grant was
+  removed, false when there was none. The next call with that
+  tool + key waits for a fresh approval. Revoking never touches
+  the activity log.
 - A forbidden tool (securities trading, transfer between accounts,
   access to another account) is always refused with
   `APPROVAL_NEVER_DENIED`, even with an allow rule AND an approval.
@@ -44,7 +54,8 @@ Evaluation order, fixed (same on both sides):
    allows a tool.
 3. Tier `ask-first` with no matching approval → ask-first
    (`APPROVAL_REQUIRED`). The approval must match the exact tool +
-   idempotency key; a different key is a different call.
+   idempotency key + session; a different key is a different call,
+   and a grant from another session is no grant at all.
 4. Otherwise → allow.
 
 ### The three tiers
@@ -77,12 +88,18 @@ and writes an explicit allow rule.
   / `APPROVAL_NEVER_DENIED` / `TOOL_POLICY_DENIED`) or — when the
   gate passes — fails with `TOOL_EXECUTION_NOT_WIRED`, because
   execution is not filled in yet. `allow_tool()` adds a rule,
-  `approve_tool()` grants an approval, `activity_log()` /
-  `list_approvals()` read the state back (clones).
+  `approve_tool()` grants an approval, `revoke_tool()` removes
+  one (bool: a live grant was removed), `activity_log()` /
+  `list_approvals()` read the state back (clones). The Rust
+  grant carries `expiresAtSecs` (granted-at + 900 s) and is
+  spent by `gate_tool_call` on the first allow, exactly like
+  the TS side (`APPROVAL_TTL_MS`, `consume()`).
 - `apps/desktop/src-tauri/src/commands/tools.rs` — thin Tauri
   wrappers: `sen_tool_call` (unchanged wire shape),
   `sen_tool_approve` (contract + `{ toolName, idempotencyKey,
-  grantedBy }` under `args`), `sen_tool_activity_log` (contract,
+  grantedBy }` under `args`), `sen_tool_revoke` (contract +
+  `{ toolName, idempotencyKey }` under `args`, returns whether a
+  live grant was removed), `sen_tool_activity_log` (contract,
   returns the entries). Registered in `main.rs`.
 - `packages/tools/src/index.ts` — the `tool_call` event hook is
   filled in: it runs the same gate (contract checks first, then
@@ -91,8 +108,10 @@ and writes an explicit allow rule.
   the evaluation on allow. A bare hook call (no policy passed)
   uses the default-deny policy, so it refuses everything.
 - Frontend: `apps/desktop/src/ipc/tools-client.ts`
-  (`approveTool`, `getActivityLog`, both validated like the other
-  clients; no key field ever travels).
+  (`approveTool`, `revokeTool`, `getActivityLog`, all validated
+  like the other clients; no key field ever travels). The
+  frontend `Approval` carries `expiresAtSecs` (epoch seconds,
+  the Rust grant's expiry).
 
 ### The activity log
 
@@ -122,16 +141,18 @@ storage of the log is a later phase, not this one.
 2. A person grants it: `sen_tool_approve` with the same tool name
    and the same idempotency key, plus who granted it
    (`approveTool` on the frontend).
-3. The caller retries the same tool + key; the gate finds the
-   approval and allows it (recorded as `allowed`). That allow
-   spends the approval (P1-4): a grant is single-use, and it
-   expires 15 minutes after being granted (`APPROVAL_TTL_MS`,
-   overridable per grant) — an old approval never authorizes a
-   later call, and replaying the same tool + key waits for a
-   fresh approval.
+3. The caller retries the same tool + key, in the same session;
+   the gate finds the approval and allows it (recorded as
+   `allowed`). That allow spends the approval (P1-4): a grant is
+   single-use, and it expires 15 minutes after being granted
+   (`APPROVAL_TTL_MS`, overridable per grant) — an old approval
+   never authorizes a later call, and replaying the same tool +
+   key waits for a fresh approval. A grant from another session
+   never allows here, even with the same tool + key.
 4. A different idempotency key is a different call: it waits for
-   its own approval. Revoking a grant (`ApprovalStore.revoke`)
-   makes the next call wait again.
+   its own approval. Revoking a grant (`ApprovalStore.revoke`,
+   `sen_tool_revoke` / `revokeTool`) makes the next call wait
+   again.
 
 ## Verification skill — approval gate
 
@@ -252,3 +273,62 @@ only on the Leader VM's `cargo test`. The TS side of those
 commands is covered by mocked-transport tests, and the shared gate
 logic is covered by the Rust `approval_gate` + `registry` tests,
 but the wrapper code path itself is uncompiled here.
+
+## P1-4 rev2 — 17/11/2026 (tin 14959, ZC Leader)
+
+Three additions on top of the rev1 TS patch (expiry + single-use
+on the TS side only):
+
+1. Rust mirror (`approval_gate.rs`): `Approval` carries
+   `expiresAtSecs` (granted-at + `APPROVAL_TTL_SECS` = 900 s,
+   same 15-minute window as `APPROVAL_TTL_MS`); `find()` /
+   `list()` drop expired grants; `consume()` spends a grant;
+   `gate_tool_call` spends it on the first allow for an
+   ask-first tool. `grant_with_ttl` / `grant_with_expiry` are
+   the explicit-window / test paths. `evaluate_tool_call` and
+   `gate_tool_call` now take `&mut ApprovalStore` (find drops
+   expired grants); `registry.rs::tool_call` passes
+   `&mut self.approvals`, `list_approvals` is `&mut self`.
+2. Session binding (TS only): `Approval.sessionId`, store key
+   `sessionId + tool + key`; `grant` / `find` / `consume` /
+   `revoke` and `ToolCallInput.sessionId` are session-scoped.
+   The session id is the live session's id — the SessionManager
+   key (`packages/core/src/session.ts`), the CLI `--session-id`
+   UUID (`mcp-client.ts`: `input.sessionId ?? randomUUID()`).
+   `onToolCall` throws when the event carries no session id;
+   `executeMcpTool` and `applyDecision` take it as a required
+   input. The Rust side is NOT session-scoped yet: the
+   `ActionContract` on the `sen_tool_call` path carries no
+   session id, so scoping it needs a wire change — follow-up,
+   not this patch.
+3. Revoke as a Tauri command: `sen_tool_revoke` in `tools.rs`
+   (contract validated first, non-empty tool + key, returns
+   whether a live grant was removed), `Registry::revoke_tool`,
+   registered in `main.rs`, frontend `revokeTool` in
+   `tools-client.ts`. Revoking never touches the activity log.
+
+Evidence (this box, 17/11): `npm test` 227 pass / 1 fail — the
+1 fail is the pre-existing flaky `MCP_TIMEOUT` test in
+`mcp-client.test.ts:158` (also failed on the unmodified
+baseline, passes on re-run in isolation); `npm run build
+--prefix apps/desktop` vite green, 22.59 kB js; Rust pure
+module harness (`/tmp/sen-p1-ts4-rust-check`, `approval_gate.rs`
+only, serde 1.0.229 from the offline cache) 16 pass / 0 fail
+(12 carried + 4 new); `rustfmt --check` clean on the 4
+touched Rust files; `git diff --check` clean. New tests were
+written first and failed on the unmodified source (the 2 TS
+session tests failed; the Rust tests failed to compile —
+`consume` / `APPROVAL_TTL_SECS` / `expires_at_secs` missing;
+the `approval-gate.test.ts` file failed to load —
+`revokeTool` export missing), then passed after the fix.
+TTL 15 minutes is still the seat's own choice, not yet
+confirmed by the Leader.
+
+NOT RUN (same blocker as P0-2): `cargo test` in
+`apps/desktop/src-tauri` (full crate incl. `tools.rs`,
+`registry.rs`, `main.rs`) — `gdk-3.0` missing on this box;
+run on the Leader VM. That leaves the 2 new `registry.rs`
+tests (`tool_call_approval_is_single_use`,
+`revoke_tool_removes_the_grant_and_the_next_call_waits`) and
+the `sen_tool_revoke` wrapper uncompiled here — they were
+reviewed by reading, not by running.
