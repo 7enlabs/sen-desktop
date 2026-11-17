@@ -21,9 +21,12 @@
 // because a transient network blip must not take the bridge down.
 //
 // Allowlist: when SEN_TELEGRAM_ALLOWED_CHAT_ID is set, only that chat's
-// messages are emitted. The offset still advances past other chats'
-// updates (they are skipped, not re-fetched forever): the skip happens
-// in poll_once AFTER the offset moves, never before.
+// messages are emitted, and only that chat may receive replies
+// (Rust P1-4: send enforces the same allowlist as poll, through
+// `send_message`, so no caller can bypass it). The offset still
+// advances past other chats' updates (they are skipped, not
+// re-fetched forever): the skip happens in poll_once AFTER the offset
+// moves, never before.
 use std::time::Duration;
 
 /// Long-poll wait per getUpdates round (seconds). The client read
@@ -349,11 +352,21 @@ impl<H: TelegramHttp> TelegramClient<H> {
     }
 
     /// Send one reply, split into 4096-UTF-16-unit messages when
-    /// longer. Returns Err when any chunk fails (earlier chunks may
-    /// already have been sent; the caller reports that, it does not
-    /// retry). Error strings are redacted: the transport error may
-    /// embed the request URL, token included.
+    /// longer. The allowlist is enforced here, like poll enforces it
+    /// in `poll_once` (Rust P1-4): a chat that `is_allowed` refuses
+    /// is an Err and no HTTP call is made, so a compromised webview or
+    /// direct `sen_telegram_send` caller cannot drive the bot to an
+    /// arbitrary chat. Returns Err when any chunk fails (earlier
+    /// chunks may already have been sent; the caller reports that, it
+    /// does not retry). Error strings are redacted: the transport
+    /// error may embed the request URL, token included.
     pub fn send_message(&self, chat_id: i64, text: &str) -> Result<(), String> {
+        if !self.is_allowed(chat_id) {
+            return Err(format!(
+                "TELEGRAM_CHAT_NOT_ALLOWED: chat {} is not allowed, FAIL",
+                chat_id
+            ));
+        }
         let url = self.api_url("sendMessage");
         let chunks = split_utf16_units(text, SEND_MESSAGE_MAX_UTF16_UNITS);
         for chunk in chunks {
@@ -550,7 +563,9 @@ impl<H: TelegramHttp> TelegramPoller<H> {
         self.client.clone()
     }
 
-    /// Send one reply through the poller's client.
+    /// Send one reply through the poller's client. The allowlist is
+    /// enforced by `TelegramClient::send_message` (Rust P1-4), so this
+    /// is the path `sen_telegram_send` takes and it cannot bypass it.
     pub fn client_send_message(&self, chat_id: i64, text: &str) -> Result<(), String> {
         self.client.send_message(chat_id, text)
     }
@@ -726,7 +741,7 @@ mod tests {
     #[test]
     fn send_message_posts_chat_id_and_text_and_ok_means_sent() {
         let http = FakeHttp::new(vec![]);
-        let client = TelegramClient::with_http(http.clone(), "TOKEN123", None);
+        let client = TelegramClient::with_http(http.clone(), "TOKEN123", Some(100));
         client.send_message(100, "hi there").unwrap();
         let calls = http.calls();
         assert_eq!(calls.len(), 1);
@@ -744,7 +759,7 @@ mod tests {
     #[test]
     fn send_message_splits_a_long_reply_into_chunks() {
         let http = FakeHttp::new(vec![]);
-        let client = TelegramClient::with_http(http.clone(), "TOKEN123", None);
+        let client = TelegramClient::with_http(http.clone(), "TOKEN123", Some(100));
         let long = "y".repeat(SEND_MESSAGE_MAX_UTF16_UNITS + 10);
         client.send_message(100, &long).unwrap();
         let calls = http.calls();
@@ -763,7 +778,7 @@ mod tests {
         // emoji each — char-based chunking would send 1 message of
         // 8192 units, over the limit.
         let http = FakeHttp::new(vec![]);
-        let client = TelegramClient::with_http(http.clone(), "TOKEN123", None);
+        let client = TelegramClient::with_http(http.clone(), "TOKEN123", Some(100));
         let emoji = "😀".repeat(SEND_MESSAGE_MAX_UTF16_UNITS);
         client.send_message(100, &emoji).unwrap();
         let calls = http.calls();
@@ -776,7 +791,7 @@ mod tests {
         }
         // Mixed: 4095 ASCII + 1 emoji = 4097 units, also 2 messages.
         let http = FakeHttp::new(vec![]);
-        let client = TelegramClient::with_http(http.clone(), "TOKEN123", None);
+        let client = TelegramClient::with_http(http.clone(), "TOKEN123", Some(100));
         let mixed = format!("{}😀", "y".repeat(4095));
         client.send_message(100, &mixed).unwrap();
         assert_eq!(http.calls().len(), 2);
@@ -875,6 +890,55 @@ mod tests {
             .with_allow_any_chat(true);
         assert!(listed.is_allowed(100));
         assert!(!listed.is_allowed(999));
+    }
+
+    #[test]
+    fn send_message_rejects_a_chat_outside_the_allowlist() {
+        // Rust P1-4: sen_telegram_send used to bypass the allowlist
+        // entirely. A send to any chat but the listed one is refused
+        // before any HTTP call is made.
+        let http = FakeHttp::new(vec![]);
+        let client = TelegramClient::with_http(http.clone(), "TOKEN123", Some(100));
+        let err = client.send_message(999, "hi").unwrap_err();
+        assert!(err.contains("TELEGRAM_CHAT_NOT_ALLOWED"), "error: {}", err);
+        assert!(http.calls().is_empty(), "no HTTP call for a refused send");
+        // The listed chat still sends.
+        client.send_message(100, "hi").unwrap();
+        assert_eq!(http.calls().len(), 1);
+    }
+
+    #[test]
+    fn send_message_rejects_every_chat_when_fail_closed() {
+        // No allowlist and no opt-in: the bridge serves nobody, and
+        // that covers sends too, not just poll.
+        let http = FakeHttp::new(vec![]);
+        let client = TelegramClient::with_http(http.clone(), "TOKEN123", None);
+        let err = client.send_message(100, "hi").unwrap_err();
+        assert!(err.contains("TELEGRAM_CHAT_NOT_ALLOWED"), "error: {}", err);
+        assert!(http.calls().is_empty(), "no HTTP call for a refused send");
+    }
+
+    #[test]
+    fn send_message_allows_any_chat_only_with_the_explicit_opt_in() {
+        let http = FakeHttp::new(vec![]);
+        let client =
+            TelegramClient::with_http(http.clone(), "TOKEN123", None).with_allow_any_chat(true);
+        client.send_message(999, "hi").unwrap();
+        assert_eq!(http.calls().len(), 1);
+    }
+
+    #[test]
+    fn client_send_message_rejects_a_chat_outside_the_allowlist() {
+        // Rust P1-4, poller path: this is the call sen_telegram_send
+        // makes, so it must refuse a non-listed chat the same way.
+        let http = FakeHttp::new(vec![]);
+        let client = TelegramClient::with_http(http.clone(), "TOKEN123", Some(100));
+        let poller = TelegramPoller::new(client);
+        let err = poller.client_send_message(999, "hi").unwrap_err();
+        assert!(err.contains("TELEGRAM_CHAT_NOT_ALLOWED"), "error: {}", err);
+        assert!(http.calls().is_empty(), "no HTTP call for a refused send");
+        poller.client_send_message(100, "hi").unwrap();
+        assert_eq!(http.calls().len(), 1);
     }
 
     #[test]
