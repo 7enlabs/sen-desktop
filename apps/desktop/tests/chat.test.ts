@@ -19,12 +19,12 @@ import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import {
   ChatSession,
   type ChatChannel,
+  type MemoryClient,
   type TranscriptEntry,
 } from "../src/chat/chat.ts";
 import type {
-  MemoryClient,
+  MemoryReadResult,
   MemoryScope,
-  MemorySnapshot,
 } from "../src/ipc/memory-client.ts";
 import type { ActionContract } from "../src/ipc/types.ts";
 import type { SenEvent } from "../src/ipc/session-events.ts";
@@ -84,7 +84,7 @@ class FakeMemory implements MemoryClient {
   today: string[] = [];
   logs: Array<{ kind: string; channel: string; text: string }> = [];
 
-  async read(_contract: ActionContract): Promise<MemorySnapshot> {
+  async read(_contract: ActionContract): Promise<MemoryReadResult> {
     return {
       memory: [...this.memory],
       user: [...this.user],
@@ -163,7 +163,6 @@ class FakeMemory implements MemoryClient {
   ) {
     this.logs.push({ kind, channel, text });
     this.today.push(kind + ": " + text);
-    return { logged: true };
   }
 }
 
@@ -201,7 +200,7 @@ function makeChat(): ChatHarness {
       if (fail.steer) {
         throw new Error("boom");
       }
-      const { text } = args as { session_id: string; text: string };
+      const { text } = args as unknown as { session_id: string; text: string };
       texts.push(text);
       // Deliver the Result event synchronously, mid-turn, like the
       // backend streaming a result record before the ack.

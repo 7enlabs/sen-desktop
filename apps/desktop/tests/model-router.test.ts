@@ -43,7 +43,7 @@ import { parseChatCommand } from "../src/chat/commands.ts";
 // fake keeps that write off the real bridge (no "window is not
 // defined" noise under node).
 const fakeMemory: MemoryClient = {
-  read: async () => ({ memory: [], user: [], today: [] }),
+  read: async () => ({ memory: [], user: [], soul: "", today: [] }),
   add: async () => ({ scope: "memory", index: 1, item: "" }),
   forgetByNumber: async () => ({ scope: "memory", removed: "" }),
   forgetByText: async () => ({ scope: "memory", removed: "" }),
@@ -387,7 +387,7 @@ test("chat turn: status line follows the route that actually ran after fallback"
   chat.bind("s1");
   setBridgeTransport(async (command, args) => {
     assert.equal(command, "sen_session_steer");
-    const { text } = args as { session_id: string; text: string };
+    const { text } = args as unknown as { session_id: string; text: string };
     // Deliver the Result event synchronously, mid-turn, like the
     // backend streaming a result record before the ack.
     const event: SenEvent = {

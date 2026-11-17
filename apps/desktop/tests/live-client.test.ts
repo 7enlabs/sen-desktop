@@ -14,6 +14,7 @@
 // CLI bridge phase.
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import type { Event } from "@tauri-apps/api/event";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import type { ActionContract } from "../src/ipc/types.ts";
 import { abortSession, callTool, followUpSession, steerSession } from "../src/ipc/session-client.ts";
@@ -39,14 +40,14 @@ const capturedEvents: {
 } = {};
 
 function fakeEventListen(): EventListen {
-  return async (event, handler) => {
+  return async <T>(event: string, handler: (e: Event<T>) => void) => {
     assert.equal(event, SEN_SESSION_EVENT);
     capturedEvents.unlistened = false;
     capturedEvents.send = (payload: unknown) => {
       if (capturedEvents.unlistened) {
         return;
       }
-      handler({ payload, event, id: 1 });
+      handler({ payload, event, id: 1 } as Event<T>);
     };
     return () => {
       capturedEvents.unlistened = true;

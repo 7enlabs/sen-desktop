@@ -580,7 +580,7 @@ export class ChatSession {
 
   private async logBestEffort(
     kind: LogKind,
-    channel: LogChannel,
+    channel: ChatChannel,
     text: string,
   ): Promise<void> {
     try {

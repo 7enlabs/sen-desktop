@@ -5,7 +5,7 @@
 // module. This module only renders; it is NOT wired into main.ts in
 // P0-4 (wiring is a follow-up after review, see
 // docs/morning-brief.md).
-import type { MorningBrief } from "../../../packages/core/src/morning-brief.ts";
+import type { MorningBrief } from "../../../../packages/core/src/morning-brief.ts";
 
 /** Escape the five characters that can break out of HTML text. */
 export function escapeHtml(value: string): string {

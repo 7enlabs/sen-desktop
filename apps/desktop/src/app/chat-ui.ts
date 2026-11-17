@@ -4,7 +4,7 @@
 // Entry text is set with textContent, never innerHTML, so a message
 // can never inject markup. The message list starts empty: no fake
 // content, no placeholder greeting.
-import type { ChatSession, TranscriptEntry } from "./chat.ts";
+import type { ChatSession, TranscriptEntry } from "../chat/chat.ts";
 
 export interface ChatUI {
   render(entries: TranscriptEntry[]): void;

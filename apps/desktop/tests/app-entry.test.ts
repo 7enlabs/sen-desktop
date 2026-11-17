@@ -12,6 +12,7 @@
 // webview-no-sdk suite, and the model proof waits for the CLI bridge.
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import type { Event } from "@tauri-apps/api/event";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import { startApp } from "../src/app/main.ts";
 import { SessionManager } from "../../../packages/core/src/session.ts";
@@ -28,10 +29,10 @@ import {
 const capturedEvents: { send?: (payload: unknown) => void } = {};
 
 function fakeEventListen(): EventListen {
-  return async (event, handler) => {
+  return async <T>(event: string, handler: (e: Event<T>) => void) => {
     assert.equal(event, SEN_SESSION_EVENT);
     capturedEvents.send = (payload: unknown) => {
-      handler({ payload, event, id: 1 });
+      handler({ payload, event, id: 1 } as Event<T>);
     };
     return () => undefined;
   };

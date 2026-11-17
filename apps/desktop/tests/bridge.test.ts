@@ -67,7 +67,7 @@ for (const field of ["phase", "toolKind", "sideEffect", "risk"] as const) {
       return {};
     });
     const bad = contract();
-    (bad as Record<string, unknown>)[field] = "";
+    (bad as unknown as Record<string, unknown>)[field] = "";
     await assert.rejects(
       () => invoke("sen_session_create", { contract: bad }),
       /missing fields/,
@@ -87,7 +87,7 @@ test("bridge BUG-16: illegal toolKind is rejected before transport", async () =>
     return {};
   });
   const bad = contract();
-  (bad as Record<string, unknown>).toolKind = "unregistered-tool";
+  (bad as unknown as Record<string, unknown>).toolKind = "unregistered-tool";
   await assert.rejects(
     () => invoke("sen_session_create", { contract: bad }),
     /illegal tool kind/,
@@ -103,7 +103,7 @@ test("bridge BUG-16: illegal sideEffect is rejected before transport", async () 
     return {};
   });
   const bad = contract();
-  (bad as Record<string, unknown>).sideEffect = "maybe-reversible";
+  (bad as unknown as Record<string, unknown>).sideEffect = "maybe-reversible";
   await assert.rejects(
     () => invoke("sen_session_create", { contract: bad }),
     /illegal side effect class/,
