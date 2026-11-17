@@ -25,6 +25,12 @@ import {
 
 const NOW = "2026-11-16T07:00:00.000Z";
 
+// Session ids are UUIDs, the same shape the CLI session id has
+// (input.sessionId ?? randomUUID() in mcp-client.ts, validated as
+// a UUID). Two ids stand in for two different live sessions.
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
+const OTHER_SESSION_ID = "22222222-2222-4222-8222-222222222222";
+
 function briefWithDecisions() {
   const emails: EmailItem[] = [
     {
@@ -120,6 +126,7 @@ test("apply: no allow rule refuses with TOOL_POLICY_DENIED and logs once", () =>
         log,
         proposal: p,
         actor: "test",
+        sessionId: SESSION_ID,
       }),
     /TOOL_POLICY_DENIED/,
   );
@@ -140,6 +147,7 @@ test("apply: allow rule but no approval refuses with APPROVAL_REQUIRED and logs 
         log,
         proposal: p,
         actor: "test",
+        sessionId: SESSION_ID,
       }),
     /APPROVAL_REQUIRED/,
   );
@@ -155,7 +163,7 @@ test("apply: never-tier still denies even with an allow rule AND an approval", (
     idempotencyKey: "proposal:m1:trade_securities",
   });
   const approvals = new ApprovalStore();
-  approvals.grant("trade_securities", "proposal:m1:trade_securities", "boss");
+  approvals.grant("trade_securities", "proposal:m1:trade_securities", "boss", SESSION_ID);
   const log = new ActivityLog();
   assert.throws(
     () =>
@@ -165,6 +173,7 @@ test("apply: never-tier still denies even with an allow rule AND an approval", (
         log,
         proposal: p,
         actor: "test",
+        sessionId: SESSION_ID,
       }),
     /APPROVAL_NEVER_DENIED/,
   );
@@ -179,7 +188,7 @@ test("apply: never-tier still denies even with an allow rule AND an approval", (
 test("apply: allow rule + approval passes the gate but never executes", () => {
   const p = proposal({ id: "proposal:m1" });
   const approvals = new ApprovalStore();
-  approvals.grant("send_email", "proposal:m1:send_email", "boss");
+  approvals.grant("send_email", "proposal:m1:send_email", "boss", SESSION_ID);
   const log = new ActivityLog();
   const result = applyDecision({
     policy: { allow: ["send_email"] },
@@ -187,6 +196,7 @@ test("apply: allow rule + approval passes the gate but never executes", () => {
     log,
     proposal: p,
     actor: "test",
+    sessionId: SESSION_ID,
   });
   assert.equal(result.executed, false);
   assert.equal(result.reason, "EXECUTION_NOT_WIRED");
@@ -196,10 +206,44 @@ test("apply: allow rule + approval passes the gate but never executes", () => {
   assert.equal(log.entries()[0].result, "allowed");
 });
 
+test("apply: an approval from another session does not apply the proposal", () => {
+  const p = proposal({ id: "proposal:m1" });
+  const approvals = new ApprovalStore();
+  approvals.grant("send_email", "proposal:m1:send_email", "boss", OTHER_SESSION_ID);
+  const log = new ActivityLog();
+  // The grant belongs to another session: this session still waits.
+  assert.throws(
+    () =>
+      applyDecision({
+        policy: { allow: ["send_email"] },
+        approvals,
+        log,
+        proposal: p,
+        actor: "test",
+        sessionId: SESSION_ID,
+      }),
+    /APPROVAL_REQUIRED/,
+  );
+  assert.equal(p.status, "pending");
+  // Granted for this session: the proposal applies.
+  approvals.grant("send_email", "proposal:m1:send_email", "boss", SESSION_ID);
+  const result = applyDecision({
+    policy: { allow: ["send_email"] },
+    approvals,
+    log,
+    proposal: p,
+    actor: "test",
+    sessionId: SESSION_ID,
+  });
+  assert.equal(result.executed, false);
+  assert.equal(result.reason, "EXECUTION_NOT_WIRED");
+  assert.equal(p.status, "approved");
+});
+
 test("apply: replaying an approved proposal refuses and never passes the gate again", () => {
   const p = proposal({ id: "proposal:m1" });
   const approvals = new ApprovalStore();
-  approvals.grant("send_email", "proposal:m1:send_email", "boss");
+  approvals.grant("send_email", "proposal:m1:send_email", "boss", SESSION_ID);
   const log = new ActivityLog();
   const result = applyDecision({
     policy: { allow: ["send_email"] },
@@ -207,6 +251,7 @@ test("apply: replaying an approved proposal refuses and never passes the gate ag
     log,
     proposal: p,
     actor: "test",
+    sessionId: SESSION_ID,
   });
   assert.equal(result.executed, false);
   assert.equal(result.reason, "EXECUTION_NOT_WIRED");
@@ -223,6 +268,7 @@ test("apply: replaying an approved proposal refuses and never passes the gate ag
         log,
         proposal: p,
         actor: "test",
+        sessionId: SESSION_ID,
       }),
     /PROPOSAL_ALREADY_APPLIED/,
   );
@@ -234,7 +280,7 @@ test("apply: an expired approval refuses with APPROVAL_REQUIRED and stays pendin
   const p = proposal({ id: "proposal:m1" });
   const approvals = new ApprovalStore();
   const past = new Date(Date.now() - 1000).toISOString();
-  approvals.grant("send_email", "proposal:m1:send_email", "boss", new Date(Date.now() - 2000).toISOString(), {
+  approvals.grant("send_email", "proposal:m1:send_email", "boss", SESSION_ID, new Date(Date.now() - 2000).toISOString(), {
     expiresAt: past,
   });
   const log = new ActivityLog();
@@ -246,6 +292,7 @@ test("apply: an expired approval refuses with APPROVAL_REQUIRED and stays pendin
         log,
         proposal: p,
         actor: "test",
+        sessionId: SESSION_ID,
       }),
     /APPROVAL_REQUIRED/,
   );
@@ -268,6 +315,7 @@ test("apply: auto-tier draft needs an allow rule but no approval", () => {
     log,
     proposal: p,
     actor: "test",
+    sessionId: SESSION_ID,
   });
   assert.equal(result.executed, false);
   assert.equal(result.reason, "EXECUTION_NOT_WIRED");
@@ -290,17 +338,19 @@ test("apply: unclassified archive_email is ask-first until approved", () => {
         log,
         proposal: p,
         actor: "test",
+        sessionId: SESSION_ID,
       }),
     /APPROVAL_REQUIRED/,
   );
   const approvals = new ApprovalStore();
-  approvals.grant("archive_email", "proposal:m1:archive_email", "boss");
+  approvals.grant("archive_email", "proposal:m1:archive_email", "boss", SESSION_ID);
   const result = applyDecision({
     policy: { allow: ["archive_email"] },
     approvals,
     log,
     proposal: p,
     actor: "test",
+    sessionId: SESSION_ID,
   });
   assert.equal(result.executed, false);
   assert.equal(result.reason, "EXECUTION_NOT_WIRED");
@@ -316,17 +366,17 @@ test("apply: the log records denied, awaiting-approval, and allowed, one entry e
   const denied = proposal({ id: "proposal:d1", idempotencyKey: "proposal:d1:send_email" });
   const waiting = proposal({ id: "proposal:d2", idempotencyKey: "proposal:d2:send_email" });
   const allowed = proposal({ id: "proposal:d3", idempotencyKey: "proposal:d3:send_email" });
-  approvals.grant("send_email", "proposal:d3:send_email", "boss");
+  approvals.grant("send_email", "proposal:d3:send_email", "boss", SESSION_ID);
 
   assert.throws(
-    () => applyDecision({ policy: { allow: [] }, approvals, log, proposal: denied, actor: "test" }),
+    () => applyDecision({ policy: { allow: [] }, approvals, log, proposal: denied, actor: "test", sessionId: SESSION_ID }),
     /TOOL_POLICY_DENIED/,
   );
   assert.throws(
-    () => applyDecision({ policy, approvals, log, proposal: waiting, actor: "test" }),
+    () => applyDecision({ policy, approvals, log, proposal: waiting, actor: "test", sessionId: SESSION_ID }),
     /APPROVAL_REQUIRED/,
   );
-  const result = applyDecision({ policy, approvals, log, proposal: allowed, actor: "test" });
+  const result = applyDecision({ policy, approvals, log, proposal: allowed, actor: "test", sessionId: SESSION_ID });
   assert.equal(result.executed, false);
 
   assert.equal(log.length, 3);
@@ -356,6 +406,7 @@ test("apply: ignore needs no gate and writes no log entry", () => {
     log,
     proposal: p,
     actor: "test",
+    sessionId: SESSION_ID,
   });
   assert.equal(result.executed, false);
   assert.equal(result.reason, "IGNORED_LOCAL_ONLY");
@@ -368,8 +419,8 @@ test("apply: ignore needs no gate and writes no log entry", () => {
 
 test("apply: executed is never true, for any action", () => {
   const approvals = new ApprovalStore();
-  approvals.grant("send_email", "proposal:m1:send_email", "boss");
-  approvals.grant("draft_email", "proposal:m1:draft_email", "boss");
+  approvals.grant("send_email", "proposal:m1:send_email", "boss", SESSION_ID);
+  approvals.grant("draft_email", "proposal:m1:draft_email", "boss", SESSION_ID);
   const log = new ActivityLog();
   const cases: DecisionProposal[] = [
     proposal({ id: "proposal:m1" }),
@@ -388,6 +439,7 @@ test("apply: executed is never true, for any action", () => {
       log,
       proposal: p,
       actor: "test",
+      sessionId: SESSION_ID,
     });
     assert.equal(result.executed, false, p.action);
   });

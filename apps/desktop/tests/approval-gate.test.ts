@@ -31,6 +31,7 @@ import { onToolCall } from "../../../packages/tools/src/index.ts";
 import {
   approveTool,
   getActivityLog,
+  revokeTool,
 } from "../src/ipc/tools-client.ts";
 
 function contract(): ActionContract {
@@ -54,6 +55,13 @@ function contract(): ActionContract {
 function policyAllowing(tools: string[]): ToolPolicy {
   return { allow: [...tools] };
 }
+
+// Session ids are UUIDs, the same shape the CLI session id has
+// (packages/core/src/mcp-client.ts: input.sessionId ?? randomUUID(),
+// validated as a UUID). Two different sessions below stand in for
+// two different live sessions.
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
+const OTHER_SESSION_ID = "22222222-2222-4222-8222-222222222222";
 
 // --- 1. Pure gate: classification ---
 
@@ -128,6 +136,7 @@ test("gate: the default policy (empty allow-list) denies everything", () => {
       actor: "test",
       tool,
       idempotencyKey: "k1",
+      sessionId: SESSION_ID,
     });
     assert.equal(evaluation.decision, "deny", tool);
   }
@@ -139,6 +148,7 @@ test("gate: an auto tool runs only with an explicit allow rule", () => {
     actor: "test",
     tool: "read_file",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(allowed.tier, "auto");
   assert.equal(allowed.decision, "allow");
@@ -147,6 +157,7 @@ test("gate: an auto tool runs only with an explicit allow rule", () => {
     actor: "test",
     tool: "read_file",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(denied.decision, "deny");
   assert.match(denied.reason, /default-deny/);
@@ -160,15 +171,17 @@ test("gate: ask-first waits for approval, then passes; a wrong key still waits",
       actor: "test",
       tool,
       idempotencyKey: "k1",
+      sessionId: SESSION_ID,
     });
     assert.equal(waiting.decision, "ask-first", tool);
     assert.match(waiting.reason, /needs explicit approval/);
   }
-  approvals.grant("send_message", "k1", "zen");
+  approvals.grant("send_message", "k1", "zen", SESSION_ID);
   const allowed = evaluateToolCall(policy, approvals, {
     actor: "test",
     tool: "send_message",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(allowed.decision, "allow");
   assert.match(allowed.reason, /approved by zen/);
@@ -176,17 +189,19 @@ test("gate: ask-first waits for approval, then passes; a wrong key still waits",
     actor: "test",
     tool: "send_message",
     idempotencyKey: "k2",
+    sessionId: SESSION_ID,
   });
   assert.equal(wrongKey.decision, "ask-first");
 });
 
 test("gate: an approval without a policy rule still denies", () => {
   const approvals = new ApprovalStore();
-  approvals.grant("delete_file", "k1", "zen");
+  approvals.grant("delete_file", "k1", "zen", SESSION_ID);
   const evaluation = evaluateToolCall(defaultToolPolicy(), approvals, {
     actor: "test",
     tool: "delete_file",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(evaluation.decision, "deny");
   assert.match(evaluation.reason, /default-deny/);
@@ -204,11 +219,12 @@ test("gate: never-tier is denied even with a rule and an approval", () => {
     "transfer_between_accounts",
     "access_other_account",
   ]) {
-    approvals.grant(tool, "k1", "zen");
+    approvals.grant(tool, "k1", "zen", SESSION_ID);
     const evaluation = evaluateToolCall(policy, approvals, {
       actor: "test",
       tool,
       idempotencyKey: "k1",
+      sessionId: SESSION_ID,
     });
     assert.equal(evaluation.tier, "never", tool);
     assert.equal(evaluation.decision, "deny", tool);
@@ -236,19 +252,19 @@ test("gate: policy validation rejects a non-array allow-list and blank entries",
 
 test("gate: approval store grants, finds, revokes, lists", () => {
   const store = new ApprovalStore();
-  assert.equal(store.find("send_message", "k1"), undefined);
-  const approval = store.grant("send_message", "k1", "zen");
+  assert.equal(store.find("send_message", "k1", SESSION_ID), undefined);
+  const approval = store.grant("send_message", "k1", "zen", SESSION_ID);
   assert.equal(approval.toolName, "send_message");
   assert.equal(approval.grantedBy, "zen");
   assert.ok(approval.grantedAt.length > 0);
-  assert.deepEqual(store.find("send_message", "k1"), approval);
-  assert.equal(store.find("send_message", "k2"), undefined);
+  assert.deepEqual(store.find("send_message", "k1", SESSION_ID), approval);
+  assert.equal(store.find("send_message", "k2", SESSION_ID), undefined);
   assert.equal(store.list().length, 1);
-  assert.equal(store.revoke("send_message", "k1"), true);
-  assert.equal(store.revoke("send_message", "k1"), false);
-  assert.equal(store.find("send_message", "k1"), undefined);
+  assert.equal(store.revoke("send_message", "k1", SESSION_ID), true);
+  assert.equal(store.revoke("send_message", "k1", SESSION_ID), false);
+  assert.equal(store.find("send_message", "k1", SESSION_ID), undefined);
   assert.throws(
-    () => store.grant("", "k1", "zen"),
+    () => store.grant("", "k1", "zen", SESSION_ID),
     /non-empty tool/,
   );
 });
@@ -258,21 +274,21 @@ test("gate: approval store grants, finds, revokes, lists", () => {
 test("gate: a grant carries an expiry (default 15 minutes, overridable)", () => {
   const store = new ApprovalStore();
   const grantedAt = "2026-11-17T10:00:00.000Z";
-  const approval = store.grant("send_message", "k1", "zen", grantedAt);
+  const approval = store.grant("send_message", "k1", "zen", SESSION_ID, grantedAt);
   assert.equal(
     approval.expiresAt,
     new Date(Date.parse(grantedAt) + APPROVAL_TTL_MS).toISOString(),
   );
   assert.equal(APPROVAL_TTL_MS, 15 * 60 * 1000);
-  const short = store.grant("send_message", "k2", "zen", grantedAt, { ttlMs: 1000 });
+  const short = store.grant("send_message", "k2", "zen", SESSION_ID, grantedAt, { ttlMs: 1000 });
   assert.equal(short.expiresAt, "2026-11-17T10:00:01.000Z");
-  const pinned = store.grant("send_message", "k3", "zen", grantedAt, {
+  const pinned = store.grant("send_message", "k3", "zen", SESSION_ID, grantedAt, {
     expiresAt: "2026-11-17T11:00:00.000Z",
   });
   assert.equal(pinned.expiresAt, "2026-11-17T11:00:00.000Z");
-  assert.throws(() => store.grant("send_message", "k4", "zen", grantedAt, { ttlMs: 0 }), /ttlMs/);
+  assert.throws(() => store.grant("send_message", "k4", "zen", SESSION_ID, grantedAt, { ttlMs: 0 }), /ttlMs/);
   assert.throws(
-    () => store.grant("send_message", "k5", "zen", grantedAt, { expiresAt: "not-a-date" }),
+    () => store.grant("send_message", "k5", "zen", SESSION_ID, grantedAt, { expiresAt: "not-a-date" }),
     /expiresAt/,
   );
 });
@@ -283,13 +299,14 @@ test("gate: an expired grant reads as absent and never allows again", () => {
   // Granted with an expiry already in the past: dead on arrival.
   const past = new Date(Date.now() - 1000).toISOString();
   const pastGrantedAt = new Date(Date.now() - 2000).toISOString();
-  store.grant("send_message", "k-exp", "boss", pastGrantedAt, { expiresAt: past });
-  assert.equal(store.find("send_message", "k-exp"), undefined);
+  store.grant("send_message", "k-exp", "boss", SESSION_ID, pastGrantedAt, { expiresAt: past });
+  assert.equal(store.find("send_message", "k-exp", SESSION_ID), undefined);
   assert.equal(store.list().length, 0);
   const evaluation = evaluateToolCall(policy, store, {
     actor: "test",
     tool: "send_message",
     idempotencyKey: "k-exp",
+    sessionId: SESSION_ID,
   });
   assert.equal(evaluation.decision, "ask-first");
 });
@@ -298,20 +315,22 @@ test("gate: an approval is single-use through gateToolCall", () => {
   const log = new ActivityLog();
   const policy = policyAllowing(["send_message"]);
   const approvals = new ApprovalStore();
-  approvals.grant("send_message", "k1", "zen");
+  approvals.grant("send_message", "k1", "zen", SESSION_ID);
   const first = gateToolCall(policy, approvals, log, {
     actor: "tester",
     tool: "send_message",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(first.decision, "allow");
-  assert.equal(approvals.find("send_message", "k1"), undefined);
+  assert.equal(approvals.find("send_message", "k1", SESSION_ID), undefined);
   // Same tool + key again: the spent grant is gone, so the gate
   // waits for a fresh approval instead of allowing on the old one.
   const second = gateToolCall(policy, approvals, log, {
     actor: "tester",
     tool: "send_message",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(second.decision, "ask-first");
   assert.deepEqual(
@@ -320,14 +339,88 @@ test("gate: an approval is single-use through gateToolCall", () => {
   );
 });
 
+// --- 1c. P1-4 rev2: grants are bound to one session ---
+
+test("gate: a grant is bound to its session and unusable from another", () => {
+  const policy = policyAllowing(["send_message"]);
+  const approvals = new ApprovalStore();
+  approvals.grant("send_message", "k1", "zen", SESSION_ID);
+  // Same tool + key, other session: the grant is not there.
+  assert.equal(approvals.find("send_message", "k1", OTHER_SESSION_ID), undefined);
+  assert.equal(approvals.consume("send_message", "k1", OTHER_SESSION_ID), undefined);
+  const fromOther = evaluateToolCall(policy, approvals, {
+    actor: "tester",
+    tool: "send_message",
+    idempotencyKey: "k1",
+    sessionId: OTHER_SESSION_ID,
+  });
+  assert.equal(fromOther.decision, "ask-first");
+  // The owning session still allows, and the grant is still live
+  // (the other session's lookups spent nothing).
+  const fromOwner = evaluateToolCall(policy, approvals, {
+    actor: "tester",
+    tool: "send_message",
+    idempotencyKey: "k1",
+    sessionId: SESSION_ID,
+  });
+  assert.equal(fromOwner.decision, "allow");
+  // The same tool + key granted in the other session is
+  // independent: each session spends its own grant.
+  approvals.grant("send_message", "k1", "zen", OTHER_SESSION_ID);
+  const log = new ActivityLog();
+  assert.equal(
+    gateToolCall(policy, approvals, log, {
+      actor: "tester",
+      tool: "send_message",
+      idempotencyKey: "k1",
+      sessionId: SESSION_ID,
+    }).decision,
+    "allow",
+  );
+  assert.equal(
+    gateToolCall(policy, approvals, log, {
+      actor: "tester",
+      tool: "send_message",
+      idempotencyKey: "k1",
+      sessionId: OTHER_SESSION_ID,
+    }).decision,
+    "allow",
+  );
+  assert.equal(approvals.list().length, 0);
+});
+
+test("gate: revoke is session-scoped", () => {
+  const store = new ApprovalStore();
+  store.grant("send_message", "k1", "zen", SESSION_ID);
+  store.grant("send_message", "k1", "zen", OTHER_SESSION_ID);
+  assert.equal(store.revoke("send_message", "k1", SESSION_ID), true);
+  assert.equal(store.find("send_message", "k1", SESSION_ID), undefined);
+  assert.notEqual(store.find("send_message", "k1", OTHER_SESSION_ID), undefined);
+  assert.equal(store.revoke("send_message", "k1", SESSION_ID), false);
+  assert.equal(store.list().length, 1);
+});
+
+test("gate: grant requires a non-empty session id", () => {
+  const store = new ApprovalStore();
+  assert.throws(
+    () => store.grant("send_message", "k1", "zen", ""),
+    /non-empty session/,
+  );
+  assert.throws(
+    () => store.grant("send_message", "k1", "zen", "   "),
+    /non-empty session/,
+  );
+});
+
 test("hook: an approval is single-use through onToolCall", () => {
   const approvals = new ApprovalStore();
-  approvals.grant("send_message", "k1", "zen");
+  approvals.grant("send_message", "k1", "zen", SESSION_ID);
   const allowed = onToolCall(
     {
       contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
       toolName: "send_message",
       actor: "tester",
+      sessionId: SESSION_ID,
     },
     { policy: policyAllowing(["send_message"]), approvals },
   );
@@ -339,11 +432,54 @@ test("hook: an approval is single-use through onToolCall", () => {
           contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
           toolName: "send_message",
           actor: "tester",
+          sessionId: SESSION_ID,
         },
         { policy: policyAllowing(["send_message"]), approvals },
       ),
     /APPROVAL_REQUIRED/,
   );
+});
+
+test("hook: onToolCall requires a session id and scopes the grant to it", () => {
+  const approvals = new ApprovalStore();
+  approvals.grant("send_message", "k1", "zen", SESSION_ID);
+  // No session id at all: fail loud, like a missing idempotency key.
+  assert.throws(
+    () =>
+      onToolCall(
+        {
+          contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
+          toolName: "send_message",
+          actor: "tester",
+        },
+        { policy: policyAllowing(["send_message"]), approvals },
+      ),
+    /missing session id/,
+  );
+  // The grant's session allows; another session waits.
+  assert.throws(
+    () =>
+      onToolCall(
+        {
+          contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
+          toolName: "send_message",
+          actor: "tester",
+          sessionId: OTHER_SESSION_ID,
+        },
+        { policy: policyAllowing(["send_message"]), approvals },
+      ),
+    /APPROVAL_REQUIRED/,
+  );
+  const allowed = onToolCall(
+    {
+      contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
+      toolName: "send_message",
+      actor: "tester",
+      sessionId: SESSION_ID,
+    },
+    { policy: policyAllowing(["send_message"]), approvals },
+  );
+  assert.equal(allowed.decision, "allow");
 });
 
 test("gate: the log records allow, deny, and ask-first with monotonic seq", () => {
@@ -355,18 +491,21 @@ test("gate: the log records allow, deny, and ask-first with monotonic seq", () =
     actor: "tester",
     tool: "read_file",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(a.decision, "allow");
   const b = gateToolCall(policy, approvals, log, {
     actor: "tester",
     tool: "send_message",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(b.decision, "ask-first");
   const c = gateToolCall(policy, approvals, log, {
     actor: "tester",
     tool: "trade_securities",
     idempotencyKey: "k1",
+    sessionId: SESSION_ID,
   });
   assert.equal(c.decision, "deny");
   assert.equal(log.length, 3);
@@ -402,6 +541,7 @@ test("hook: an allowed auto tool returns its evaluation", () => {
       contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
       toolName: "read_file",
       actor: "tester",
+      sessionId: SESSION_ID,
     },
     { policy: policyAllowing(["read_file"]), log },
   );
@@ -420,6 +560,7 @@ test("hook: ask-first without approval throws APPROVAL_REQUIRED and logs it", ()
           contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
           toolName: "send_message",
           actor: "tester",
+          sessionId: SESSION_ID,
         },
         { policy: policyAllowing(["send_message"]), log },
       ),
@@ -431,7 +572,7 @@ test("hook: ask-first without approval throws APPROVAL_REQUIRED and logs it", ()
 
 test("hook: never-tier throws APPROVAL_NEVER_DENIED even with a rule and an approval", () => {
   const approvals = new ApprovalStore();
-  approvals.grant("trade_securities", "k1", "zen");
+  approvals.grant("trade_securities", "k1", "zen", SESSION_ID);
   assert.throws(
     () =>
       onToolCall(
@@ -439,6 +580,7 @@ test("hook: never-tier throws APPROVAL_NEVER_DENIED even with a rule and an appr
           contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
           toolName: "trade_securities",
           actor: "tester",
+          sessionId: SESSION_ID,
         },
         { policy: policyAllowing(["trade_securities"]), approvals },
       ),
@@ -452,6 +594,7 @@ test("hook: no policy means default-deny, and the contract checks still fail lou
       onToolCall({
         contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
         toolName: "read_file",
+        sessionId: SESSION_ID,
       }),
     /TOOL_POLICY_DENIED/,
   );
@@ -495,17 +638,46 @@ test("tools-client approve: invokes sen_tool_approve with the grant under args",
       idempotencyKey: "k1",
       grantedBy: "zen",
       grantedAt: "epoch-1",
+      expiresAtSecs: 1793123456,
     };
   });
   try {
     const approval = await approveTool(contract(), "send_message", "k1", "zen");
     assert.equal(approval.grantedBy, "zen");
+    assert.equal(approval.expiresAtSecs, 1793123456);
     assert.equal(seen[0]["command"], "sen_tool_approve");
     assert.deepEqual(seen[0]["args"], {
       toolName: "send_message",
       idempotencyKey: "k1",
       grantedBy: "zen",
     });
+  } finally {
+    setBridgeTransport(null);
+  }
+});
+
+test("tools-client revoke: invokes sen_tool_revoke and returns its boolean", async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  setBridgeTransport(async (command, args) => {
+    seen.push({ command, ...args });
+    return true;
+  });
+  try {
+    assert.equal(await revokeTool(contract(), "send_message", "k1"), true);
+    assert.equal(seen[0]["command"], "sen_tool_revoke");
+    assert.deepEqual(seen[0]["args"], {
+      toolName: "send_message",
+      idempotencyKey: "k1",
+    });
+  } finally {
+    setBridgeTransport(null);
+  }
+});
+
+test("tools-client revoke: a non-boolean answer fails loudly", async () => {
+  setBridgeTransport(async () => "yes");
+  try {
+    await assert.rejects(() => revokeTool(contract(), "send_message", "k1"), /malformed/);
   } finally {
     setBridgeTransport(null);
   }

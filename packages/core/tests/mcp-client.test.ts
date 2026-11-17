@@ -30,6 +30,12 @@ import {
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const FAKE_SERVER = join(FIXTURES, "mcp-fake-server.mjs");
 
+// Session ids are UUIDs, the same shape the CLI session id has
+// (input.sessionId ?? randomUUID() in mcp-client.ts, validated as
+// a UUID). Two ids stand in for two different live sessions.
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
+const OTHER_SESSION_ID = "22222222-2222-4222-8222-222222222222";
+
 function stdioConfig(): McpServerConfig {
   return { command: process.execPath, args: [FAKE_SERVER] };
 }
@@ -186,6 +192,7 @@ test("gate: default-deny refuses before the tool runs and logs once", async () =
           tool: "echo",
           arguments: { hello: "world" },
           idempotencyKey: "k1",
+          sessionId: SESSION_ID,
         }),
       /TOOL_POLICY_DENIED/,
     );
@@ -209,6 +216,7 @@ test("gate: an auto-tier tool with an allow rule runs, no approval needed", asyn
         tool: "read_file",
         arguments: { path: "README.md" },
         idempotencyKey: "k2",
+        sessionId: SESSION_ID,
       },
     );
     assert.equal(result.isError, false);
@@ -229,6 +237,7 @@ test("gate: an ask-first tool needs an approval, then runs", async () => {
     tool: "echo",
     arguments: { hello: "world" },
     idempotencyKey: "k3",
+    sessionId: SESSION_ID,
   };
   try {
     await assert.rejects(
@@ -236,7 +245,7 @@ test("gate: an ask-first tool needs an approval, then runs", async () => {
         executeMcpTool(client, { policy: { allow: ["echo"] }, approvals, log }, input),
       /APPROVAL_REQUIRED/,
     );
-    approvals.grant("echo", "k3", "zen");
+    approvals.grant("echo", "k3", "zen", SESSION_ID);
     const { result } = await executeMcpTool(
       client,
       { policy: { allow: ["echo"] }, approvals, log },
@@ -263,9 +272,10 @@ test("gate: an ask-first approval is single-use through executeMcpTool", async (
     tool: "echo",
     arguments: { hello: "world" },
     idempotencyKey: "k3",
+    sessionId: SESSION_ID,
   };
   try {
-    approvals.grant("echo", "k3", "zen");
+    approvals.grant("echo", "k3", "zen", SESSION_ID);
     const { result } = await executeMcpTool(
       client,
       { policy: { allow: ["echo"] }, approvals, log },
@@ -292,9 +302,10 @@ test("gate: an ask-first approval is single-use without a log", async () => {
     tool: "echo",
     arguments: { hello: "world" },
     idempotencyKey: "k3",
+    sessionId: SESSION_ID,
   };
   try {
-    approvals.grant("echo", "k3", "zen");
+    approvals.grant("echo", "k3", "zen", SESSION_ID);
     const { result } = await executeMcpTool(
       client,
       { policy: { allow: ["echo"] }, approvals },
@@ -311,10 +322,43 @@ test("gate: an ask-first approval is single-use without a log", async () => {
   }
 });
 
+test("gate: an approval granted for another session does not run the tool", async () => {
+  const client = await connectedClient();
+  const approvals = new ApprovalStore();
+  const log = new ActivityLog();
+  const input = {
+    actor: "sen",
+    server: "fake",
+    tool: "echo",
+    arguments: { hello: "world" },
+    idempotencyKey: "k3",
+    sessionId: SESSION_ID,
+  };
+  try {
+    // Granted for the other session only: this session still waits.
+    approvals.grant("echo", "k3", "zen", OTHER_SESSION_ID);
+    await assert.rejects(
+      () =>
+        executeMcpTool(client, { policy: { allow: ["echo"] }, approvals, log }, input),
+      /APPROVAL_REQUIRED/,
+    );
+    // Granted for this session: the tool runs.
+    approvals.grant("echo", "k3", "zen", SESSION_ID);
+    const { result } = await executeMcpTool(
+      client,
+      { policy: { allow: ["echo"] }, approvals, log },
+      input,
+    );
+    assert.equal(result.isError, false);
+  } finally {
+    await client.close();
+  }
+});
+
 test("gate: a never-tier tool is denied even with a rule and an approval", async () => {
   const client = await connectedClient();
   const approvals = new ApprovalStore();
-  approvals.grant("trade_securities", "k4", "zen");
+  approvals.grant("trade_securities", "k4", "zen", SESSION_ID);
   try {
     await assert.rejects(
       () =>
@@ -327,6 +371,7 @@ test("gate: a never-tier tool is denied even with a rule and an approval", async
             tool: "trade_securities",
             arguments: {},
             idempotencyKey: "k4",
+            sessionId: SESSION_ID,
           },
         ),
       /APPROVAL_NEVER_DENIED/,

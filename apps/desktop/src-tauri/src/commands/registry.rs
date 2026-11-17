@@ -940,7 +940,12 @@ impl Registry {
     ///   way a tool becomes runnable at all.
     /// - `approve_tool` grants one approval for one tool + one
     ///   idempotency key, by a named granter. A grant for a
-    ///   never-tier tool is recorded but never honored.
+    ///   never-tier tool is recorded but never honored. A grant
+    ///   lives APPROVAL_TTL_SECS (15 minutes) and is spent the
+    ///   first time the gate allows a call with it (P1-4).
+    /// - `revoke_tool` removes one approval: the next call with
+    ///   that tool + key waits for a fresh approval. It never
+    ///   touches the activity log (the log has no delete path).
     /// - `activity_log` / `list_approvals` read back the gate state
     ///   (clones; the log has no delete or update path).
     pub fn allow_tool(&mut self, tool_name: &str) {
@@ -960,11 +965,15 @@ impl Registry {
         self.approvals.grant(tool_name, idempotency_key, granted_by)
     }
 
+    pub fn revoke_tool(&mut self, tool_name: &str, idempotency_key: &str) -> bool {
+        self.approvals.revoke(tool_name, idempotency_key)
+    }
+
     pub fn activity_log(&self) -> Vec<ActivityEntry> {
         self.activity_log.entries()
     }
 
-    pub fn list_approvals(&self) -> Vec<Approval> {
+    pub fn list_approvals(&mut self) -> Vec<Approval> {
         self.approvals.list()
     }
 
@@ -991,7 +1000,7 @@ impl Registry {
         assert_gate_order(&GATE_ORDER)?;
         let evaluation = gate_tool_call(
             &self.tool_policy,
-            &self.approvals,
+            &mut self.approvals,
             &mut self.activity_log,
             &contract.actor,
             tool_name,
@@ -1893,6 +1902,42 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         other.idempotency_key = "k2".to_string();
         let err = reg.tool_call(&other, "send_message").unwrap_err();
         assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+    }
+
+    #[test]
+    fn tool_call_approval_is_single_use() {
+        // P1-4: one grant authorizes exactly one allowed call. The
+        // first tool_call passes the gate (and ends in
+        // TOOL_EXECUTION_NOT_WIRED, because execution is a later
+        // phase); the same tool + key again waits for a fresh
+        // approval instead of passing on the spent grant.
+        let mut reg = Registry::new();
+        reg.allow_tool("send_message");
+        reg.approve_tool("send_message", "k1", "zen");
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+        assert_eq!(reg.list_approvals().len(), 0);
+    }
+
+    #[test]
+    fn revoke_tool_removes_the_grant_and_the_next_call_waits() {
+        let mut reg = Registry::new();
+        reg.allow_tool("send_message");
+        assert!(!reg.revoke_tool("send_message", "k1"));
+        reg.approve_tool("send_message", "k1", "zen");
+        assert_eq!(reg.list_approvals().len(), 1);
+        assert!(reg.revoke_tool("send_message", "k1"));
+        assert!(!reg.revoke_tool("send_message", "k1"));
+        assert!(reg.list_approvals().is_empty());
+        // The revoked grant authorizes nothing: the call waits.
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+        // Revoking never touches the log: only the one
+        // awaiting-approval entry from this call is there.
+        assert_eq!(reg.activity_log().len(), 1);
+        assert_eq!(reg.activity_log()[0].result, "awaiting-approval");
     }
 
     #[test]

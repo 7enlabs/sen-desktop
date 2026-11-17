@@ -7,7 +7,9 @@
 // passes, sen_tool_call still ends in TOOL_EXECUTION_NOT_WIRED, and
 // that is honest — permission granted is not execution.
 // sen_tool_approve grants one approval (one tool + one idempotency
-// key, by a named granter); sen_tool_activity_log reads the log back.
+// key, by a named granter); sen_tool_revoke removes one approval
+// (one tool + one idempotency key, true when a live grant was
+// removed); sen_tool_activity_log reads the log back.
 // No key, token, or credential travels through any of these commands.
 use serde::Deserialize;
 use std::sync::Mutex;
@@ -64,6 +66,37 @@ pub fn sen_tool_approve(
     }
     let mut registry = state.lock().map_err(|e| e.to_string())?;
     Ok(registry.approve_tool(&args.tool_name, &args.idempotency_key, &args.granted_by))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevokeToolArgs {
+    pub tool_name: String,
+    pub idempotency_key: String,
+}
+
+/// sen_tool_revoke: remove one approval (one tool + one
+/// idempotency key). The contract is validated first (a bad
+/// contract revokes nothing). Returns true when a live grant was
+/// removed, false when there was none (already spent, expired, or
+/// never granted). Revoking a grant never touches the activity log:
+/// the log has no delete path, and the removal itself is not a
+/// log entry — the next call with that tool + key is recorded as
+/// awaiting-approval like any other unapproved call.
+#[tauri::command]
+pub fn sen_tool_revoke(
+    state: State<'_, Mutex<Registry>>,
+    contract: ContractArgs,
+    args: RevokeToolArgs,
+) -> Result<bool, String> {
+    super::registry::validate_contract(&contract.to_registry()).map_err(|e| e.to_wire())?;
+    if args.tool_name.trim().is_empty() || args.idempotency_key.trim().is_empty() {
+        return Err(
+            "INVALID_CONTRACT: revoke needs a non-empty tool and idempotency key, FAIL".to_string(),
+        );
+    }
+    let mut registry = state.lock().map_err(|e| e.to_string())?;
+    Ok(registry.revoke_tool(&args.tool_name, &args.idempotency_key))
 }
 
 /// sen_tool_activity_log: read back the append-only activity log

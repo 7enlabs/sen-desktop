@@ -744,6 +744,11 @@ export interface McpToolCallInput {
   tool: string;
   arguments?: Record<string, unknown>;
   idempotencyKey: string;
+  /** The live session asking for the tool: the CLI --session-id
+   * UUID (input.sessionId ?? randomUUID() in the delegate path).
+   * The approval must belong to this session, not just to this
+   * tool + key. */
+  sessionId: string;
 }
 
 /**
@@ -766,16 +771,21 @@ export async function executeMcpTool(
 ): Promise<{ result: McpToolResult; evaluation: GateEvaluation }> {
   const policy = gate.policy ?? { allow: [] };
   const approvals = gate.approvals ?? new ApprovalStore();
+  if (!input.sessionId?.trim()) {
+    throw new Error("MCP_VALIDATION: sessionId must be a non-empty string");
+  }
   const evaluation = gate.log
     ? gateToolCall(policy, approvals, gate.log, {
         actor: input.actor,
         tool: input.tool,
         idempotencyKey: input.idempotencyKey,
+        sessionId: input.sessionId,
       })
     : evaluateToolCall(policy, approvals, {
         actor: input.actor,
         tool: input.tool,
         idempotencyKey: input.idempotencyKey,
+        sessionId: input.sessionId,
       });
   if (evaluation.decision !== "allow") {
     if (evaluation.decision === "ask-first") {
@@ -791,7 +801,7 @@ export async function executeMcpTool(
   // spent it inside gateToolCall, so this second consume is a
   // no-op there; the unlogged path spends it here.
   if (evaluation.tier === "ask-first") {
-    approvals.consume(input.tool, input.idempotencyKey);
+    approvals.consume(input.tool, input.idempotencyKey, input.sessionId);
   }
   const result = await client.callTool(
     input.tool,

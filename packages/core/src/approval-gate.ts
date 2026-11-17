@@ -159,7 +159,14 @@ export function validateToolPolicy(policy: unknown): string[] {
  * A grant is bounded two ways (Sen P1-4): it expires
  * APPROVAL_TTL_MS after it is granted, and it is spent the first
  * time a gate allows a call with it — a second call with the same
- * tool + key waits for a fresh approval. */
+ * tool + key waits for a fresh approval. It is bounded a third way
+ * (P1-4 rev2): it belongs to one session. The session id is the
+ * live session's id — the SessionManager key in
+ * packages/core/src/session.ts, the CLI --session-id UUID in
+ * packages/core/src/mcp-client.ts (input.sessionId ??
+ * randomUUID(), validated as a UUID). No new session is invented
+ * here: the caller passes the session it already runs in, and a
+ * grant from another session never authorizes a call in this one. */
 export interface Approval {
   toolName: string;
   idempotencyKey: string;
@@ -167,6 +174,8 @@ export interface Approval {
   grantedAt: string;
   /** ISO timestamp after which the grant no longer counts. */
   expiresAt: string;
+  /** The one live session this grant belongs to (a UUID). */
+  sessionId: string;
 }
 
 /**
@@ -179,13 +188,15 @@ export interface Approval {
  */
 export const APPROVAL_TTL_MS = 15 * 60 * 1000;
 
-/** In-memory approval grants. A grant matches one tool + one key,
- * lives at most APPROVAL_TTL_MS, and is spent on first use. */
+/** In-memory approval grants. A grant matches one session + one
+ * tool + one key, lives at most APPROVAL_TTL_MS, and is spent on
+ * first use. The same tool + key granted in two sessions are two
+ * independent grants: neither session can spend the other's. */
 export class ApprovalStore {
   private grants = new Map<string, Approval>();
 
-  private static key(toolName: string, idempotencyKey: string): string {
-    return `${toolName}\n${idempotencyKey}`;
+  private static key(sessionId: string, toolName: string, idempotencyKey: string): string {
+    return `${sessionId}\n${toolName}\n${idempotencyKey}`;
   }
 
   private static isExpired(approval: Approval, nowMs: number): boolean {
@@ -197,12 +208,18 @@ export class ApprovalStore {
     toolName: string,
     idempotencyKey: string,
     grantedBy: string,
+    sessionId: string,
     grantedAt: string = new Date().toISOString(),
     options: { ttlMs?: number; expiresAt?: string } = {},
   ): Approval {
     if (!toolName.trim() || !idempotencyKey.trim() || !grantedBy.trim()) {
       throw new Error(
         "Approval needs a non-empty tool, idempotency key, and granter, FAIL",
+      );
+    }
+    if (!sessionId.trim()) {
+      throw new Error(
+        "Approval needs a non-empty session id, FAIL",
       );
     }
     if (options.ttlMs !== undefined) {
@@ -221,13 +238,13 @@ export class ApprovalStore {
         baseMs + (options.ttlMs ?? APPROVAL_TTL_MS),
       ).toISOString();
     }
-    const approval: Approval = { toolName, idempotencyKey, grantedBy, grantedAt, expiresAt };
-    this.grants.set(ApprovalStore.key(toolName, idempotencyKey), approval);
+    const approval: Approval = { toolName, idempotencyKey, grantedBy, grantedAt, expiresAt, sessionId };
+    this.grants.set(ApprovalStore.key(sessionId, toolName, idempotencyKey), approval);
     return { ...approval };
   }
 
-  find(toolName: string, idempotencyKey: string): Approval | undefined {
-    const key = ApprovalStore.key(toolName, idempotencyKey);
+  find(toolName: string, idempotencyKey: string, sessionId: string): Approval | undefined {
+    const key = ApprovalStore.key(sessionId, toolName, idempotencyKey);
     const found = this.grants.get(key);
     if (!found) {
       return undefined;
@@ -247,18 +264,18 @@ export class ApprovalStore {
    * it either way, so one approval authorizes exactly one allowed
    * call. Returns undefined for an absent or expired grant.
    */
-  consume(toolName: string, idempotencyKey: string): Approval | undefined {
-    const found = this.find(toolName, idempotencyKey);
+  consume(toolName: string, idempotencyKey: string, sessionId: string): Approval | undefined {
+    const found = this.find(toolName, idempotencyKey, sessionId);
     if (!found) {
       return undefined;
     }
-    this.grants.delete(ApprovalStore.key(toolName, idempotencyKey));
+    this.grants.delete(ApprovalStore.key(sessionId, toolName, idempotencyKey));
     return found;
   }
 
   /** Revoking a grant removes the grant, never a log entry. */
-  revoke(toolName: string, idempotencyKey: string): boolean {
-    return this.grants.delete(ApprovalStore.key(toolName, idempotencyKey));
+  revoke(toolName: string, idempotencyKey: string, sessionId: string): boolean {
+    return this.grants.delete(ApprovalStore.key(sessionId, toolName, idempotencyKey));
   }
 
   list(): Approval[] {
@@ -339,6 +356,9 @@ export interface ToolCallInput {
   actor: string;
   tool: string;
   idempotencyKey: string;
+  /** The live session asking for the tool (a UUID): the approval
+   * must belong to this session, not just to this tool + key. */
+  sessionId: string;
 }
 
 export interface GateEvaluation {
@@ -392,7 +412,7 @@ export function evaluateToolCall(
     };
   }
   if (tier === "ask-first") {
-    const approval = approvals.find(input.tool, input.idempotencyKey);
+    const approval = approvals.find(input.tool, input.idempotencyKey, input.sessionId);
     if (!approval) {
       return {
         tier,
@@ -442,7 +462,7 @@ export function gateToolCall(
     result: resultOf(evaluation.decision),
   });
   if (evaluation.decision === "allow" && evaluation.tier === "ask-first") {
-    approvals.consume(input.tool, input.idempotencyKey);
+    approvals.consume(input.tool, input.idempotencyKey, input.sessionId);
   }
   return evaluation;
 }
