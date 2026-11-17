@@ -8,16 +8,17 @@
 //
 // HOW A TURN RUNS (verified against the real CLI, rev 8ac73fe):
 //   zen -p --output-format stream-json --bare --setting-sources ""
-//       --model <model> [--base-url <url>] [--session-id <id> | -r <id>] <prompt>
+//       --model <model> [--base-url <url>] [--session-id <id> | -r <id>] -- <prompt>
 // - `--setting-sources ""` + `--bare` keep project/user settings out of
 //   the run, so a turn is reproducible from its explicit inputs.
 // - The first turn of a handle starts a fresh CLI session named with
 //   --session-id; every later turn resumes it with -r. The B2 bridge
 //   verified that --session-id alone does NOT load history while -r <id>
 //   sends the full history (system, prior prompts, prior replies).
-// - The prompt is the last argv element; flags never follow it. The key
-//   is NEVER in argv: the CLI reads ZEN_API_KEY from the inherited
-//   environment itself. The bridge never logs argv (it holds prompt text)
+// - The prompt is the last argv element, preceded by `--` so a prompt
+//   starting with `-` (e.g. "- fix bug", "--help") is passed to the CLI
+//   as the prompt, never parsed as a flag (Rust P1-1). Flags never
+//   follow it. The key is NEVER in argv: the CLI reads ZEN_API_KEY from
 //   and never logs the environment.
 // - stream-json records on stdout are parsed + translated by
 //   stream_json.rs and delivered to the caller through the `emit`
@@ -166,8 +167,12 @@ pub fn no_result_error_code(exit_code: Option<i32>) -> &'static str {
 }
 
 /// Build the exact CLI argv for one turn. The prompt is the last argv
-/// element; flags never follow it. `resume` = false starts a fresh CLI
-/// session named --session-id <id>; true resumes it with -r <id>.
+/// element, preceded by `--` so a prompt starting with `-` is passed as
+/// the prompt value, never parsed as a CLI flag (Rust P1-1: without the
+/// separator, "- fix bug" fails clap parsing with exit 4 and "--help"
+/// prints CLI help, both with no result record). Flags never follow it.
+/// `resume` = false starts a fresh CLI session named --session-id <id>;
+/// true resumes it with -r <id>.
 /// `base_url` (R2B-05) appends `--base-url <url>` after --model when
 /// Some, and passes no flag when None (the CLI uses its own default
 /// endpoint). No key appears anywhere in argv: the CLI reads
@@ -200,6 +205,9 @@ pub fn build_cli_argv(
         argv.push("--session-id".to_string());
         argv.push(session_id.to_string());
     }
+    // Rust P1-1: `--` ends flag parsing, so the prompt that follows is
+    // always the positional prompt, even when it starts with `-`.
+    argv.push("--".to_string());
     argv.push(text.to_string());
     argv
 }
@@ -963,6 +971,7 @@ exit 0"#;
                 "m:free",
                 "--session-id",
                 "s1",
+                "--",
                 "hi",
             ]
         );
@@ -996,6 +1005,7 @@ exit 0"#;
                 url,
                 "--session-id",
                 "s1",
+                "--",
                 "hi",
             ]
         );
@@ -1008,6 +1018,32 @@ exit 0"#;
         // None passes no flag at all.
         let none = build_cli_argv("m:free", None, "s1", false, "hi");
         assert!(!none.contains(&"--base-url".to_string()));
+    }
+
+    // Rust P1-1: a prompt starting with `-` must travel after `--`,
+    // so the CLI parses it as the prompt, never as a flag. Without the
+    // separator, "- fix bug" fails clap parsing (exit 4) and "--help"
+    // prints CLI help (exit 0); both produce no result record, so the
+    // bridge reports the turn failed. Verified live against the real
+    // CLI binary: with `--`, both prompts reach the model path and the
+    // CLI emits a `result` record.
+    #[test]
+    fn build_argv_separates_hyphen_prompt_with_double_dash() {
+        for prompt in ["- fix bug", "--help", "-h", "--version", "hi"] {
+            let argv = build_cli_argv("m:free", None, "s1", false, prompt);
+            // `--` sits immediately before the prompt, which stays last.
+            let sep = argv.iter().position(|a| a == "--").unwrap();
+            assert_eq!(argv[sep + 1], prompt);
+            assert_eq!(argv.last().unwrap(), prompt);
+            // Nothing after `--` can be mistaken for a flag: the only
+            // element past the separator is the prompt itself.
+            assert_eq!(argv.len(), sep + 2);
+        }
+        // The separator is present on resume turns too.
+        let later = build_cli_argv("m:free", None, "s1", true, "--help");
+        let sep = later.iter().position(|a| a == "--").unwrap();
+        assert_eq!(later[sep + 1], "--help");
+        assert_eq!(later.last().unwrap(), "--help");
     }
 
     // R2B-05: a turn on a bridge created with a base URL really spawns
