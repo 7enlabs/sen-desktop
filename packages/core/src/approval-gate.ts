@@ -155,15 +155,32 @@ export function validateToolPolicy(policy: unknown): string[] {
   return errors;
 }
 
-/** One explicit approval: granted by a person, for one tool call. */
+/** One explicit approval: granted by a person, for one tool call.
+ * A grant is bounded two ways (Sen P1-4): it expires
+ * APPROVAL_TTL_MS after it is granted, and it is spent the first
+ * time a gate allows a call with it — a second call with the same
+ * tool + key waits for a fresh approval. */
 export interface Approval {
   toolName: string;
   idempotencyKey: string;
   grantedBy: string;
   grantedAt: string;
+  /** ISO timestamp after which the grant no longer counts. */
+  expiresAt: string;
 }
 
-/** In-memory approval grants. A grant matches one tool + one key. */
+/**
+ * Default lifetime of a grant: 15 minutes. Long enough for a person
+ * to approve in the UI and the call to run at once; short enough
+ * that an approval from long ago can never authorize a later run.
+ * A caller that needs a different window passes ttlMs/expiresAt
+ * to grant(); the default is the fail-closed choice, not a
+ * per-call decision.
+ */
+export const APPROVAL_TTL_MS = 15 * 60 * 1000;
+
+/** In-memory approval grants. A grant matches one tool + one key,
+ * lives at most APPROVAL_TTL_MS, and is spent on first use. */
 export class ApprovalStore {
   private grants = new Map<string, Approval>();
 
@@ -171,25 +188,72 @@ export class ApprovalStore {
     return `${toolName}\n${idempotencyKey}`;
   }
 
+  private static isExpired(approval: Approval, nowMs: number): boolean {
+    const expiresMs = Date.parse(approval.expiresAt);
+    return Number.isNaN(expiresMs) || expiresMs <= nowMs;
+  }
+
   grant(
     toolName: string,
     idempotencyKey: string,
     grantedBy: string,
     grantedAt: string = new Date().toISOString(),
+    options: { ttlMs?: number; expiresAt?: string } = {},
   ): Approval {
     if (!toolName.trim() || !idempotencyKey.trim() || !grantedBy.trim()) {
       throw new Error(
         "Approval needs a non-empty tool, idempotency key, and granter, FAIL",
       );
     }
-    const approval: Approval = { toolName, idempotencyKey, grantedBy, grantedAt };
+    if (options.ttlMs !== undefined) {
+      if (!Number.isFinite(options.ttlMs) || options.ttlMs <= 0) {
+        throw new Error("Approval ttlMs must be a positive number, FAIL");
+      }
+    }
+    let expiresAt = options.expiresAt;
+    if (expiresAt !== undefined && Number.isNaN(Date.parse(expiresAt))) {
+      throw new Error("Approval expiresAt must be a valid ISO date, FAIL");
+    }
+    if (expiresAt === undefined) {
+      const grantedMs = Date.parse(grantedAt);
+      const baseMs = Number.isNaN(grantedMs) ? Date.now() : grantedMs;
+      expiresAt = new Date(
+        baseMs + (options.ttlMs ?? APPROVAL_TTL_MS),
+      ).toISOString();
+    }
+    const approval: Approval = { toolName, idempotencyKey, grantedBy, grantedAt, expiresAt };
     this.grants.set(ApprovalStore.key(toolName, idempotencyKey), approval);
     return { ...approval };
   }
 
   find(toolName: string, idempotencyKey: string): Approval | undefined {
-    const found = this.grants.get(ApprovalStore.key(toolName, idempotencyKey));
-    return found ? { ...found } : undefined;
+    const key = ApprovalStore.key(toolName, idempotencyKey);
+    const found = this.grants.get(key);
+    if (!found) {
+      return undefined;
+    }
+    // An expired grant counts as absent, and is dropped so it can
+    // never be honored later: expiry is enforced on read, not only
+    // on grant.
+    if (ApprovalStore.isExpired(found, Date.now())) {
+      this.grants.delete(key);
+      return undefined;
+    }
+    return { ...found };
+  }
+
+  /**
+   * Spend a grant: return it only if it is still live, and remove
+   * it either way, so one approval authorizes exactly one allowed
+   * call. Returns undefined for an absent or expired grant.
+   */
+  consume(toolName: string, idempotencyKey: string): Approval | undefined {
+    const found = this.find(toolName, idempotencyKey);
+    if (!found) {
+      return undefined;
+    }
+    this.grants.delete(ApprovalStore.key(toolName, idempotencyKey));
+    return found;
   }
 
   /** Revoking a grant removes the grant, never a log entry. */
@@ -198,7 +262,16 @@ export class ApprovalStore {
   }
 
   list(): Approval[] {
-    return [...this.grants.values()].map((a) => ({ ...a }));
+    const nowMs = Date.now();
+    const live: Approval[] = [];
+    for (const [key, approval] of this.grants) {
+      if (ApprovalStore.isExpired(approval, nowMs)) {
+        this.grants.delete(key);
+        continue;
+      }
+      live.push({ ...approval });
+    }
+    return live;
   }
 }
 
@@ -288,8 +361,11 @@ function resultOf(decision: GateDecision): ActivityResult {
 /**
  * Pure evaluation, in fixed order: never-tier first (no override),
  * then the default-deny policy, then the approval check for
- * ask-first tools. No side effect, no logging: use gateToolCall for
- * the evaluated + recorded path.
+ * ask-first tools. No side effect on live grants, no logging: use
+ * gateToolCall for the evaluated + recorded + consuming path.
+ * (find() drops grants that already expired, so an expired grant
+ * reads as absent here too; a live grant is never spent by this
+ * function — only the caller that acts on an allow spends it.)
  */
 export function evaluateToolCall(
   policy: ToolPolicy,
@@ -345,6 +421,10 @@ export function evaluateToolCall(
  * denied, and awaiting-approval are all recorded, exactly once each.
  * "Allow" here means permission granted, not executed: the caller
  * still has to run (or refuse to run) the tool itself.
+ * An allow for an ask-first tool spends the approval that allowed
+ * it (ApprovalStore.consume): one grant authorizes exactly one
+ * call, so replaying the same tool + key waits for a fresh
+ * approval. Auto-tier allows spend nothing (no approval exists).
  */
 export function gateToolCall(
   policy: ToolPolicy,
@@ -361,5 +441,8 @@ export function gateToolCall(
     reason: evaluation.reason,
     result: resultOf(evaluation.decision),
   });
+  if (evaluation.decision === "allow" && evaluation.tier === "ask-first") {
+    approvals.consume(input.tool, input.idempotencyKey);
+  }
   return evaluation;
 }

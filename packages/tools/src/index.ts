@@ -97,6 +97,12 @@ export function onToolCall(
     });
   }
   if (evaluation.decision === "allow") {
+    // An allow for an ask-first tool spends the approval (P1-4):
+    // one grant authorizes exactly one call, so the same tool +
+    // key cannot pass this hook again on an old approval.
+    if (evaluation.tier === "ask-first") {
+      approvals.consume(event.toolName, event.contract.idempotencyKey);
+    }
     return evaluation;
   }
   if (evaluation.decision === "ask-first") {

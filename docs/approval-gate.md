@@ -123,7 +123,12 @@ storage of the log is a later phase, not this one.
    and the same idempotency key, plus who granted it
    (`approveTool` on the frontend).
 3. The caller retries the same tool + key; the gate finds the
-   approval and allows it (recorded as `allowed`).
+   approval and allows it (recorded as `allowed`). That allow
+   spends the approval (P1-4): a grant is single-use, and it
+   expires 15 minutes after being granted (`APPROVAL_TTL_MS`,
+   overridable per grant) — an old approval never authorizes a
+   later call, and replaying the same tool + key waits for a
+   fresh approval.
 4. A different idempotency key is a different call: it waits for
    its own approval. Revoking a grant (`ApprovalStore.revoke`)
    makes the next call wait again.
