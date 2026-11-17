@@ -538,6 +538,18 @@ impl<H: TelegramHttp> TelegramPoller<H> {
         self.client.allow_any_chat()
     }
 
+    /// Clone the poller's client. Send and status use the clone with
+    /// no lock held, so a reply never queues behind a poll round in
+    /// flight (Rust P1-3): the client is cheap to clone (the reqwest
+    /// client shares its connection pool) and carries the same token
+    /// and allowlist as the poller's own.
+    pub fn clone_client(&self) -> TelegramClient<H>
+    where
+        H: Clone,
+    {
+        self.client.clone()
+    }
+
     /// Send one reply through the poller's client.
     pub fn client_send_message(&self, chat_id: i64, text: &str) -> Result<(), String> {
         self.client.send_message(chat_id, text)
@@ -768,6 +780,30 @@ mod tests {
         let mixed = format!("{}😀", "y".repeat(4095));
         client.send_message(100, &mixed).unwrap();
         assert_eq!(http.calls().len(), 2);
+    }
+
+    #[test]
+    fn clone_client_shares_token_and_config_and_sends() {
+        // Rust P1-3: send clones the client out of the poller and
+        // sends with no lock held. The clone must carry the same
+        // token and allowlist, and send through the same transport.
+        let http = FakeHttp::new(vec![]);
+        let client = TelegramClient::with_http(http.clone(), "TOKEN123", Some(100))
+            .with_allow_any_chat(true);
+        let poller = TelegramPoller::new(client);
+        let cloned = poller.clone_client();
+        assert_eq!(cloned.allowed_chat_id(), Some(100));
+        assert!(cloned.allow_any_chat());
+        cloned.send_message(100, "hi").unwrap();
+        let calls = http.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].0.contains("/botTOKEN123/sendMessage"),
+            "url: {}",
+            calls[0].0
+        );
+        // The clone redacts the token in Debug, like the original.
+        assert!(!format!("{:?}", cloned).contains("TOKEN123"));
     }
 
     #[test]

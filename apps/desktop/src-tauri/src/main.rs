@@ -13,8 +13,11 @@
 //   SOUL.md, daily logs) under the app data dir + "sen-memory/". None
 //   when the dir is unavailable: memory commands then fail loudly and
 //   turns run on the bare text.
-// - Mutex<TelegramState>: the Telegram poller (client + offset), built
-//   lazily from the environment on first use. No token is stored
+// - TelegramState: the Telegram poller (client + offset), built
+//   lazily from the environment on first use. Its pieces live behind
+//   their own locks inside the struct (Rust P1-3), so it is managed
+//   directly, not wrapped in another Mutex: a poll round must never
+//   hold one lock across its 30s long-poll. No token is stored
 //   anywhere else, and no command ever returns one.
 mod commands;
 
@@ -29,7 +32,7 @@ fn main() {
     tauri::Builder::default()
         .manage(Mutex::new(Registry::new()))
         .manage(Mutex::new(None::<MemoryStore>))
-        .manage(Mutex::new(TelegramState::new()))
+        .manage(TelegramState::new())
         .setup(|app| {
             // Local CLI settings live in the app config dir
             // (cli-settings.json, model id + optional base URL, never a
@@ -58,10 +61,8 @@ fn main() {
                 // the in-memory offset moves, so a restart resumes
                 // instead of replaying handled updates. When the dir
                 // is unavailable the offset stays memory-only.
-                if let Some(state) = app.try_state::<Mutex<TelegramState>>() {
-                    if let Ok(mut telegram) = state.lock() {
-                        telegram.set_offset_path(dir.join("sen-memory").join("telegram-offset"));
-                    }
+                if let Some(state) = app.try_state::<TelegramState>() {
+                    state.set_offset_path(dir.join("sen-memory").join("telegram-offset"));
                 }
             }
             Ok(())
