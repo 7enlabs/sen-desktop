@@ -58,6 +58,9 @@ pub struct SetModelArgs {
 /// applies to sessions created after the change; a running session keeps
 /// the model it started with. Refuses a blank model. The stored base
 /// URL, if any, is preserved: setting the model must not wipe it.
+/// The load-change-save runs under `CliSettings::update`'s
+/// process-wide lock (P2-6), so a concurrent set_base_url / set_router
+/// cannot lose this change, and vice versa.
 #[tauri::command]
 pub fn sen_settings_set_model(
     app: AppHandle,
@@ -70,11 +73,11 @@ pub fn sen_settings_set_model(
         CliSettings::validate_model(&args.model).map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
     let dir = settings_dir(&app)
         .ok_or_else(|| "INVALID_CONTRACT: app config dir is not available, FAIL".to_string())?;
-    let mut settings = CliSettings::load(&dir);
-    settings.model = model.clone();
-    settings
-        .save(&dir)
-        .map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
+    let model = CliSettings::update(&dir, |settings| {
+        settings.model = model.clone();
+        Ok(model.clone())
+    })
+    .map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
     // Sessions created from now on use the new model.
     if let Ok(mut registry) = state.lock() {
         registry.set_settings_dir(dir);
@@ -115,7 +118,9 @@ pub struct SetBaseUrlArgs {
 /// change; a running session keeps the base URL it started with. A
 /// blank value clears the stored base URL (later sessions pass no
 /// --base-url flag). The stored model is preserved: setting the base
-/// URL must not wipe it.
+/// URL must not wipe it. The load-change-save runs under
+/// `CliSettings::update`'s process-wide lock (P2-6), so a concurrent
+/// set_model / set_router cannot lose this change, and vice versa.
 #[tauri::command]
 pub fn sen_settings_set_base_url(
     app: AppHandle,
@@ -128,11 +133,11 @@ pub fn sen_settings_set_base_url(
         .map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
     let dir = settings_dir(&app)
         .ok_or_else(|| "INVALID_CONTRACT: app config dir is not available, FAIL".to_string())?;
-    let mut settings = CliSettings::load(&dir);
-    settings.base_url = base_url.clone();
-    settings
-        .save(&dir)
-        .map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
+    let base_url = CliSettings::update(&dir, |settings| {
+        settings.base_url = base_url.clone();
+        Ok(base_url.clone())
+    })
+    .map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
     // Sessions created from now on use the new base URL.
     if let Ok(mut registry) = state.lock() {
         registry.set_settings_dir(dir);
@@ -212,7 +217,10 @@ pub struct SetRouterArgs {
 /// A running session keeps the route it started with; the new chain
 /// applies to sessions created after the change (and to fallback
 /// swaps, which read the stored chain). Refuses an invalid merged
-/// config.
+/// config. The load-change-save runs under `CliSettings::update`'s
+/// process-wide lock (P2-6), so a concurrent set_model /
+/// set_base_url cannot lose this change, and vice versa. A refused
+/// merged config saves nothing: the stored settings stay untouched.
 #[tauri::command]
 pub fn sen_settings_set_router(
     app: AppHandle,
@@ -223,28 +231,36 @@ pub fn sen_settings_set_router(
     validate_contract(&contract.to_registry()).map_err(|e| e.to_wire())?;
     let dir = settings_dir(&app)
         .ok_or_else(|| "INVALID_CONTRACT: app config dir is not available, FAIL".to_string())?;
-    let mut settings = CliSettings::load(&dir);
-    let mut config = settings.router.clone().unwrap_or_default();
-    if let Some(preferred) = args.preferred_route {
-        config.preferred_route = preferred.filter(|p| !p.trim().is_empty());
-    }
-    if let Some(fallback) = args.fallback_enabled {
-        config.fallback_enabled = fallback;
-    }
-    if let Some(approved) = args.byok_approved {
-        config.byok_approved = approved;
-    }
-    if let Some(routes) = args.routes {
-        config.routes = routes;
-    }
-    let errors = validate_router_config(&config);
-    if !errors.is_empty() {
-        return Err(format!("INVALID_CONTRACT: {}", errors.join("; ")));
-    }
-    settings.router = Some(config.clone());
-    settings
-        .save(&dir)
-        .map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
+    let SetRouterArgs {
+        preferred_route,
+        fallback_enabled,
+        byok_approved,
+        routes,
+    } = args;
+    let config = CliSettings::update(&dir, |settings| {
+        let mut config = settings.router.clone().unwrap_or_default();
+        if let Some(preferred) = preferred_route {
+            config.preferred_route = preferred.filter(|p| !p.trim().is_empty());
+        }
+        if let Some(fallback) = fallback_enabled {
+            config.fallback_enabled = fallback;
+        }
+        if let Some(approved) = byok_approved {
+            config.byok_approved = approved;
+        }
+        if let Some(routes) = routes {
+            config.routes = routes;
+        }
+        let errors = validate_router_config(&config);
+        if !errors.is_empty() {
+            // Bare error: the outer map_err adds the single
+            // "INVALID_CONTRACT: " prefix, exactly as before.
+            return Err(errors.join("; "));
+        }
+        settings.router = Some(config.clone());
+        Ok(config)
+    })
+    .map_err(|e| format!("INVALID_CONTRACT: {}", e))?;
     if let Ok(mut registry) = state.lock() {
         registry.set_settings_dir(dir);
     }
