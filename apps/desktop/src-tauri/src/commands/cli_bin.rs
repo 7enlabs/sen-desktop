@@ -87,13 +87,28 @@ pub fn resolve_zen_bin_with(env_bin: Option<&str>, path_var: &str) -> Result<Pat
             ));
         }
     }
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
+    // std::env::split_paths uses the platform separator (`:` on Unix,
+    // `;` on Windows). Splitting on ':' by hand breaks Windows PATHs
+    // such as `C:\Windows;C:\Tools` into ["C", "\Windows;C", ...], so
+    // no candidate ever matches and every turn fails CLI_NOT_FOUND.
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = Path::new(dir).join("zen");
+        let candidate = dir.join("zen");
         if is_executable_file(&candidate) {
             return Ok(candidate);
+        }
+        // On Windows the installed binary is `zen.exe` (the CLI install
+        // puts `%USERPROFILE%\.local\bin\zen.exe` on PATH), so a bare
+        // `zen` candidate never matches there; try the `.exe` name too.
+        // Same directory first: an earlier PATH entry wins, as usual.
+        #[cfg(windows)]
+        {
+            let exe_candidate = dir.join("zen.exe");
+            if is_executable_file(&exe_candidate) {
+                return Ok(exe_candidate);
+            }
         }
     }
     Err(CliBinError::new(
@@ -311,6 +326,92 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ERR_CLI_NOT_FOUND);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_finds_zen_in_a_later_path_dir() {
+        // Locks split_paths iteration: `zen` in the second entry must be
+        // found, not just the first entry. join_paths builds the PATH
+        // with the OS separator, so this runs on Linux and on Windows.
+        let base =
+            std::env::temp_dir().join(format!("zen_bin_test_p1r5_later_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let path_path = second.join("zen");
+        std::fs::write(&path_path, "#!/bin/sh\necho zen 0.1.0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var = std::env::join_paths([&first, &second]).unwrap();
+        let found = resolve_zen_bin_with(None, path_var.to_str().unwrap()).unwrap();
+        assert_eq!(found, path_path);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_skips_empty_path_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("zen_bin_test_p1r5_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path_path = dir.join("zen");
+        std::fs::write(&path_path, "#!/bin/sh\necho zen 0.1.0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var = std::env::join_paths(["", dir.to_str().unwrap()]).unwrap();
+        let found = resolve_zen_bin_with(None, path_var.to_str().unwrap()).unwrap();
+        assert_eq!(found, path_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_executable_file_rejects_a_missing_file() {
+        // The non-Unix branch returns `true`, but only for files that
+        // exist: the `is_file()` guard at the top of the function runs
+        // on every platform, so a missing file is rejected everywhere.
+        assert!(!is_executable_file(Path::new("/nonexistent-dir-xyz/zen")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir =
+                std::env::temp_dir().join(format!("zen_bin_test_p1r5_exec_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let plain = dir.join("zen");
+            std::fs::write(&plain, "not executable\n").unwrap();
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!is_executable_file(&plain));
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(is_executable_file(&plain));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn resolve_finds_zen_exe_on_a_windows_path() {
+        // Windows-only: runs on Windows CI, never on this Linux box.
+        // Locks both halves of the Windows fix at once - `;` splitting
+        // and the `zen.exe` candidate. `C:\Windows` has no `zen.exe`
+        // here, so the real directory must be the one that resolves.
+        let base =
+            std::env::temp_dir().join(format!("zen_bin_test_p1r5_win_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let exe_path = base.join("zen.exe");
+        std::fs::write(&exe_path, "MZ fake\n").unwrap();
+        let path_var = format!("C:\\Windows;{}", base.to_str().unwrap());
+        let found = resolve_zen_bin_with(None, &path_var).unwrap();
+        assert_eq!(found, exe_path);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
