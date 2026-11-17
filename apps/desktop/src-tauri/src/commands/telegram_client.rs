@@ -451,10 +451,13 @@ impl TelegramClient<ReqwestHttp> {
 /// the wrong item. The offset file (under the app data dir, next to
 /// the memory files) is written BEFORE the in-memory offset moves, so
 /// a failed write leaves the offset untouched and the next round
-/// re-fetches instead of silently skipping. A missing or unreadable
-/// file means "start at 0" (fresh install, or a deleted state file):
-/// replays are annoying but never destructive, because the in-process
-/// dedupe below also guards a re-fetch.
+/// re-fetches instead of silently skipping. The write is atomic
+/// (P2-6): temp file in the same dir, fsync, rename — a crash
+/// mid-write leaves the old offset or the new offset whole, never a
+/// torn file that loads as 0. A missing or unreadable file means
+/// "start at 0" (fresh install, or a deleted state file): replays are
+/// annoying but never destructive, because the in-process dedupe below
+/// also guards a re-fetch.
 pub struct FileOffsetStore {
     path: std::path::PathBuf,
 }
@@ -485,13 +488,15 @@ impl FileOffsetStore {
                 )
             })?;
         }
-        std::fs::write(&self.path, format!("{}\n", offset)).map_err(|e| {
-            format!(
-                "Cannot write Telegram offset {}: {}",
-                self.path.display(),
-                e
-            )
-        })
+        super::atomic_file::write_atomic(&self.path, format!("{}\n", offset).as_bytes()).map_err(
+            |e| {
+                format!(
+                    "Cannot write Telegram offset {}: {}",
+                    self.path.display(),
+                    e
+                )
+            },
+        )
     }
 }
 
@@ -1027,6 +1032,31 @@ mod tests {
         assert_eq!(resumed.poll_once(&mut |_| {}).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // P2-6: an offset save writes the whole number and leaves no temp
+    // file behind; the file content is exactly "N\n", never a torn
+    // prefix that would load as 0 and replay updates.
+    #[test]
+    fn offset_save_writes_whole_number_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("sen_offset_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("telegram-offset");
+        let store = FileOffsetStore::new(path.clone());
+        store.save(123456).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "123456\n");
+        assert_eq!(FileOffsetStore::new(path.clone()).load(), 123456);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["telegram-offset"],
+            "temp left behind: {:?}",
+            names
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

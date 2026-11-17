@@ -17,7 +17,9 @@
 // no key field in this struct, no key in the settings file, and no key in
 // any log line this module can produce.
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use super::atomic_file::write_atomic;
 use super::model_router::{default_routes, validate_router_config, Route, RouterConfig};
 
 /// The CLI's own free default model (zen-cli settings.rs:6).
@@ -158,7 +160,10 @@ impl CliSettings {
     /// Save settings to a config dir (creating it when needed). The
     /// model id is always written; "base_url" is written only when
     /// Some, so a file with no base URL stays a plain {"model": ...}
-    /// file. The file never contains a key.
+    /// file. The file never contains a key. The write is atomic (P2-6):
+    /// temp file in the same dir, fsync, rename — a crash mid-write
+    /// leaves the old file or the new file whole, never a torn file
+    /// that would load as the default and lose the stored router.
     pub fn save(&self, config_dir: &Path) -> Result<(), String> {
         let model = Self::validate_model(&self.model)?;
         let base_url = match &self.base_url {
@@ -189,13 +194,43 @@ impl CliSettings {
             Ok(text) => text,
             Err(e) => return Err(format!("Cannot serialize settings: {}", e)),
         };
-        std::fs::write(Self::file_path(config_dir), text).map_err(|e| {
+        write_atomic(&Self::file_path(config_dir), text.as_bytes()).map_err(|e| {
             format!(
                 "Cannot write settings file {}: {}",
                 Self::file_path(config_dir).display(),
                 e
             )
         })
+    }
+}
+
+/// One process-wide lock for the settings file (P2-6). The three
+/// setters each used to load, change one field, and save the whole
+/// file with no lock: two concurrent setters could interleave (both
+/// load the old file, each saves its own field) and the second save
+/// silently wiped the first setter's change. Every read-modify-write
+/// goes through `CliSettings::update`, which holds this lock for the
+/// whole load-change-save sequence. Plain loads need no lock: the
+/// atomic write means a load always sees a whole old or new file.
+static SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+impl CliSettings {
+    /// Load the settings, apply `change`, and save — atomically with
+    /// respect to other `update` calls in this process. When `change`
+    /// returns Err, nothing is saved: a refused change leaves the file
+    /// untouched. The lock is recovered when poisoned (a thread that
+    /// panicked mid-update) instead of bricking settings forever.
+    pub fn update<T>(
+        config_dir: &Path,
+        change: impl FnOnce(&mut CliSettings) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _guard = SETTINGS_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut settings = Self::load(config_dir);
+        let out = change(&mut settings)?;
+        settings.save(config_dir)?;
+        Ok(out)
     }
 }
 
@@ -399,6 +434,71 @@ mod tests {
         let loaded = CliSettings::load(&dir);
         assert_eq!(loaded.router, None);
         assert_eq!(loaded.active_route().id, "spark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P2-6: two threads updating different fields at once must not
+    // lose each other's change. Without the update lock, both threads
+    // load the same old file and the second save wipes the first
+    // thread's field; with it, the final file carries both threads'
+    // last values, deterministically.
+    #[test]
+    fn concurrent_updates_to_different_fields_keep_both() {
+        use std::sync::{Arc, Barrier};
+        let dir = tmpdir("race");
+        CliSettings::default().save(&dir).unwrap();
+        let dir = Arc::new(dir);
+        let barrier = Arc::new(Barrier::new(2));
+        let rounds = 100;
+        let d1 = dir.clone();
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            for i in 0..rounds {
+                CliSettings::update(&d1, |settings| {
+                    settings.model = format!("model-{}", i);
+                    Ok(())
+                })
+                .unwrap();
+            }
+        });
+        let d2 = dir.clone();
+        let b2 = barrier.clone();
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            for i in 0..rounds {
+                CliSettings::update(&d2, |settings| {
+                    settings.base_url = Some(format!("https://example.invalid/{}", i));
+                    Ok(())
+                })
+                .unwrap();
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let loaded = CliSettings::load(&dir);
+        assert_eq!(loaded.model, format!("model-{}", rounds - 1));
+        assert_eq!(
+            loaded.base_url,
+            Some(format!("https://example.invalid/{}", rounds - 1))
+        );
+        let _ = std::fs::remove_dir_all(dir.as_path());
+    }
+
+    // P2-6: a refused change saves nothing — the file stays exactly
+    // as it was, so a failed validation can never wipe stored settings.
+    #[test]
+    fn update_leaves_file_untouched_when_the_change_is_refused() {
+        let dir = tmpdir("updaterefuse");
+        let before = CliSettings {
+            model: "keep/me:free".to_string(),
+            base_url: Some("https://example.invalid/v1".to_string()),
+            router: None,
+        };
+        before.save(&dir).unwrap();
+        let err = CliSettings::update(&dir, |_| Err::<(), String>("nope".to_string())).unwrap_err();
+        assert!(err.contains("nope"));
+        assert_eq!(CliSettings::load(&dir), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

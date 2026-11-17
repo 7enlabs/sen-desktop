@@ -295,13 +295,22 @@ impl MemoryStore {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Cannot create memory dir {}: {}", parent.display(), e))?;
         }
-        std::fs::write(path, text)
+        // Atomic (P2-6): temp file in the same dir, fsync, rename. A
+        // crash mid-write leaves the old file or the new file whole,
+        // never a torn MEMORY.md that loses facts.
+        super::atomic_file::write_atomic(path, text.as_bytes())
             .map_err(|e| format!("Cannot write memory file {}: {}", path.display(), e))
     }
 
     /// Append one line to a file, keeping the existing content and
-    /// making sure the new line starts on its own line. Small files, so
-    /// read-modify-write is fine and avoids a half-written append.
+    /// making sure the new line starts on its own line. Small files,
+    /// so read-modify-write is fine; the write itself is atomic
+    /// (P2-6), so a crash mid-append leaves the old file or the new
+    /// file whole, never a half-written one. (The earlier comment
+    /// claimed read-modify-write "avoids a half-written append" —
+    /// wrong: the plain `fs::write` it used truncated first, so a
+    /// crash mid-write tore the file. The atomic rename is what
+    /// avoids it.)
     fn append_line(path: &Path, line: &str) -> Result<(), String> {
         let mut text = Self::read_file(path);
         if !text.is_empty() && !text.ends_with('\n') {
@@ -559,6 +568,31 @@ mod tests {
         assert!(store.add(Scope::Memory, "   ").is_err());
         assert!(store.add(Scope::Memory, "two\nlines").is_err());
         assert_eq!(store.read().memory, Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P2-6: appending to a file with no trailing newline keeps the
+    // existing line intact on its own line (and the atomic write
+    // leaves the file whole, never torn).
+    #[test]
+    fn append_keeps_content_when_file_has_no_trailing_newline() {
+        let (store, dir) = store("appendnl");
+        let path = store.file_path(Scope::Memory);
+        std::fs::write(&path, "- one").unwrap();
+        store.add(Scope::Memory, "two").unwrap();
+        assert_eq!(store.read().memory, vec!["one", "two"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "- one\n- two\n");
+        // No temp file left behind in the store dir.
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name.contains(".tmp-")),
+            "temp file left behind: {:?}",
+            names
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
