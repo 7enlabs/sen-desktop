@@ -681,45 +681,61 @@ impl CliBridge {
 
         // Take the child back to wait for its exit code. Abort may have
         // taken it already; then the exit code is unknown to this path.
-        let exit_code = {
+        // Rust P1-2: take the child out of the slot and drop the lock
+        // BEFORE waiting for it. Holding `child_slot` across the wait
+        // (up to 180s in `wait_child_after_eof`) blocked `abort()`,
+        // which needs the same lock to reach the child — exactly when
+        // abort exists to be used. Only the `Child` is kept, never
+        // the lock, on both wait paths below.
+        let child = {
             let mut slot = self.child_slot.lock().map_err(|_| {
                 BridgeError::new(
                     ERR_CLI_SPAWN_FAILED,
                     "Bridge child slot lock poisoned, FAIL",
                 )
             })?;
-            match slot.take() {
-                // R2B-09 + R2B-06 (merged): the wait after the read
-                // loop is bounded on both paths. With a result record
-                // in hand, poll for a quick exit up to RESULT_EXIT_GRACE
-                // (500ms, keeps the real exit code), then SIGKILL and
-                // reap. Without a result record, go through the 180s
-                // process-kill backstop (wait_child_after_eof) — never
-                // an unbounded child.wait(), or R2B-06 would lose its
-                // effect exactly in the lingering-child case R2B-09
-                // fixes.
-                Some(mut child) => {
-                    if broke_on_result {
-                        let deadline = std::time::Instant::now() + RESULT_EXIT_GRACE;
-                        loop {
-                            match child.try_wait() {
-                                Ok(Some(status)) => break status.code(),
-                                Ok(None) => {
-                                    if std::time::Instant::now() >= deadline {
-                                        let _ = child.kill();
-                                        break child.wait().ok().and_then(|status| status.code());
-                                    }
-                                    std::thread::sleep(Duration::from_millis(10));
+            slot.take()
+        };
+        let exit_code = match child {
+            // R2B-09 + R2B-06 (merged): the wait after the read
+            // loop is bounded on both paths. With a result record
+            // in hand, poll for a quick exit up to RESULT_EXIT_GRACE
+            // (500ms, keeps the real exit code), then SIGKILL and
+            // reap. Without a result record, go through the 180s
+            // process-kill backstop (wait_child_after_eof) — never
+            // an unbounded child.wait(), or R2B-06 would lose its
+            // effect exactly in the lingering-child case R2B-09
+            // fixes.
+            Some(mut child) => {
+                if broke_on_result {
+                    let deadline = std::time::Instant::now() + RESULT_EXIT_GRACE;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => break status.code(),
+                            Ok(None) => {
+                                // P1-2: abort() cannot take this child
+                                // any more (the turn owns it now), but it
+                                // sets the aborted flag first — notice it
+                                // here and kill the child at once instead
+                                // of polling out the grace.
+                                if self.is_aborted() {
+                                    let _ = child.kill();
+                                    break child.wait().ok().and_then(|status| status.code());
                                 }
-                                Err(_) => break None,
+                                if std::time::Instant::now() >= deadline {
+                                    let _ = child.kill();
+                                    break child.wait().ok().and_then(|status| status.code());
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
                             }
+                            Err(_) => break None,
                         }
-                    } else {
-                        self.wait_child_after_eof(&mut child)
                     }
+                } else {
+                    self.wait_child_after_eof(&mut child)
                 }
-                None => None,
             }
+            None => None,
         };
 
         let Some(result) = result_record else {
@@ -804,15 +820,29 @@ impl CliBridge {
     /// Polls `try_wait()` every 50ms (same cadence as the abort poll);
     /// a child that already exited returns at once with no waiting.
     /// Past the deadline the child is SIGKILLed and reaped, and the
-    /// turn keeps the result record it already has. Returns the exit
-    /// code, or None when the child was killed (signal death has no
-    /// code) or the code is unknown.
+    /// turn keeps the result record it already has. An abort requested
+    /// while waiting is noticed within one poll (P1-2): the turn owns
+    /// the child now, so abort() signals through the aborted flag and
+    /// the wait kills the child at once. Returns the exit code, or None
+    /// when the child was killed (signal death has no code) or the code
+    /// is unknown.
     fn wait_child_after_eof(&self, child: &mut Child) -> Option<i32> {
         let deadline = std::time::Instant::now() + self.process_kill_backstop;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => return status.code(),
                 Ok(None) => {
+                    // P1-2: same as the result-grace poll — the turn
+                    // owns the child now, so abort() reaches it only
+                    // through the aborted flag. Kill at once when the
+                    // flag is set instead of waiting out the backstop.
+                    if self.is_aborted() {
+                        let _ = child.kill();
+                        return match child.wait() {
+                            Ok(status) => status.code(),
+                            Err(_) => None,
+                        };
+                    }
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
                         return match child.wait() {
@@ -834,11 +864,17 @@ impl CliBridge {
     /// SIGKILL the stored child, if any (used when a turn fails mid-read
     /// so no child is left running).
     fn kill_stored_child(&self) {
-        let mut slot = match self.child_slot.lock() {
-            Ok(slot) => slot,
-            Err(_) => return,
+        // Rust P1-2: take the child out of the slot and drop the lock
+        // before kill+wait, so abort() is never blocked behind this
+        // helper either (same lock, same reason as the exit-code wait).
+        let child = {
+            let mut slot = match self.child_slot.lock() {
+                Ok(slot) => slot,
+                Err(_) => return,
+            };
+            slot.take()
         };
-        if let Some(mut child) = slot.take() {
+        if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -849,7 +885,11 @@ impl CliBridge {
     /// 130); SIGKILL after the grace period if the process does not exit.
     /// With no turn running, returns NoChild at once. Also marks the
     /// turn aborted, so a turn that is between spawn and store still ends
-    /// as CLI_TURN_ABORTED instead of running on.
+    /// as CLI_TURN_ABORTED instead of running on. When the turn already
+    /// took the child out of the slot for its exit wait, abort() returns
+    /// NoChild at once — but the wait notices the aborted flag within
+    /// one poll and kills the child, so the turn still ends promptly
+    /// (P1-2, instead of waiting out the backstop).
     pub fn abort(&self) -> AbortOutcome {
         {
             if let Ok(mut state) = self.state.lock() {
@@ -1307,6 +1347,61 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let outcome = bridge.abort();
         assert_eq!(outcome, AbortOutcome::KilledAfterGrace);
         let result = handle.join().unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERR_CLI_TURN_ABORTED);
+    }
+
+    #[test]
+    fn abort_is_not_blocked_while_turn_waits_for_lingering_child() {
+        // Rust P1-2: a CLI that closes stdout but stays alive puts
+        // the turn into the backstop wait (wait_child_after_eof).
+        // Before the fix the turn held the child_slot lock across
+        // that wait, so abort() — which needs the same lock to reach
+        // the child — hung until the backstop expired (up to 180s).
+        // After the fix the lock is dropped before the wait, so abort
+        // returns at once; and because the turn owns the child now,
+        // abort signals through the aborted flag, which the wait
+        // notices within one poll and kills the child — so the turn
+        // itself must also end promptly, far inside the 5s test
+        // backstop, instead of waiting it out. The abort outcome is
+        // deliberately not asserted: it is NoChild while the turn
+        // owns the child (the session still cancels, and the turn
+        // still ends as CLI_TURN_ABORTED).
+        let body = r#"trap '' INT
+echo '{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}'
+exec 1>&-
+i=0; while [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done"#;
+        let bin = fake_zen("lingeringeof", body);
+        let bridge = Arc::new(
+            CliBridge::new(Some(bin), "s1", "m:free", None)
+                .with_abort_grace(Duration::from_millis(300))
+                .with_process_kill_backstop(Duration::from_secs(5)),
+        );
+        let bridge_run = Arc::clone(&bridge);
+        let turn_started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            let mut emit = move |_ev: SenEvent| {};
+            bridge_run.run_turn("steer", "hi", &mut emit)
+        });
+        // Let the turn read the init record, hit EOF, and enter the
+        // backstop wait before aborting.
+        std::thread::sleep(Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let _outcome = bridge.abort();
+        let abort_elapsed = started.elapsed();
+        // 5s is the whole backstop: abort must return far sooner.
+        assert!(
+            abort_elapsed < Duration::from_secs(2),
+            "abort took {:?} while the turn waited on a lingering child",
+            abort_elapsed
+        );
+        let result = handle.join().unwrap();
+        // The turn must end promptly too, not wait out the backstop.
+        assert!(
+            turn_started.elapsed() < Duration::from_secs(3),
+            "turn took {:?} after abort, backstop is 5s",
+            turn_started.elapsed()
+        );
         let err = result.unwrap_err();
         assert_eq!(err.code, ERR_CLI_TURN_ABORTED);
     }
