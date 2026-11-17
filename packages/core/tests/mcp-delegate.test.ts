@@ -16,6 +16,7 @@ import {
   buildDelegateArgv,
   buildDelegatePrompt,
   delegateToolCallToCliCore,
+  isValidUuid,
   writeMcpConfigFile,
   type McpServerConfig,
 } from "../src/mcp-client.ts";
@@ -123,20 +124,30 @@ test("delegate: the written config file parses as zen-mcp expects", () => {
 
 // --- Real spawn of the fake zen binary ---
 
+test("delegate: isValidUuid accepts what the CLI parser accepts", () => {
+  assert.equal(isValidUuid("a7406aab-eb14-42ae-b68b-c4b8178caaa1"), true);
+  assert.equal(isValidUuid("A7406AAB-EB14-42AE-B68B-C4B8178CAAA1"), true);
+  assert.equal(isValidUuid("a7406aabeb1442aeb68bc4b8178caaa1"), true);
+  assert.equal(isValidUuid("sen-mcp-a7406aab-eb14-42ae-b68b-c4b8178caaa1"), false);
+  assert.equal(isValidUuid("s-delegate-1"), false);
+  assert.equal(isValidUuid(""), false);
+  assert.equal(isValidUuid("a7406aab-eb14-42ae-b68b"), false);
+});
+
 test("delegate: a success turn returns the result record text", async () => {
   const argvFile = join(mkdtempSync(join(tmpdir(), "sen-argv-")), "argv.json");
   await withFakeZenEnv(undefined, "echo: hello", async () => {
     process.env.FAKE_ZEN_ARGV_FILE = argvFile;
     const out = await delegateToolCallToCliCore({
       zenBin: FAKE_ZEN,
-      sessionId: "s-delegate-1",
+      sessionId: "11111111-2222-4333-8444-555555555555",
       serverName: "fake",
       serverConfig: SERVER,
       tool: "echo",
       arguments: { hello: "world" },
     });
     assert.equal(out.text, "echo: hello");
-    assert.equal(out.sessionId, "s-delegate-1");
+    assert.equal(out.sessionId, "11111111-2222-4333-8444-555555555555");
     assert.equal(out.exitCode, 0);
     const argv = JSON.parse(readFileSync(argvFile, "utf8")) as string[];
     assert.ok(argv.includes("--mcp-config"));
@@ -144,6 +155,65 @@ test("delegate: a success turn returns the result record text", async () => {
     assert.ok(argv[at + 1]?.endsWith("mcp-servers.json"));
     assert.ok(argv.includes("--session-id"));
     assert.ok(argv[argv.length - 1]?.includes('"echo"'));
+  });
+  rmSync(dirname(argvFile), { recursive: true, force: true });
+});
+
+test("delegate: a non-UUID session id is refused before spawning (P0-1)", async () => {
+  const argvFile = join(mkdtempSync(join(tmpdir(), "sen-argv-")), "argv.json");
+  await withFakeZenEnv(undefined, "echo: hello", async () => {
+    process.env.FAKE_ZEN_ARGV_FILE = argvFile;
+    // The old default shape: the real CLI rejects it at parse time
+    // (exit 4, "must be a valid UUID"), so the delegate must refuse
+    // it before spawning instead of handing the CLI a bad id.
+    await assert.rejects(
+      () =>
+        delegateToolCallToCliCore({
+          zenBin: FAKE_ZEN,
+          sessionId: "sen-mcp-a7406aab-eb14-42ae-b68b-c4b8178caaa1",
+          serverName: "fake",
+          serverConfig: SERVER,
+          tool: "echo",
+        }),
+      /MCP_VALIDATION: sessionId must be a valid UUID/,
+    );
+  });
+  // The fake zen writes its argv file only when spawned: no file
+  // means the refusal happened before any spawn.
+  assert.equal(
+    (() => {
+      try {
+        readFileSync(argvFile, "utf8");
+        return true;
+      } catch {
+        return false;
+      }
+    })(),
+    false,
+  );
+  rmSync(dirname(argvFile), { recursive: true, force: true });
+});
+
+test("delegate: the default session id is a bare UUID the CLI accepts (P0-1)", async () => {
+  const argvFile = join(mkdtempSync(join(tmpdir(), "sen-argv-")), "argv.json");
+  await withFakeZenEnv(undefined, "echo: hello", async () => {
+    process.env.FAKE_ZEN_ARGV_FILE = argvFile;
+    const out = await delegateToolCallToCliCore({
+      zenBin: FAKE_ZEN,
+      serverName: "fake",
+      serverConfig: SERVER,
+      tool: "echo",
+    });
+    const argv = JSON.parse(readFileSync(argvFile, "utf8")) as string[];
+    const at = argv.indexOf("--session-id");
+    assert.ok(at >= 0);
+    const id = argv[at + 1] ?? "";
+    assert.equal(out.sessionId, id);
+    assert.ok(!id.startsWith("sen-mcp-"), `default id must not carry a prefix: ${id}`);
+    assert.match(
+      id,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
   });
   rmSync(dirname(argvFile), { recursive: true, force: true });
 });
