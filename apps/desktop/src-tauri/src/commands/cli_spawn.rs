@@ -75,6 +75,21 @@ pub const ABORT_GRACE: Duration = Duration::from_secs(5);
 /// diagnostics, never the stream; never log it whole).
 pub const STDERR_TAIL_LEN: usize = 8192;
 
+/// Keep only the last `max` bytes of a stderr tail, cutting on a char
+/// boundary (P2-1): `String::drain(..cut)` panics when `cut` lands
+/// inside a multi-byte character, and stderr often holds non-ASCII
+/// text. The cut is advanced to the next char boundary, so the kept
+/// tail is at most `max` bytes and never splits a character.
+fn trim_tail_to_len(tail: &mut String, max: usize) {
+    if tail.len() > max {
+        let mut cut = tail.len() - max;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail.drain(..cut);
+    }
+}
+
 /// Turn timeout (Leader tin 9566 decision 1): a turn that produces no
 /// result record within this long is killed and reported as
 /// CLI_TURN_TIMEOUT, so a genuinely hung turn (no result record at all)
@@ -534,10 +549,7 @@ impl CliBridge {
                             Ok(n) => {
                                 if let Ok(mut guard) = tail.lock() {
                                     guard.push_str(&String::from_utf8_lossy(&buf[..n]));
-                                    if guard.len() > STDERR_TAIL_LEN {
-                                        let cut = guard.len() - STDERR_TAIL_LEN;
-                                        guard.drain(..cut);
-                                    }
+                                    trim_tail_to_len(&mut guard, STDERR_TAIL_LEN);
                                 }
                             }
                             Err(_) => break,
@@ -1061,6 +1073,43 @@ exit 0"#;
         assert_eq!(later.last().unwrap(), "again");
         // No key anywhere in argv.
         assert!(!first.iter().any(|a| a.contains("KEY")));
+    }
+
+    // P2-1: trimming the stderr tail must never panic on non-ASCII
+    // text. The bug-hunt repro ("ế" x 3000, 3 bytes/char) put the old
+    // byte cut at 808, and 808 % 3 == 1, so `drain(..808)` panicked
+    // with "assertion failed: self.is_char_boundary(end)".
+    #[test]
+    fn stderr_tail_trim_never_splits_utf8_char() {
+        let mut tail = "ế".repeat(3000); // 9000 bytes, 3000 chars
+        trim_tail_to_len(&mut tail, STDERR_TAIL_LEN);
+        // Old code cut at byte 808 (9000 - 8192), inside a char.
+        // The fix advances to the next boundary (810), keeping
+        // 8190 bytes = 2730 whole chars, all "ế".
+        assert_eq!(tail.len(), 8190);
+        assert_eq!(tail.chars().count(), 2730);
+        assert!(tail.chars().all(|c| c == 'ế'));
+        assert!(tail.is_char_boundary(0));
+    }
+
+    #[test]
+    fn stderr_tail_trim_ascii_and_short_inputs() {
+        // ASCII cut lands on a boundary already: exact max kept.
+        let mut tail = "x".repeat(9000);
+        trim_tail_to_len(&mut tail, STDERR_TAIL_LEN);
+        assert_eq!(tail.len(), STDERR_TAIL_LEN);
+        // At or under the cap: untouched.
+        let mut short = "ế".repeat(100);
+        trim_tail_to_len(&mut short, STDERR_TAIL_LEN);
+        assert_eq!(short.chars().count(), 100);
+        let mut exact = "a".repeat(STDERR_TAIL_LEN);
+        trim_tail_to_len(&mut exact, STDERR_TAIL_LEN);
+        assert_eq!(exact.len(), STDERR_TAIL_LEN);
+        // Mixed content: tail keeps whole chars only, never over max.
+        let mut mixed = "ab".repeat(3000) + &"ế".repeat(1000);
+        trim_tail_to_len(&mut mixed, STDERR_TAIL_LEN);
+        assert!(mixed.len() <= STDERR_TAIL_LEN);
+        assert!(mixed.ends_with('ế'));
     }
 
     // R2B-05: a stored base URL is passed as --base-url after --model
