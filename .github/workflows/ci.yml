@@ -86,11 +86,17 @@ jobs:
         # Runs the crate test suite under source-based coverage, prints
         # the summary table to the log, and writes lcov + text reports.
         # The job fails if any test fails (cargo-llvm-cov propagates the
-        # test exit code). No minimum threshold is enforced yet: the job
-        # reports coverage, it does not gate on a number.
+        # test exit code) and if total line coverage falls below 60%
+        # (--fail-under-lines). 60% is a floor, not a target: measured
+        # 2026-11-17 at 92.13% lines on the 8 tested modules, whole
+        # crate estimated 69.8-76.8% (see CI P1-2 fix note), so 60%
+        # passes on current code with about 10 points of margin and
+        # still fails if the test suite is deleted (0%) or a whole
+        # module's tests are lost. Raise the floor, never lower it
+        # to force green.
         run: |
           mkdir -p coverage
-          cargo llvm-cov --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --lcov --output-path coverage/lcov.info
+          cargo llvm-cov --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --lcov --output-path coverage/lcov.info --fail-under-lines 60
           cargo llvm-cov report --manifest-path apps/desktop/src-tauri/Cargo.toml --summary-only > coverage/coverage.txt
           cat coverage/coverage.txt
       - name: Upload coverage report
