@@ -126,7 +126,7 @@ test("live-client attach: success creates the backend + local record and subscri
   setBridgeTransport(null);
 });
 
-test("live-client attach: backend failure leaves no local record", async () => {
+test("live-client attach: create failure leaves no local record", async () => {
   setBridgeTransport(async () => {
     throw new Error("backend down");
   });
@@ -136,6 +136,162 @@ test("live-client attach: backend failure leaves no local record", async () => {
     /backend down/,
   );
   assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
+  setBridgeTransport(null);
+});
+
+test("live-client attach (P1-3): subscribe failure after a successful create rolls the session back", async () => {
+  // Repro of the reported bug: create OK, subscribe throws. Before
+  // the fix the catch only dropped the listener, leaving a live
+  // orphan — backend session + local Running record, no subscriber,
+  // no close path. After the fix the created session is aborted
+  // before the error propagates: backend Cancelled, local terminal
+  // Cancelled, listener stopped, and a fresh id attaches cleanly.
+  const transportCalls: string[] = [];
+  setBridgeTransport(async (command, args) => {
+    transportCalls.push(command);
+    const a = args as { session_id?: string };
+    if (command === "sen_session_create") {
+      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    }
+    if (command === "sen_events_subscribe") {
+      if (a.session_id === "s1") {
+        throw new Error("subscribe down");
+      }
+      return { sessionId: a.session_id, subscriberId: 7 };
+    }
+    if (command === "sen_session_abort") {
+      return { sessionId: a.session_id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
+    }
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+  });
+  const manager = new SessionManager();
+  await assert.rejects(
+    () => attachLiveSession(manager, contract(), "s1"),
+    /subscribe down/,
+  );
+  // No separate unsubscribe: the failed subscribe recorded no
+  // subscriber, and the abort itself resets the count to 0.
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "sen_session_abort",
+  ]);
+  assert.equal(capturedEvents.unlistened, true);
+  // No live session survives: the local record is terminal
+  // Cancelled, not Running.
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  // The failed attach leaves nothing that blocks a fresh session:
+  // a retry with a new id attaches cleanly.
+  const attached = await attachLiveSession(manager, contract(), "s2");
+  assert.equal(attached.sessionId, "s2");
+  assert.equal(attached.state, "Running");
+  assert.equal(attached.subscriberId, 7);
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "sen_session_abort",
+    "sen_session_create",
+    "sen_events_subscribe",
+  ]);
+  setBridgeTransport(null);
+});
+
+test("live-client attach (P1-3): same-id retry still hits DUPLICATE_SESSION — the id is not freed", async () => {
+  // Pins the residual limit of the TS-only rollback, against a fake
+  // backend that models the real registry faithfully: create refuses
+  // any id already held (registry.rs, ERR_DUPLICATE_SESSION) and
+  // abort only moves the record to Cancelled, it never deletes it
+  // (there is no sessions.remove anywhere in src-tauri). The local
+  // side matches by design: BUG-04 forbids re-creating any existing
+  // id, terminal ones included. So the rollback kills the live
+  // orphan, but the id stays unusable — a retry must use a new id
+  // (startApp mints one with randomUUID()). Freeing the id needs a
+  // backend delete/evict command, which is Rust P2-5 scope, not
+  // this fix.
+  const backend = new Map<string, string>();
+  const transportCalls: string[] = [];
+  setBridgeTransport(async (command, args) => {
+    transportCalls.push(command);
+    const a = args as { session_id?: string };
+    const id = a.session_id as string;
+    if (command === "sen_session_create") {
+      if (backend.has(id)) {
+        throw new Error("DUPLICATE_SESSION: Session already exists: " + id);
+      }
+      backend.set(id, "Running");
+      return { sessionId: id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    }
+    if (command === "sen_events_subscribe") {
+      throw new Error("subscribe down");
+    }
+    if (command === "sen_session_abort") {
+      if (!backend.has(id)) {
+        throw new Error("Session does not exist: " + id);
+      }
+      backend.set(id, "Cancelled");
+      return { sessionId: id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
+    }
+    return { sessionId: id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+  });
+  const manager = new SessionManager();
+  await assert.rejects(
+    () => attachLiveSession(manager, contract(), "s1"),
+    /subscribe down/,
+  );
+  // The orphan is dead on both sides, not live: backend Cancelled,
+  // local terminal Cancelled.
+  assert.equal(backend.get("s1"), "Cancelled");
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  // But the id is not reusable: the retry is refused by the backend
+  // before any local record is touched, and the refused retry does
+  // not disturb the cancelled record (no second abort).
+  await assert.rejects(
+    () => attachLiveSession(manager, contract(), "s1"),
+    /DUPLICATE_SESSION/,
+  );
+  assert.equal(backend.get("s1"), "Cancelled");
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "sen_session_abort",
+    "sen_session_create",
+  ]);
+  setBridgeTransport(null);
+});
+
+test("live-client attach (P1-3): a failed rollback does not mask the subscribe error", async () => {
+  // Create OK, subscribe throws, and the rollback abort throws too.
+  // The caller must still see the subscribe error — the cause of the
+  // failed attach — not the cleanup failure.
+  const transportCalls: string[] = [];
+  setBridgeTransport(async (command, args) => {
+    transportCalls.push(command);
+    const a = args as { session_id?: string };
+    if (command === "sen_session_create") {
+      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    }
+    if (command === "sen_events_subscribe") {
+      throw new Error("subscribe down");
+    }
+    if (command === "sen_session_abort") {
+      throw new Error("abort down");
+    }
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+  });
+  const manager = new SessionManager();
+  await assert.rejects(
+    () => attachLiveSession(manager, contract(), "s1"),
+    /subscribe down/,
+  );
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "sen_session_abort",
+  ]);
+  // The abort never landed, so the local record is still Running:
+  // the leak persists in this path, honestly, and the test proves
+  // the original error still propagates instead of being masked.
+  assert.equal(manager.transition("s1", "Cancelled"), "Cancelled");
   setBridgeTransport(null);
 });
 
