@@ -127,13 +127,26 @@ export interface ApplyDecisionResult {
  *   proposal stays "pending", so the user can approve and retry.
  *   An allow decision sets status "approved" and returns
  *   { executed: false, reason: "EXECUTION_NOT_WIRED" } — nothing
- *   was sent, drafted, archived, or scheduled.
+ *   was sent, drafted, archived, or scheduled. The allow also
+ *   spends the approval (P1-4), and an already approved/executed
+ *   proposal refuses a second apply, so replaying the same
+ *   proposal never passes the gate on an old approval again.
  */
 export function applyDecision(input: ApplyDecisionInput): ApplyDecisionResult {
   const { proposal } = input;
   if (proposal.action === "ignore") {
     proposal.status = "executed";
     return { executed: false, reason: "IGNORED_LOCAL_ONLY" };
+  }
+  // A proposal that already passed the gate (or was resolved) is
+  // terminal: replaying it must not reach the gate again on the
+  // strength of an old approval. Pending/refused proposals stay
+  // retryable so the user can approve and retry after a refusal.
+  if (proposal.status === "approved" || proposal.status === "executed") {
+    throw new Error(
+      "PROPOSAL_ALREADY_APPLIED: proposal " +
+        `${proposal.id} is already ${proposal.status}`,
+    );
   }
   const toolName = proposal.toolName;
   if (toolName === null) {

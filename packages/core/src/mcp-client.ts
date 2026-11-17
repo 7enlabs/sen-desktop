@@ -753,6 +753,8 @@ export interface McpToolCallInput {
  * decision throws with the P0-2 code (TOOL_POLICY_DENIED /
  * APPROVAL_REQUIRED / APPROVAL_NEVER_DENIED) and the tool never
  * runs; an allow decision runs tools/call on the connected server.
+ * An allow for an ask-first tool spends the approval (P1-4): one
+ * grant authorizes exactly one call, a retry needs a fresh grant.
  * The evaluation is recorded in the log exactly once when a log is
  * given. A tool result with isError: true is still a completed
  * call - it is returned, not thrown.
@@ -783,6 +785,13 @@ export async function executeMcpTool(
       throw new Error("APPROVAL_NEVER_DENIED: " + evaluation.reason);
     }
     throw new Error("TOOL_POLICY_DENIED: " + evaluation.reason);
+  }
+  // An allow for an ask-first tool spends the approval (P1-4): one
+  // grant authorizes exactly one call. The logged path already
+  // spent it inside gateToolCall, so this second consume is a
+  // no-op there; the unlogged path spends it here.
+  if (evaluation.tier === "ask-first") {
+    approvals.consume(input.tool, input.idempotencyKey);
   }
   const result = await client.callTool(
     input.tool,

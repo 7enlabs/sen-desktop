@@ -18,6 +18,7 @@ import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import type { ActionContract } from "../src/ipc/types.ts";
 import {
   ActivityLog,
+  APPROVAL_TTL_MS,
   ApprovalStore,
   classifyTool,
   defaultToolPolicy,
@@ -249,6 +250,99 @@ test("gate: approval store grants, finds, revokes, lists", () => {
   assert.throws(
     () => store.grant("", "k1", "zen"),
     /non-empty tool/,
+  );
+});
+
+// --- 1b. P1-4: grants expire and are single-use ---
+
+test("gate: a grant carries an expiry (default 15 minutes, overridable)", () => {
+  const store = new ApprovalStore();
+  const grantedAt = "2026-11-17T10:00:00.000Z";
+  const approval = store.grant("send_message", "k1", "zen", grantedAt);
+  assert.equal(
+    approval.expiresAt,
+    new Date(Date.parse(grantedAt) + APPROVAL_TTL_MS).toISOString(),
+  );
+  assert.equal(APPROVAL_TTL_MS, 15 * 60 * 1000);
+  const short = store.grant("send_message", "k2", "zen", grantedAt, { ttlMs: 1000 });
+  assert.equal(short.expiresAt, "2026-11-17T10:00:01.000Z");
+  const pinned = store.grant("send_message", "k3", "zen", grantedAt, {
+    expiresAt: "2026-11-17T11:00:00.000Z",
+  });
+  assert.equal(pinned.expiresAt, "2026-11-17T11:00:00.000Z");
+  assert.throws(() => store.grant("send_message", "k4", "zen", grantedAt, { ttlMs: 0 }), /ttlMs/);
+  assert.throws(
+    () => store.grant("send_message", "k5", "zen", grantedAt, { expiresAt: "not-a-date" }),
+    /expiresAt/,
+  );
+});
+
+test("gate: an expired grant reads as absent and never allows again", () => {
+  const store = new ApprovalStore();
+  const policy = policyAllowing(["send_message"]);
+  // Granted with an expiry already in the past: dead on arrival.
+  const past = new Date(Date.now() - 1000).toISOString();
+  const pastGrantedAt = new Date(Date.now() - 2000).toISOString();
+  store.grant("send_message", "k-exp", "boss", pastGrantedAt, { expiresAt: past });
+  assert.equal(store.find("send_message", "k-exp"), undefined);
+  assert.equal(store.list().length, 0);
+  const evaluation = evaluateToolCall(policy, store, {
+    actor: "test",
+    tool: "send_message",
+    idempotencyKey: "k-exp",
+  });
+  assert.equal(evaluation.decision, "ask-first");
+});
+
+test("gate: an approval is single-use through gateToolCall", () => {
+  const log = new ActivityLog();
+  const policy = policyAllowing(["send_message"]);
+  const approvals = new ApprovalStore();
+  approvals.grant("send_message", "k1", "zen");
+  const first = gateToolCall(policy, approvals, log, {
+    actor: "tester",
+    tool: "send_message",
+    idempotencyKey: "k1",
+  });
+  assert.equal(first.decision, "allow");
+  assert.equal(approvals.find("send_message", "k1"), undefined);
+  // Same tool + key again: the spent grant is gone, so the gate
+  // waits for a fresh approval instead of allowing on the old one.
+  const second = gateToolCall(policy, approvals, log, {
+    actor: "tester",
+    tool: "send_message",
+    idempotencyKey: "k1",
+  });
+  assert.equal(second.decision, "ask-first");
+  assert.deepEqual(
+    log.entries().map((e) => e.result),
+    ["allowed", "awaiting-approval"],
+  );
+});
+
+test("hook: an approval is single-use through onToolCall", () => {
+  const approvals = new ApprovalStore();
+  approvals.grant("send_message", "k1", "zen");
+  const allowed = onToolCall(
+    {
+      contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
+      toolName: "send_message",
+      actor: "tester",
+    },
+    { policy: policyAllowing(["send_message"]), approvals },
+  );
+  assert.equal(allowed.decision, "allow");
+  assert.throws(
+    () =>
+      onToolCall(
+        {
+          contract: { id: "c1", idempotencyKey: "k1", toolKind: "registered-tool" },
+          toolName: "send_message",
+          actor: "tester",
+        },
+        { policy: policyAllowing(["send_message"]), approvals },
+      ),
+    /APPROVAL_REQUIRED/,
   );
 });
 

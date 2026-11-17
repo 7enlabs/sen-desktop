@@ -253,6 +253,64 @@ test("gate: an ask-first tool needs an approval, then runs", async () => {
   }
 });
 
+test("gate: an ask-first approval is single-use through executeMcpTool", async () => {
+  const client = await connectedClient();
+  const approvals = new ApprovalStore();
+  const log = new ActivityLog();
+  const input = {
+    actor: "sen",
+    server: "fake",
+    tool: "echo",
+    arguments: { hello: "world" },
+    idempotencyKey: "k3",
+  };
+  try {
+    approvals.grant("echo", "k3", "zen");
+    const { result } = await executeMcpTool(
+      client,
+      { policy: { allow: ["echo"] }, approvals, log },
+      input,
+    );
+    assert.equal(result.isError, false);
+    // Same tool + key again: the grant was spent on the first run.
+    await assert.rejects(
+      () =>
+        executeMcpTool(client, { policy: { allow: ["echo"] }, approvals, log }, input),
+      /APPROVAL_REQUIRED/,
+    );
+  } finally {
+    await client.close();
+  }
+});
+
+test("gate: an ask-first approval is single-use without a log", async () => {
+  const client = await connectedClient();
+  const approvals = new ApprovalStore();
+  const input = {
+    actor: "sen",
+    server: "fake",
+    tool: "echo",
+    arguments: { hello: "world" },
+    idempotencyKey: "k3",
+  };
+  try {
+    approvals.grant("echo", "k3", "zen");
+    const { result } = await executeMcpTool(
+      client,
+      { policy: { allow: ["echo"] }, approvals },
+      input,
+    );
+    assert.equal(result.isError, false);
+    await assert.rejects(
+      () =>
+        executeMcpTool(client, { policy: { allow: ["echo"] }, approvals }, input),
+      /APPROVAL_REQUIRED/,
+    );
+  } finally {
+    await client.close();
+  }
+});
+
 test("gate: a never-tier tool is denied even with a rule and an approval", async () => {
   const client = await connectedClient();
   const approvals = new ApprovalStore();

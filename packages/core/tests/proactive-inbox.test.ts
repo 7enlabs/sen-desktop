@@ -196,6 +196,64 @@ test("apply: allow rule + approval passes the gate but never executes", () => {
   assert.equal(log.entries()[0].result, "allowed");
 });
 
+test("apply: replaying an approved proposal refuses and never passes the gate again", () => {
+  const p = proposal({ id: "proposal:m1" });
+  const approvals = new ApprovalStore();
+  approvals.grant("send_email", "proposal:m1:send_email", "boss");
+  const log = new ActivityLog();
+  const result = applyDecision({
+    policy: { allow: ["send_email"] },
+    approvals,
+    log,
+    proposal: p,
+    actor: "test",
+  });
+  assert.equal(result.executed, false);
+  assert.equal(result.reason, "EXECUTION_NOT_WIRED");
+  assert.equal(p.status, "approved");
+  assert.equal(log.length, 1);
+  // The same proposal again: the approval was spent on the first
+  // apply, and the proposal itself is terminal — replay refuses
+  // before the gate, and no second log entry is written.
+  assert.throws(
+    () =>
+      applyDecision({
+        policy: { allow: ["send_email"] },
+        approvals,
+        log,
+        proposal: p,
+        actor: "test",
+      }),
+    /PROPOSAL_ALREADY_APPLIED/,
+  );
+  assert.equal(p.status, "approved");
+  assert.equal(log.length, 1);
+});
+
+test("apply: an expired approval refuses with APPROVAL_REQUIRED and stays pending", () => {
+  const p = proposal({ id: "proposal:m1" });
+  const approvals = new ApprovalStore();
+  const past = new Date(Date.now() - 1000).toISOString();
+  approvals.grant("send_email", "proposal:m1:send_email", "boss", new Date(Date.now() - 2000).toISOString(), {
+    expiresAt: past,
+  });
+  const log = new ActivityLog();
+  assert.throws(
+    () =>
+      applyDecision({
+        policy: { allow: ["send_email"] },
+        approvals,
+        log,
+        proposal: p,
+        actor: "test",
+      }),
+    /APPROVAL_REQUIRED/,
+  );
+  assert.equal(p.status, "pending");
+  assert.equal(log.length, 1);
+  assert.equal(log.entries()[0].result, "awaiting-approval");
+});
+
 test("apply: auto-tier draft needs an allow rule but no approval", () => {
   const p = proposal({
     id: "proposal:m1",
