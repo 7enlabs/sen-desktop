@@ -84,5 +84,33 @@ export function setBridgeTransport(next: BridgeTransport | null): void {
 
 export async function invoke(command: string, args: BridgeArgs): Promise<unknown> {
   assertContract(args.contract);
-  return transport(command, args);
+  // P1-2: enforce contract.timeoutMs. Before this fix invoke() returned
+  // the transport promise bare, so a hung backend call hung forever and
+  // leaked: the chat waiter timed out and rejected, but the steer
+  // promise stayed in-flight, and the next turn on the same session
+  // then failed with CLI_TURN_IN_PROGRESS. The timeout rejects here;
+  // the timer is always cleared when the transport settles first, and
+  // a late transport rejection is swallowed so it never surfaces as an
+  // unhandled rejection after the timeout already won the race.
+  // The transport itself cannot be cancelled (Tauri invoke takes no
+  // AbortSignal), so this bounds the frontend wait only; the backend
+  // turn cap is a separate concern (Rust side).
+  const timeoutMs = args.contract.timeoutMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new Error(
+          `IPC_TIMEOUT: ${command} did not respond within ${timeoutMs}ms (contract ${args.contract.id})`,
+        ),
+      );
+    }, timeoutMs);
+  });
+  const result = transport(command, args);
+  result.catch(() => undefined);
+  try {
+    return await Promise.race([result, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
