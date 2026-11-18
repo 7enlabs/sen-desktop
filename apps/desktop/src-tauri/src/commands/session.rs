@@ -253,14 +253,26 @@ fn run_steer_turn(
     // test-only Registry::steer). A non-retryable failure returns at
     // once. The in-flight key is released only when no route is left
     // or the failure is not retryable, so a retry with the same key
-    // still executes.
+    // still executes. P2-2: at most MAX_ATTEMPTS attempts per turn.
     let mut bridge = bridge;
-    let mut failed_route = match state.lock() {
-        Ok(registry) => registry
-            .route_id(session_id)
-            .unwrap_or_else(|| "spark".to_string()),
-        Err(_) => "spark".to_string(),
+    // P2-2: snapshot the attempt order once, at turn start, and count
+    // attempts (the first run is attempt 1). The order used to be
+    // re-read from disk on every retry, so a config change mid-turn
+    // could drop the failed route out of the chain and restart the
+    // loop at the first route forever; there was no counter to stop
+    // it. The turn now walks the snapshot only and stops after
+    // MAX_ATTEMPTS attempts even if the chain would keep yielding
+    // routes.
+    let (mut failed_route, order) = match state.lock() {
+        Ok(registry) => (
+            registry
+                .route_id(session_id)
+                .unwrap_or_else(|| "spark".to_string()),
+            registry.attempt_order(),
+        ),
+        Err(_) => ("spark".to_string(), Vec::new()),
     };
+    let mut attempts = 1;
     let turn = loop {
         match bridge.run_turn_with_timeout(kind, &prompt, timeout, &mut emit) {
             Ok(turn) => break turn,
@@ -271,8 +283,15 @@ fn run_steer_turn(
                     }
                     return Err(format!("{}: {}", e.code, e.message));
                 }
+                if attempts >= super::model_router::MAX_ATTEMPTS {
+                    if let Ok(mut registry) = state.lock() {
+                        registry.release_steer(session_id, &contract.to_registry(), kind, text);
+                    }
+                    return Err(format!("{}: {}", e.code, e.message));
+                }
+                attempts += 1;
                 let swapped = match state.lock() {
-                    Ok(mut registry) => registry.fallback_bridge(session_id, &failed_route),
+                    Ok(mut registry) => registry.fallback_bridge(session_id, &failed_route, &order),
                     Err(_) => None,
                 };
                 match swapped {

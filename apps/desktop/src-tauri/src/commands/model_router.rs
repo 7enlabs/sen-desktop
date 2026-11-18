@@ -288,12 +288,23 @@ pub fn select_route(config: &RouterConfig) -> Option<Route> {
     resolve_attempt_order(config).into_iter().next()
 }
 
-/// Route after `failed_id` in the attempt order, or None.
+/// Route after `failed_id` in the attempt order, or None when the
+/// chain is exhausted or `failed_id` is not in the order. An unknown
+/// id never restarts at the first route: that route may already have
+/// been tried, and restarting it is how the fallback loop ran
+/// forever when the config changed mid-turn (P2-2).
 pub fn next_route(config: &RouterConfig, failed_id: &str) -> Option<Route> {
-    let order = resolve_attempt_order(config);
+    next_route_in(&resolve_attempt_order(config), failed_id)
+}
+
+/// Route after `failed_id` in a caller-supplied order snapshot, or
+/// None. A turn snapshots its order once at start (P2-2) and walks
+/// the snapshot, so a config change mid-turn cannot move routes
+/// under the loop.
+pub fn next_route_in(order: &[Route], failed_id: &str) -> Option<Route> {
     match order.iter().position(|r| r.id == failed_id) {
         Some(at) => order.get(at + 1).cloned(),
-        None => order.into_iter().next(),
+        None => None,
     }
 }
 
@@ -366,6 +377,40 @@ mod tests {
         assert_eq!(order[2].id, "openrouter-free");
         assert_eq!(next_route(&config, "ollama").unwrap().id, "spark");
         assert_eq!(next_route(&config, "openrouter-free"), None);
+    }
+
+    #[test]
+    fn next_route_never_restarts_at_the_first_route() {
+        // P2-2: an unknown failed id used to return the first route,
+        // which may be the route that just failed — the fallback loop
+        // then retried it forever when the config changed mid-turn.
+        let config = RouterConfig::default();
+        assert_eq!(next_route(&config, "no-such-route"), None);
+        assert_eq!(next_route(&config, ""), None);
+    }
+
+    #[test]
+    fn next_route_in_walks_a_snapshot_order() {
+        let order = resolve_attempt_order(&RouterConfig::default());
+        assert_eq!(order.len(), 3);
+        assert_eq!(
+            next_route_in(&order, "spark").unwrap().id,
+            "openrouter-free"
+        );
+        assert_eq!(
+            next_route_in(&order, "openrouter-free").unwrap().id,
+            "ollama"
+        );
+        assert_eq!(next_route_in(&order, "ollama"), None);
+        assert_eq!(next_route_in(&order, "no-such-route"), None);
+        // A snapshot taken before a reorder still walks the old
+        // order: the caller, not next_route_in, owns the snapshot.
+        let mut reordered = order.clone();
+        reordered.reverse();
+        assert_eq!(
+            next_route_in(&reordered, "ollama").unwrap().id,
+            "openrouter-free"
+        );
     }
 
     #[test]
