@@ -72,7 +72,7 @@ use super::approval_gate::{
 };
 use super::cli_settings::{CliSettings, DEFAULT_MODEL};
 use super::cli_spawn::{AbortOutcome, BridgeError, CliBridge, TurnResult};
-use super::model_router::{next_route, resolve_attempt_order, Route, RouterConfig};
+use super::model_router::{next_route_in, resolve_attempt_order, Route, RouterConfig};
 use super::stream_json::SenEvent;
 
 // --- Session statechart (point 854, mirror of packages/core) ---
@@ -515,7 +515,14 @@ impl Registry {
 
     /// Swap a session's bridge to the next route after `failed_route_id`
     /// (P0-3 fallback). Returns the new bridge and route, or None when
-    /// the chain is exhausted or fallback is disabled. When the failed
+    /// the chain is exhausted or fallback is disabled. `order` is the
+    /// attempt order the turn snapshotted at its start (P2-2): this
+    /// function never re-reads the router config, so a config change
+    /// mid-turn cannot move routes under the loop, and it never
+    /// returns a route already tried — the next route always comes
+    /// after `failed_route_id` in that snapshot, or there is none.
+    /// Fallback disabled needs no separate check here: a disabled turn
+    /// snapshots a one-route order, so there is no next route. When the failed
     /// bridge already ran a turn to a result, the new bridge resumes
     /// the same CLI session with -r, so the turn keeps its history;
     /// when the failed bridge never started (e.g. auth failed on the
@@ -527,12 +534,9 @@ impl Registry {
         &mut self,
         session_id: &str,
         failed_route_id: &str,
+        order: &[Route],
     ) -> Option<(Arc<CliBridge>, Route)> {
-        let config = self.router_config();
-        if !config.fallback_enabled {
-            return None;
-        }
-        let next = next_route(&config, failed_route_id)?;
+        let next = next_route_in(order, failed_route_id)?;
         let resume = self
             .bridges
             .get(session_id)
@@ -763,11 +767,19 @@ impl Registry {
                 // deadline instead of running to the cap or hanging forever.
                 // P0-3 fallback: a turn that fails with a retryable code
                 // (auth/rate-limit/no-result/timeout/...) runs again on
-                // the next route in the chain, at most once per route.
+                // the next route in the chain. P2-2: the attempt order
+                // is snapshotted once here, at turn start, and the turn
+                // counts attempts — at most MAX_ATTEMPTS in total. The
+                // order used to be re-read from disk on every retry,
+                // so a config change mid-turn could drop the failed
+                // route out of the chain and restart the loop at the
+                // first route forever; there was no counter to stop it.
                 // A non-retryable failure returns at once, never retried.
                 let mut failed_route = self
                     .route_id(session_id)
                     .unwrap_or_else(|| "spark".to_string());
+                let order = self.attempt_order();
+                let mut attempts = 1;
                 let turn = loop {
                     match bridge.run_turn_with_timeout(
                         kind,
@@ -781,7 +793,12 @@ impl Registry {
                                 self.release_steer(session_id, contract, kind, text);
                                 return Err(bridge_error_to_command(e));
                             }
-                            match self.fallback_bridge(session_id, &failed_route) {
+                            if attempts >= super::model_router::MAX_ATTEMPTS {
+                                self.release_steer(session_id, contract, kind, text);
+                                return Err(bridge_error_to_command(e));
+                            }
+                            attempts += 1;
+                            match self.fallback_bridge(session_id, &failed_route, &order) {
                                 Some((next_bridge, next_route)) => {
                                     failed_route = next_route.id.clone();
                                     bridge = next_bridge;
@@ -2167,6 +2184,162 @@ exit 2; fi"#,
         assert!(matches!(events[3], SenEvent::Result { .. }));
         assert_eq!(reg.get("s1").unwrap().log.len(), 2);
         let _ = std::fs::remove_file(&marker);
+    }
+
+    // P2-2: the fallback loop stops after MAX_ATTEMPTS attempts even
+    // when the router config changes mid-turn. The fake binary fails
+    // every run with a retryable code (exit 2 = auth) and rewrites
+    // the settings file on each run to drop the route that just ran
+    // out of the chain — on the old code that made next_route restart
+    // at the first route and the loop ping-ponged forever. The turn
+    // must return the auth error after exactly 3 runs, one per route,
+    // with no route repeated.
+    #[test]
+    fn steer_stops_after_max_attempts_when_config_changes_mid_turn() {
+        let dir = std::env::temp_dir().join(format!("sen_reg_p22count_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter =
+            std::env::temp_dir().join(format!("sen_reg_p22counter_{}", std::process::id()));
+        let _ = std::fs::remove_file(&counter);
+        // The live settings start as the default 3-route chain. Each
+        // variant drops one route; the fake binary copies the variant
+        // that drops the route it just ran.
+        CliSettings {
+            model: DEFAULT_MODEL.to_string(),
+            base_url: None,
+            router: Some(RouterConfig::default()),
+        }
+        .save(&dir)
+        .unwrap();
+        let variant = |tag: &str, drop_id: &str| -> std::path::PathBuf {
+            let vdir =
+                std::env::temp_dir().join(format!("sen_reg_p22var_{}_{}", tag, std::process::id()));
+            let _ = std::fs::remove_dir_all(&vdir);
+            std::fs::create_dir_all(&vdir).unwrap();
+            let mut config = RouterConfig::default();
+            config.routes.retain(|r| r.id != drop_id);
+            CliSettings {
+                model: DEFAULT_MODEL.to_string(),
+                base_url: None,
+                router: Some(config),
+            }
+            .save(&vdir)
+            .unwrap();
+            vdir
+        };
+        let no_spark = variant("nospark", "spark");
+        let no_openrouter = variant("noopenrouter", "openrouter-free");
+        let no_ollama = variant("noollama", "ollama");
+        // The bridge passes --model <model> [--base-url <url>], so the
+        // route is told apart by its base URL: ollama on 11434,
+        // openrouter-free on openrouter.ai, spark with no base URL.
+        // The echo lines go to the counter file, never to stdout, so
+        // the bridge only ever sees the init record below.
+        let body = format!(
+            r#"case "$*" in *11434*) echo ollama >> '{counter}'; cp '{no_ollama}/cli-settings.json' '{dir}/cli-settings.json';; *openrouter.ai*) echo openrouter-free >> '{counter}'; cp '{no_openrouter}/cli-settings.json' '{dir}/cli-settings.json';; *) echo spark >> '{counter}'; cp '{no_spark}/cli-settings.json' '{dir}/cli-settings.json';; esac
+cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+EOF
+exit 2"#,
+            counter = counter.display(),
+            no_ollama = no_ollama.display(),
+            no_openrouter = no_openrouter.display(),
+            no_spark = no_spark.display(),
+            dir = dir.display(),
+        );
+        let mut reg = Registry::with_settings_dir(dir.clone());
+        reg.set_zen_bin(fake_zen("p22count", &body));
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.route_id("s1").as_deref(), Some("spark"));
+        let mut emit = |_ev: SenEvent| {};
+        let err = reg
+            .steer("s1", &contract(), "steer", "hi", &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, "CLI_AUTH");
+        let runs = std::fs::read_to_string(&counter).unwrap();
+        let tried: Vec<&str> = runs.lines().collect();
+        assert_eq!(
+            tried,
+            vec!["spark", "openrouter-free", "ollama"],
+            "at most MAX_ATTEMPTS=3 runs, one per route, no repeat; got: {tried:?}"
+        );
+        assert_eq!(reg.route_id("s1").as_deref(), Some("ollama"));
+        let _ = std::fs::remove_file(&counter);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&no_spark);
+        let _ = std::fs::remove_dir_all(&no_openrouter);
+        let _ = std::fs::remove_dir_all(&no_ollama);
+    }
+
+    // P2-2: the turn walks the attempt order snapshotted at its start,
+    // not the config re-read mid-turn. The fake binary fails once on
+    // spark (exit 2) and rewrites the settings mid-turn to a chain
+    // that drops openrouter-free and prefers ollama; the retry must
+    // still run on openrouter-free — the second route of the snapshot
+    // — and succeed there. On the old code the re-read chain had no
+    // route after spark, so the turn failed outright.
+    #[test]
+    fn steer_uses_the_order_snapshot_from_turn_start() {
+        let dir = std::env::temp_dir().join(format!("sen_reg_p22snap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        CliSettings {
+            model: DEFAULT_MODEL.to_string(),
+            base_url: None,
+            router: Some(RouterConfig::default()),
+        }
+        .save(&dir)
+        .unwrap();
+        let vdir = std::env::temp_dir().join(format!("sen_reg_p22snapvar_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&vdir);
+        std::fs::create_dir_all(&vdir).unwrap();
+        let mut changed = RouterConfig::default();
+        changed.routes.retain(|r| r.id != "openrouter-free");
+        changed.preferred_route = Some("ollama".to_string());
+        CliSettings {
+            model: DEFAULT_MODEL.to_string(),
+            base_url: None,
+            router: Some(changed),
+        }
+        .save(&vdir)
+        .unwrap();
+        let marker =
+            std::env::temp_dir().join(format!("sen_reg_p22snap_marker_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let body = format!(
+            r#"if [ -f '{marker}' ]; then cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+{{"type":"assistant","uuid":"u1","session_id":"s1","message":{{"role":"assistant","content":"hello"}},"parent_tool_use_id":null,"v":1}}
+{{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0}},"model":"m:free","session_id":"s1","v":1}}
+EOF
+exit 0; else touch '{marker}'; cp '{vdir}/cli-settings.json' '{dir}/cli-settings.json'; cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+EOF
+exit 2; fi"#,
+            marker = marker.display(),
+            vdir = vdir.display(),
+            dir = dir.display(),
+        );
+        let mut reg = Registry::with_settings_dir(dir.clone());
+        reg.set_zen_bin(fake_zen("p22snap", &body));
+        reg.create("s1", &contract()).unwrap();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert!(marker.exists(), "fake binary must have run twice");
+        assert_eq!(
+            reg.route_id("s1").as_deref(),
+            Some("openrouter-free"),
+            "retry must use the snapshot order, not the rewritten config"
+        );
+        assert_eq!(events.len(), 4);
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&vdir);
     }
 
     // P0-3: a non-retryable failure (exit 4 = validation) is never
