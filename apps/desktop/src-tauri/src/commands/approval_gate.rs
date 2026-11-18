@@ -324,13 +324,46 @@ pub struct ActivityEntry {
     pub result: String,
 }
 
+/// Retention bound for the activity log (P2-5, same bound as the
+/// TS ActivityLog and RawLog's MAX_RAW_LOG_EVENTS). Why 10,000: one
+/// entry is recorded per evaluated tool call, and a session makes
+/// only a handful of tool calls per turn, so even a 1,000-turn
+/// session is a few thousand entries; 10,000 sits an order of
+/// magnitude above any ordinary session, so no useful history of a
+/// normal session is lost. Why a bound at all: entries carry full
+/// reason strings, so an unbounded log grows with session length
+/// without limit. Eviction is FIFO: the oldest entry goes first, the
+/// surviving entries keep their append order, and seq never reuses a
+/// number, so a gap in seq is the observable trace that eviction
+/// happened. The cap is not a delete function and does not change
+/// the no-delete rule: no caller can delete anything, there is
+/// still no public delete API, and eviction happens only inside
+/// record, only to the oldest entry, only when the fixed bound is
+/// exceeded (INFO-1 precedent: eviction under a cap is not
+/// deletion).
+pub const MAX_ACTIVITY_LOG_ENTRIES: usize = 10_000;
+
 /// Append-only activity log. There is deliberately no delete, no
 /// update, and no clear: entries only ever get appended, seq never
-/// reuses a number, and readers get clones.
-#[derive(Debug, Clone, Default)]
+/// reuses a number, and readers get clones. The one exception is
+/// the retention cap above: when the log holds more than
+/// MAX_ACTIVITY_LOG_ENTRIES entries, record drops the oldest one
+/// (FIFO). That is eviction under a cap, not deletion — see the
+/// MAX_ACTIVITY_LOG_ENTRIES note.
+#[derive(Debug, Clone)]
 pub struct ActivityLog {
     entries: Vec<ActivityEntry>,
     next_seq: u64,
+    max_entries: usize,
+}
+
+impl Default for ActivityLog {
+    /// A default log keeps the production cap: a derived Default
+    /// would set max_entries to 0 and evict every entry on record,
+    /// so Default delegates to new() instead.
+    fn default() -> ActivityLog {
+        ActivityLog::new()
+    }
 }
 
 impl ActivityLog {
@@ -338,6 +371,24 @@ impl ActivityLog {
         ActivityLog {
             entries: Vec::new(),
             next_seq: 1,
+            max_entries: MAX_ACTIVITY_LOG_ENTRIES,
+        }
+    }
+
+    /// Test-only: a log with an explicit bound, so the cap is
+    /// exercised through a small bound and the tests stay fast. The
+    /// production default (MAX_ACTIVITY_LOG_ENTRIES) is asserted,
+    /// not filled, because recording 10,000 entries in a test
+    /// would prove nothing the small-cap tests do not already
+    /// prove. Panics on a zero bound: a log that keeps nothing
+    /// cannot record, fail closed at construction.
+    #[cfg(test)]
+    pub fn with_max_entries(max_entries: usize) -> ActivityLog {
+        assert!(max_entries >= 1, "max_entries must be at least 1, FAIL");
+        ActivityLog {
+            entries: Vec::new(),
+            next_seq: 1,
+            max_entries,
         }
     }
 
@@ -366,6 +417,12 @@ impl ActivityLog {
         };
         self.next_seq += 1;
         self.entries.push(entry.clone());
+        // P2-5 retention cap: FIFO eviction under MAX_ACTIVITY_LOG_ENTRIES,
+        // same as RawLog. Seq never reuses a number, so the gap left by
+        // an evicted entry stays visible.
+        if self.entries.len() > self.max_entries {
+            self.entries.remove(0);
+        }
         entry
     }
 
@@ -784,6 +841,104 @@ mod tests {
         let mut stolen = log.entries();
         stolen.clear();
         assert_eq!(log.len(), 3);
+    }
+
+    // --- P2-5: the activity log is capped, FIFO, seq never reused ---
+
+    #[test]
+    fn activity_log_default_cap_is_10000_entries() {
+        assert_eq!(MAX_ACTIVITY_LOG_ENTRIES, 10_000);
+        let mut log = ActivityLog::new();
+        for i in 0..3 {
+            log.record(
+                "tester",
+                "read_file",
+                ApprovalTier::Auto,
+                GateDecision::Allow,
+                &format!("ok {i}"),
+            );
+        }
+        assert_eq!(log.len(), 3);
+        assert_eq!(
+            log.entries().iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn activity_log_zero_cap_is_rejected_at_construction() {
+        let result = std::panic::catch_unwind(|| ActivityLog::with_max_entries(0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn activity_log_evicts_oldest_first_under_a_small_cap() {
+        let mut log = ActivityLog::with_max_entries(3);
+        for i in 0..5 {
+            log.record(
+                "tester",
+                "read_file",
+                ApprovalTier::Auto,
+                GateDecision::Allow,
+                &format!("ok {i}"),
+            );
+        }
+        assert_eq!(log.len(), 3);
+        // Oldest two (seq 1, 2) evicted; newest three kept in order.
+        assert_eq!(
+            log.entries().iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            log.entries()
+                .iter()
+                .map(|e| e.reason.clone())
+                .collect::<Vec<_>>(),
+            vec!["ok 2", "ok 3", "ok 4"]
+        );
+    }
+
+    #[test]
+    fn activity_log_seq_never_reused_after_eviction() {
+        let mut log = ActivityLog::with_max_entries(3);
+        for i in 0..3 {
+            log.record(
+                "tester",
+                "read_file",
+                ApprovalTier::Auto,
+                GateDecision::Allow,
+                &format!("ok {i}"),
+            );
+        }
+        log.record(
+            "tester",
+            "read_file",
+            ApprovalTier::Auto,
+            GateDecision::Allow,
+            "ok 3",
+        );
+        log.record(
+            "tester",
+            "read_file",
+            ApprovalTier::Auto,
+            GateDecision::Allow,
+            "ok 4",
+        );
+        assert_eq!(
+            log.entries().iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        // The next entry continues at 6, not back at 1: the seq gap
+        // (1-2 gone) is what makes eviction observable instead of
+        // silent.
+        let next = log.record(
+            "tester",
+            "read_file",
+            ApprovalTier::Auto,
+            GateDecision::Allow,
+            "ok 5",
+        );
+        assert_eq!(next.seq, 6);
     }
 
     #[test]

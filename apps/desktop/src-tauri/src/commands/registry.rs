@@ -62,7 +62,7 @@
 // There is no recorded result to replay yet, so the refusal is a
 // distinct InFlight answer, not a faked Duplicate turn.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -251,6 +251,20 @@ pub fn assert_gate_order(steps: &[&str]) -> Result<(), CommandError> {
 
 // --- Session record and registry ---
 
+/// Retention caps (P2-5): the registry never evicted, so sessions,
+/// completed steers, and the activity log grew with runtime. Eviction
+/// is FIFO under a fixed cap (INFO-1 precedent: eviction under a cap
+/// is NOT deletion — there is still no delete API, no caller can
+/// delete anything, and eviction happens only inside the insert path,
+/// only to the oldest entry, only when the cap is exceeded). Caps sit
+/// an order of magnitude above ordinary use: a desktop assistant holds
+/// a handful of live sessions, and a session replays at most its recent
+/// steers, so no useful state of a normal session is lost. The
+/// activity log has its own cap, MAX_ACTIVITY_LOG_ENTRIES in
+/// approval_gate.rs (10,000, same as RawLog and the TS ActivityLog).
+pub const MAX_SESSIONS: usize = 100;
+pub const MAX_COMPLETED_STEERS_PER_SESSION: usize = 100;
+
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub id: String,
@@ -265,6 +279,11 @@ pub struct SessionRecord {
 #[derive(Default)]
 pub struct Registry {
     sessions: HashMap<String, SessionRecord>,
+    /// Creation order of session ids (P2-5): FIFO eviction drops the
+    /// oldest session first when the registry holds more than
+    /// MAX_SESSIONS. Kept in step with `sessions`: every create
+    /// pushes, every eviction pops.
+    session_order: VecDeque<String>,
     /// One CLI bridge handle per session (Phase 2). The handle is
     /// created with the session and outlives single turns; the process
     /// itself is per-turn (see cli_spawn.rs for why no process stays
@@ -274,6 +293,12 @@ pub struct Registry {
     /// session id -> (steer key -> recorded turn result). Only turns
     /// that ran to a result land here, via complete_steer.
     completed_steers: HashMap<String, HashMap<SteerKey, TurnResult>>,
+    /// Insertion order of completed-steer keys per session (P2-5):
+    /// FIFO eviction drops the oldest recorded steer first when a
+    /// session holds more than MAX_COMPLETED_STEERS_PER_SESSION.
+    /// Kept in step with `completed_steers`: a key is pushed only
+    /// the first time it is recorded.
+    completed_steer_order: HashMap<String, VecDeque<SteerKey>>,
     /// Steers currently running per session (BUG-10 extra, tin
     /// 9645/9650): session id -> keys whose turn began but has not
     /// finished yet. begin_steer inserts the key the moment the turn
@@ -365,8 +390,10 @@ impl Registry {
     pub fn new() -> Registry {
         Registry {
             sessions: HashMap::new(),
+            session_order: VecDeque::new(),
             bridges: HashMap::new(),
             completed_steers: HashMap::new(),
+            completed_steer_order: HashMap::new(),
             in_flight_steers: HashMap::new(),
             settings_dir: None,
             zen_bin_override: None,
@@ -451,7 +478,9 @@ impl Registry {
     /// router's active route (model and base URL from the resolved
     /// route; legacy stored model/base_url when no router is stored).
     /// No model call happens here: the handle spawns nothing until
-    /// the first steer.
+    /// the first steer. P2-5: creating past MAX_SESSIONS evicts the
+    /// oldest session (FIFO, with everything it owns) so the
+    /// registry stays bounded over a long runtime.
     pub fn create(
         &mut self,
         session_id: &str,
@@ -486,7 +515,69 @@ impl Registry {
             session_id.to_string(),
             Arc::new(self.new_bridge(session_id, &route.model, route.base_url.as_deref())),
         );
+        // P2-5: remember creation order, then evict the oldest
+        // sessions while the registry holds more than MAX_SESSIONS.
+        self.session_order.push_back(session_id.to_string());
+        self.evict_oldest_sessions();
         Ok(SessionState::Running)
+    }
+
+    /// Drop the oldest sessions while the registry holds more than
+    /// MAX_SESSIONS (P2-5). FIFO: the session created first goes
+    /// first. Everything the session owns goes with it — bridge,
+    /// completed steers, their order queue, and in-flight keys — so
+    /// no map keeps growing behind the sessions map. A later call
+    /// for an evicted session fails loudly with UNKNOWN_SESSION; a
+    /// turn still running on one fails loudly at complete_steer,
+    /// never silently. This is retention eviction under a cap, not
+    /// a delete API (INFO-1): no caller can evict anything on
+    /// demand, and there is still no close/delete session command.
+    fn evict_oldest_sessions(&mut self) {
+        while self.session_order.len() > MAX_SESSIONS {
+            let Some(oldest) = self.session_order.pop_front() else {
+                break;
+            };
+            self.sessions.remove(&oldest);
+            self.bridges.remove(&oldest);
+            self.completed_steers.remove(&oldest);
+            self.completed_steer_order.remove(&oldest);
+            self.in_flight_steers.remove(&oldest);
+        }
+    }
+
+    /// Drop the oldest recorded steers of one session while it holds
+    /// more than MAX_COMPLETED_STEERS_PER_SESSION (P2-5). FIFO: the
+    /// steer recorded first goes first. A later retry of an evicted
+    /// key runs the model again instead of replaying — the result
+    /// was already delivered, so nothing is lost, only the replay
+    /// shortcut for that old key.
+    fn evict_oldest_completed_steers(&mut self, session_id: &str) {
+        let Some(order) = self.completed_steer_order.get_mut(session_id) else {
+            return;
+        };
+        while order.len() > MAX_COMPLETED_STEERS_PER_SESSION {
+            let Some(oldest) = order.pop_front() else {
+                break;
+            };
+            if let Some(done) = self.completed_steers.get_mut(session_id) {
+                done.remove(&oldest);
+            }
+        }
+    }
+
+    /// Test-only: how many sessions the registry holds (P2-5 cap).
+    #[cfg(test)]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Test-only: how many completed steers one session holds (P2-5 cap).
+    #[cfg(test)]
+    pub fn completed_steer_count(&self, session_id: &str) -> usize {
+        self.completed_steers
+            .get(session_id)
+            .map(|done| done.len())
+            .unwrap_or(0)
     }
 
     /// The session's active route id (P0-3), for the session result
@@ -701,10 +792,27 @@ impl Registry {
         // Duplicate. The log entry above already records that the
         // turn ran and what its subtype was.
         if !turn.is_error {
+            // P2-5: remember insertion order (a key is pushed only
+            // the first time it is recorded), then evict the oldest
+            // recorded steers while the session holds more than
+            // MAX_COMPLETED_STEERS_PER_SESSION.
+            let key = SteerKey::new(contract, kind, text);
+            let is_new = !self
+                .completed_steers
+                .get(session_id)
+                .map(|done| done.contains_key(&key))
+                .unwrap_or(false);
             self.completed_steers
                 .entry(session_id.to_string())
                 .or_default()
-                .insert(SteerKey::new(contract, kind, text), turn.clone());
+                .insert(key.clone(), turn.clone());
+            if is_new {
+                self.completed_steer_order
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .push_back(key);
+            }
+            self.evict_oldest_completed_steers(session_id);
         }
         Ok(state)
     }
@@ -2386,5 +2494,123 @@ exit 4"#;
         assert_eq!(bridge.base_url(), Some("http://127.0.0.1:11434/v1"));
         assert_eq!(reg.route_id("s1").as_deref(), Some("ollama"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- P2-5: retention caps, FIFO eviction ---
+
+    /// A fabricated successful turn result: no model run, so the cap
+    /// tests can complete 100+ steers without spawning 100+
+    /// processes. Only complete_steer is exercised, never the bridge.
+    fn fake_turn(session_id: &str, text: &str) -> TurnResult {
+        TurnResult {
+            kind: "result".to_string(),
+            session_id: session_id.to_string(),
+            model: "m:free".to_string(),
+            subtype: "success".to_string(),
+            is_error: false,
+            text: text.to_string(),
+            num_turns: 1,
+            usage: crate::commands::stream_json::TurnUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+                cache_read_input_tokens: 0,
+            },
+            duration_ms: 7,
+            exit_code: Some(0),
+            exit_code_label: "ok".to_string(),
+            records_seen: 3,
+            unknown_records: 0,
+            version_mismatches: 0,
+        }
+    }
+
+    /// Drive one steer to a recorded result without running the
+    /// model: begin (Run), then complete with the fabricated turn.
+    /// A duplicate key would return Duplicate from begin_steer
+    /// instead, so callers use a fresh key per steer.
+    fn record_steer(reg: &mut Registry, session_id: &str, key_suffix: &str) {
+        let mut c = contract();
+        c.idempotency_key = format!("k-{key_suffix}");
+        let text = format!("hello {key_suffix}");
+        match reg.begin_steer(session_id, &c, "steer", &text).unwrap() {
+            SteerStart::Run(_) => {}
+            other => panic!("expected Run, got {other:?}"),
+        }
+        let turn = fake_turn(session_id, &text);
+        reg.complete_steer(session_id, &c, "steer", &text, &turn)
+            .unwrap();
+    }
+
+    #[test]
+    fn create_evicts_oldest_session_over_the_cap() {
+        assert_eq!(MAX_SESSIONS, 100);
+        let mut reg = Registry::new();
+        for i in 0..=MAX_SESSIONS {
+            reg.create(&format!("s{i:03}"), &contract()).unwrap();
+        }
+        assert_eq!(reg.session_count(), MAX_SESSIONS);
+        // Oldest (s000) evicted: no record, no bridge.
+        assert!(reg.get("s000").is_none());
+        assert!(reg.bridge("s000").is_none());
+        // Newest still live.
+        assert!(reg.get(&format!("s{MAX_SESSIONS:03}")).is_some());
+        assert!(reg.bridge(&format!("s{MAX_SESSIONS:03}")).is_some());
+        // Under the cap nothing is evicted.
+        let mut small = Registry::new();
+        for i in 0..MAX_SESSIONS {
+            small.create(&format!("t{i:03}"), &contract()).unwrap();
+        }
+        assert_eq!(small.session_count(), MAX_SESSIONS);
+        assert!(small.get("t000").is_some());
+    }
+
+    #[test]
+    fn evicted_session_fails_loudly_and_can_be_recreated() {
+        let mut reg = Registry::new();
+        reg.create("s0", &contract()).unwrap();
+        for i in 1..=MAX_SESSIONS {
+            reg.create(&format!("s{i:03}"), &contract()).unwrap();
+        }
+        assert!(reg.get("s0").is_none());
+        // A steer on the evicted session fails loudly, never silently.
+        let mut emit = |_ev: SenEvent| {};
+        let err = reg
+            .steer("s0", &contract(), "steer", "hi", &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, ERR_UNKNOWN_SESSION);
+        // The id is free again: recreating it is a fresh session,
+        // not a duplicate.
+        assert_eq!(reg.create("s0", &contract()), Ok(SessionState::Running));
+        assert!(reg.get("s0").is_some());
+    }
+
+    #[test]
+    fn complete_steer_evicts_oldest_completed_steer_over_the_cap() {
+        assert_eq!(MAX_COMPLETED_STEERS_PER_SESSION, 100);
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        for i in 0..=MAX_COMPLETED_STEERS_PER_SESSION {
+            record_steer(&mut reg, "s1", &format!("{i:03}"));
+        }
+        assert_eq!(
+            reg.completed_steer_count("s1"),
+            MAX_COMPLETED_STEERS_PER_SESSION
+        );
+        // The oldest recorded steer (key k-000) is gone: begin_steer
+        // runs the model again instead of replaying a Duplicate.
+        let mut c = contract();
+        c.idempotency_key = "k-000".to_string();
+        match reg.begin_steer("s1", &c, "steer", "hello 000").unwrap() {
+            SteerStart::Run(_) => {}
+            other => panic!("expected Run for evicted key, got {other:?}"),
+        }
+        // The newest recorded steer still replays.
+        let mut c2 = contract();
+        c2.idempotency_key = format!("k-{:03}", MAX_COMPLETED_STEERS_PER_SESSION);
+        let text2 = format!("hello {:03}", MAX_COMPLETED_STEERS_PER_SESSION);
+        match reg.begin_steer("s1", &c2, "steer", &text2).unwrap() {
+            SteerStart::Duplicate { .. } => {}
+            other => panic!("expected Duplicate for newest key, got {other:?}"),
+        }
     }
 }
