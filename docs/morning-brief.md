@@ -70,8 +70,12 @@ deterministic: every list is sorted by time, then id.
 - Deadlines: an email `dueAt`, or an event `start`, inside the
   window; `{ kind, id, label, at }`, sorted by time then id.
 - needsDecision: emails with `needsDecision: true`, or whose
-  subject + body matches `DECISION_MARKERS` — an explicit, closed
-  list in code (Vietnamese: duyệt, phê duyệt, quyết định, quyết,
+  subject + body matches `DECISION_MARKERS` as standalone words
+  or phrases — never as a substring inside another word, and never
+  inside a known non-decision compound ("quyết toán", "chốt sổ",
+  "confirm receipt"). An explicit `needsDecision: false` never
+  counts, even when the body contains a marker. The list is
+  explicit and closed (Vietnamese: duyệt, phê duyệt, quyết định, quyết,
   xác nhận, xin ý kiến, cho ý kiến, đồng ý, chốt, cần bạn quyết;
   English: approve, approval, confirm, decision, decide,
   sign off, action required, please review). Nothing outside the

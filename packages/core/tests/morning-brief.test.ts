@@ -260,6 +260,92 @@ test("buildMorningBrief: invalid input throws instead of building a wrong brief"
   );
 });
 
+// --- P2-3: dates must be real ISO, compared by UTC day ---
+
+test("brief P2-3: non-ISO now is rejected instead of silently emptying todayEvents", () => {
+  assert.throws(
+    () =>
+      buildMorningBrief({
+        emails: [],
+        events: [event({ id: "e1" })],
+        now: "17 Nov 2026 09:00",
+      }),
+    /now must be a valid ISO/,
+  );
+});
+
+test("brief P2-3: an event with a timezone offset counts as today by its UTC day", () => {
+  const brief = buildMorningBrief({
+    emails: [],
+    events: [
+      // 01:00+07:00 on the 17th is 18:00Z on the 16th: "today" for a
+      // 19:00Z now on the 16th, even though the written date says 17th.
+      event({ id: "e1", title: "Tối 16", start: "2026-11-17T01:00:00+07:00", end: "2026-11-17T02:00:00+07:00" }),
+      // Really tomorrow in UTC: must stay out of todayEvents.
+      event({ id: "e2", title: "Sáng 17", start: "2026-11-17T01:00:00.000Z", end: "2026-11-17T02:00:00.000Z" }),
+    ],
+    now: "2026-11-16T19:00:00.000Z",
+  });
+  assert.deepEqual(brief.todayEvents.map((e) => e.id), ["e1"]);
+});
+
+test("validate P2-3: a non-ISO date string is not a valid ISO date", () => {
+  assert.ok(
+    validateEvents([
+      event({ id: "e1", start: "17 Nov 2026 09:00", end: "2026-11-17T10:00:00.000Z" }),
+    ]).some((e) => e.includes("start must be a valid ISO")),
+  );
+  assert.ok(
+    validateEmails([email({ id: "m1", receivedAt: "17 Nov 2026 09:00" })]).some((e) =>
+      e.includes("receivedAt must be a valid ISO"),
+    ),
+  );
+  assert.ok(
+    validateEvents([event({ id: "e1", start: "2026-02-30T09:00:00.000Z", end: "2026-03-01T10:00:00.000Z" })]).some(
+      (e) => e.includes("start must be a valid ISO"),
+    ),
+  );
+});
+
+// --- P2-4: explicit false wins, markers match standalone words only ---
+
+test("brief P2-4: an explicit needsDecision false is respected even with a marker in the body", () => {
+  const brief = buildMorningBrief({
+    emails: [
+      email({ id: "m1", subject: "Quyết toán tháng 11", body: "Quyết toán chi phí tháng 11.", needsDecision: false }),
+    ],
+    events: [],
+    now: NOW,
+  });
+  assert.deepEqual(brief.needsDecision, []);
+});
+
+test("brief P2-4: a marker inside a compound word or boilerplate does not count", () => {
+  const brief = buildMorningBrief({
+    emails: [
+      email({ id: "m1", subject: "Báo cáo", body: "Chốt sổ cuối tháng, gửi báo cáo." }),
+      email({ id: "m2", subject: "Invoice", body: "Please confirm receipt of the invoice." }),
+      email({ id: "m3", subject: "Reconfirmation", body: "Your booking is reconfirmed." }),
+    ],
+    events: [],
+    now: NOW,
+  });
+  assert.deepEqual(brief.needsDecision, []);
+});
+
+test("brief P2-4: a standalone marker still counts", () => {
+  const brief = buildMorningBrief({
+    emails: [
+      email({ id: "m1", subject: "Cần bạn quyết ngân sách", body: "Xem file đính kèm." }),
+      email({ id: "m2", subject: "Chốt phương án triển khai", body: "Chốt trước thứ sáu." }),
+      email({ id: "m3", subject: "Quyết toán tháng 11", body: "Quyết toán chi phí.", needsDecision: true }),
+    ],
+    events: [],
+    now: NOW,
+  });
+  assert.deepEqual(brief.needsDecision.map((e) => e.id), ["m1", "m2", "m3"]);
+});
+
 // --- Render ---
 
 test("render: text names the real items, with plain words for empty sections", () => {
