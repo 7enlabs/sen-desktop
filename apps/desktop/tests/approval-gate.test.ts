@@ -14,6 +14,7 @@
 // still ends in TOOL_EXECUTION_NOT_WIRED on the backend).
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import type { ActionContract } from "../src/ipc/types.ts";
 import {
@@ -34,6 +35,7 @@ import {
   getActivityLog,
   revokeTool,
 } from "../src/ipc/tools-client.ts";
+import { callTool } from "../src/ipc/session-client.ts";
 
 function contract(): ActionContract {
   return {
@@ -790,4 +792,174 @@ test("tools-client activity log: a malformed entry fails loudly", async () => {
   } finally {
     setBridgeTransport(null);
   }
+});
+
+// --- 4. Tools client wire shape (CI P2-6) ---
+// Same lesson as settings-client R2B-05 rev2: the v1 mock-transport
+// tests only assert what the client sends, so a client that sends a
+// flat payload while the handler waits for `args: <Args>` (or a
+// nested `args` while the handler waits for a flat `tool_name`)
+// passes under node and fails on every real call ("missing required
+// key args" / "missing required key tool_name"). These tests read
+// each handler signature out of tools.rs and assert the client
+// payload against it, so they FAIL on a wrong payload and PASS only
+// when the client sends the shape the handler waits for. They do NOT
+// prove the Rust side gates or logs: that evidence is the
+// approval_gate.rs + registry.rs suite (cargo test, run on the
+// Leader VM), and real tool execution is NOT RUN anywhere yet.
+function rustToolsSource(): string {
+  return readFileSync(
+    new URL("../src-tauri/src/commands/tools.rs", import.meta.url),
+    "utf8",
+  );
+}
+
+function toCamelCase(snake: string): string {
+  return snake.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+}
+
+/// Expected wire shape for a command with an `args: <Args>` struct,
+/// derived from the Rust handler: the struct-typed parameter name
+/// (e.g. "args") plus the camelCase field names of its args struct.
+function expectedWireShape(
+  src: string,
+  command: string,
+): { paramKey: string; fields: string[] } {
+  const fnMatch = src.match(new RegExp(`pub fn ${command}\\(([\\s\\S]*?)\\) ->`));
+  assert.ok(fnMatch, `Rust handler ${command} not found in tools.rs`);
+  // tools.rs declares `contract: ContractArgs` BEFORE `args: <Args>`
+  // (approve/revoke), so take the first *Args parameter that is not
+  // the contract: `contract` is the wire contract, not the args struct.
+  const argsMatch = [...fnMatch[1].matchAll(/(\w+):\s*(\w+Args)/g)].find(
+    (m) => m[1] !== "contract",
+  );
+  assert.ok(argsMatch, `${command} declares no *Args parameter in tools.rs`);
+  const paramKey = argsMatch[1];
+  const structName = argsMatch[2];
+  const structMatch = src.match(new RegExp(`pub struct ${structName} \\{([\\s\\S]*?)\\}`));
+  assert.ok(structMatch, `Rust struct ${structName} not found in tools.rs`);
+  const structHead = src.slice(Math.max(0, (structMatch.index ?? 0) - 200), structMatch.index ?? 0);
+  assert.match(structHead, /rename_all = "camelCase"/, `${structName} is not camelCase-renamed`);
+  const fields = [...structMatch[1].matchAll(/pub (\w+):/g)].map((m) => toCamelCase(m[1]));
+  assert.ok(fields.length > 0, `${structName} has no fields`);
+  return { paramKey, fields };
+}
+
+/// Flat wire params for a command, derived from the Rust handler
+/// signature: every declared parameter except the Tauri-managed
+/// `state` slot and the `contract`. Param names are asserted as
+/// declared (snake_case, e.g. `tool_name`).
+function expectedFlatParams(src: string, command: string): string[] {
+  const fnMatch = src.match(new RegExp(`pub fn ${command}\\(([\\s\\S]*?)\\) ->`));
+  assert.ok(fnMatch, `Rust handler ${command} not found in tools.rs`);
+  const params = fnMatch[1];
+  // Split on commas that are not inside <...> (State<'_, Mutex<...>>).
+  const chunks: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of params) {
+    if (ch === "<") depth += 1;
+    if (ch === ">") depth -= 1;
+    if (ch === "," && depth === 0) {
+      chunks.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  chunks.push(cur);
+  const names = chunks
+    .map((c) => c.trim().match(/^(\w+)\s*:/)?.[1])
+    .filter((n): n is string => !!n);
+  const wire = names.filter((n) => !["state", "contract"].includes(n));
+  assert.ok(wire.length > 0, `${command} declares no wire params in tools.rs`);
+  return wire;
+}
+
+async function capturePayload(
+  command: string,
+  stubResult: unknown,
+  call: () => Promise<unknown>,
+): Promise<Record<string, unknown>> {
+  let seen: Record<string, unknown> = {};
+  setBridgeTransport(async (cmd, args) => {
+    assert.equal(cmd, command);
+    seen = args as Record<string, unknown>;
+    return stubResult;
+  });
+  try {
+    await call();
+  } finally {
+    setBridgeTransport(null);
+  }
+  return seen;
+}
+
+test("tools-client approve: payload matches the Rust handler wire shape (CI P2-6)", async () => {
+  const { paramKey, fields } = expectedWireShape(rustToolsSource(), "sen_tool_approve");
+  assert.equal(paramKey, "args");
+  assert.deepEqual(fields, ["toolName", "idempotencyKey", "grantedBy"]);
+  const payload = await capturePayload(
+    "sen_tool_approve",
+    {
+      toolName: "send_message",
+      idempotencyKey: "k1",
+      grantedBy: "zen",
+      grantedAt: "epoch-1",
+      expiresAtSecs: 1793123456,
+    },
+    () => approveTool(contract(), "send_message", "k1", "zen"),
+  );
+  assert.ok(paramKey in payload, `payload is missing the "${paramKey}" key the Rust handler waits for`);
+  assert.deepEqual(payload[paramKey], {
+    toolName: "send_message",
+    idempotencyKey: "k1",
+    grantedBy: "zen",
+  });
+  assert.ok(!("toolName" in payload) && !("idempotencyKey" in payload) && !("grantedBy" in payload), "payload must not carry flat toolName/idempotencyKey/grantedBy keys");
+  assert.ok("contract" in payload, "payload must still carry the contract");
+});
+
+test("tools-client revoke: payload matches the Rust handler wire shape (CI P2-6)", async () => {
+  const { paramKey, fields } = expectedWireShape(rustToolsSource(), "sen_tool_revoke");
+  assert.equal(paramKey, "args");
+  assert.deepEqual(fields, ["toolName", "idempotencyKey"]);
+  const payload = await capturePayload(
+    "sen_tool_revoke",
+    true,
+    () => revokeTool(contract(), "send_message", "k1"),
+  );
+  assert.ok(paramKey in payload, `payload is missing the "${paramKey}" key the Rust handler waits for`);
+  assert.deepEqual(payload[paramKey], {
+    toolName: "send_message",
+    idempotencyKey: "k1",
+  });
+  assert.ok(!("toolName" in payload) && !("idempotencyKey" in payload), "payload must not carry flat toolName/idempotencyKey keys");
+  assert.ok("contract" in payload, "payload must still carry the contract");
+});
+
+test("tools-client call: flat tool_name param matches the Rust handler (CI P2-6)", async () => {
+  assert.deepEqual(expectedFlatParams(rustToolsSource(), "sen_tool_call"), ["tool_name"]);
+  const payload = await capturePayload(
+    "sen_tool_call",
+    undefined,
+    () => callTool(contract(), "read_file"),
+  );
+  assert.deepEqual(payload, { contract: contract(), tool_name: "read_file" });
+  assert.ok(!("args" in payload), "call takes a flat tool_name, so the payload must not carry an args key");
+  assert.ok(!("toolName" in payload), "payload must use the declared snake_case tool_name, not camelCase toolName");
+});
+
+test("tools-client activity log: no args key, contract only (CI P2-6)", async () => {
+  const src = rustToolsSource();
+  const fnMatch = src.match(/pub fn sen_tool_activity_log\(([\s\S]*?)\) ->/);
+  assert.ok(fnMatch, "Rust handler sen_tool_activity_log not found in tools.rs");
+  assert.doesNotMatch(fnMatch[1], /args:\s*\w+Args/, "sen_tool_activity_log declares no args struct parameter in tools.rs");
+  const payload = await capturePayload(
+    "sen_tool_activity_log",
+    [],
+    () => getActivityLog(contract()),
+  );
+  assert.deepEqual(Object.keys(payload), ["contract"]);
+  assert.ok(!("args" in payload), "activity log takes no args struct, so the payload must not carry an args key");
 });

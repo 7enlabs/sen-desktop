@@ -10,6 +10,7 @@
 // here (no token on this box).
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import {
   getTelegramStatus,
@@ -176,4 +177,102 @@ test("telegram loop: a failed update does not kill the loop", async () => {
   // The first update failed, the loop logged it and routed the second.
   assert.deepEqual(routed, ["second"]);
   assert.equal(sends, 2);
+});
+
+// --- CI P2-6: wire shape locked against telegram.rs ---
+// Same lesson as settings-client R2B-05 rev2: the v1 mock-transport
+// tests only assert what the client sends, so a client that sends a
+// flat payload while the handler waits for `args: <Args>` passes
+// under node and fails on every real call ("missing required key
+// args"). These tests read each handler signature out of telegram.rs
+// and assert the client payload against it, so they FAIL on a wrong
+// payload and PASS only when the client sends the shape the handler
+// waits for. They do NOT prove the Bot API itself: that evidence is
+// the telegram_client.rs suite in the harness, and a live bot is NOT
+// RUN here (no token on this box).
+function rustTelegramSource(): string {
+  return readFileSync(
+    new URL("../src-tauri/src/commands/telegram.rs", import.meta.url),
+    "utf8",
+  );
+}
+
+function toCamelCase(snake: string): string {
+  return snake.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+}
+
+/// Expected wire shape for a command with an `args: <Args>` struct,
+/// derived from the Rust handler: the struct-typed parameter name
+/// (e.g. "args") plus the camelCase field names of its args struct.
+function expectedWireShape(
+  src: string,
+  command: string,
+): { paramKey: string; fields: string[] } {
+  const fnMatch = src.match(new RegExp(`pub fn ${command}\\(([\\s\\S]*?)\\) ->`));
+  assert.ok(fnMatch, `Rust handler ${command} not found in telegram.rs`);
+  const argsMatch = fnMatch[1].match(/(\w+):\s*(\w+Args)/);
+  assert.ok(argsMatch, `${command} declares no *Args parameter in telegram.rs`);
+  const paramKey = argsMatch[1];
+  const structName = argsMatch[2];
+  const structMatch = src.match(new RegExp(`pub struct ${structName} \\{([\\s\\S]*?)\\}`));
+  assert.ok(structMatch, `Rust struct ${structName} not found in telegram.rs`);
+  const structHead = src.slice(Math.max(0, (structMatch.index ?? 0) - 200), structMatch.index ?? 0);
+  assert.match(structHead, /rename_all = "camelCase"/, `${structName} is not camelCase-renamed`);
+  const fields = [...structMatch[1].matchAll(/pub (\w+):/g)].map((m) => toCamelCase(m[1]));
+  assert.ok(fields.length > 0, `${structName} has no fields`);
+  return { paramKey, fields };
+}
+
+async function capturePayload(
+  command: string,
+  stubResult: unknown,
+  call: () => Promise<unknown>,
+): Promise<Record<string, unknown>> {
+  let seen: Record<string, unknown> = {};
+  setBridgeTransport(async (cmd, args) => {
+    assert.equal(cmd, command);
+    seen = args as Record<string, unknown>;
+    return stubResult;
+  });
+  await call();
+  setBridgeTransport(null);
+  return seen;
+}
+
+test("telegram send: payload matches the Rust handler wire shape (CI P2-6)", async () => {
+  const { paramKey, fields } = expectedWireShape(rustTelegramSource(), "sen_telegram_send");
+  assert.equal(paramKey, "args");
+  assert.deepEqual(fields, ["chatId", "text"]);
+  const payload = await capturePayload(
+    "sen_telegram_send",
+    { sent: true },
+    () => sendTelegramMessage(contract(), 100, "hello"),
+  );
+  assert.ok(paramKey in payload, `payload is missing the "${paramKey}" key the Rust handler waits for`);
+  assert.deepEqual(payload[paramKey], { chatId: 100, text: "hello" });
+  assert.ok(!("chatId" in payload) && !("text" in payload), "payload must not carry flat chatId/text keys");
+  assert.ok("contract" in payload, "payload must still carry the contract");
+});
+
+test("telegram status and poll: no args key, contract only (CI P2-6)", async () => {
+  const src = rustTelegramSource();
+  for (const command of ["sen_telegram_status", "sen_telegram_poll_once"]) {
+    const fnMatch = src.match(new RegExp(`pub fn ${command}\\(([\\s\\S]*?)\\) ->`));
+    assert.ok(fnMatch, `Rust handler ${command} not found in telegram.rs`);
+    assert.doesNotMatch(fnMatch[1], /args:\s*\w+Args/, `${command} declares no args struct parameter in telegram.rs`);
+  }
+  const statusPayload = await capturePayload(
+    "sen_telegram_status",
+    { configured: true, allowedChatIdSet: false, allowAnyChat: false },
+    () => getTelegramStatus(contract()),
+  );
+  assert.deepEqual(Object.keys(statusPayload), ["contract"]);
+  assert.ok(!("args" in statusPayload), "status takes no args struct, so the payload must not carry an args key");
+  const pollPayload = await capturePayload(
+    "sen_telegram_poll_once",
+    { updates: [] },
+    () => pollTelegramOnce(contract()),
+  );
+  assert.deepEqual(Object.keys(pollPayload), ["contract"]);
+  assert.ok(!("args" in pollPayload), "poll takes no args struct, so the payload must not carry an args key");
 });

@@ -13,6 +13,7 @@
 // from TurnResult).
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { setBridgeTransport } from "../src/ipc/bridge.ts";
 import type { ActionContract } from "../src/ipc/types.ts";
 import {
@@ -20,6 +21,8 @@ import {
   createSession,
   followUpSession,
   steerSession,
+  subscribeSession,
+  unsubscribeSession,
 } from "../src/ipc/session-client.ts";
 import { SessionManager } from "../../../packages/core/src/session.ts";
 
@@ -118,4 +121,168 @@ test("session-client steer: result missing the counts is refused", async () => {
   await createSession(manager, contract(), "s1");
   await assert.rejects(() => steerSession(contract(), "s1", "hi"), /malformed/);
   setBridgeTransport(null);
+});
+
+// --- CI P2-6: wire shape locked against session.rs + events.rs ---
+// The session handlers take FLAT parameters, not an `args: <Args>`
+// struct: `session_id: String` and `text: String` travel as top-level
+// payload keys (snake_case, exactly as declared), next to `contract`.
+// The failure mode is the mirror image of settings-client R2B-05
+// rev2: a client that nests these under `args` passes under node and
+// fails on every real call ("missing required key session_id"), and a
+// client that sends a renamed key fails the same way. These tests
+// parse each handler signature out of session.rs / events.rs and
+// assert the client payload carries exactly the flat params the
+// handler declares — no `args` key, no renamed key — so they FAIL on
+// a wrong payload and PASS only when the client sends the shape the
+// handler waits for. They do NOT prove the Rust handlers run a turn:
+// that evidence is the cli_spawn harness test plus the registry suite.
+function rustSessionSource(): string {
+  return readFileSync(
+    new URL("../src-tauri/src/commands/session.rs", import.meta.url),
+    "utf8",
+  );
+}
+
+function rustEventsSource(): string {
+  return readFileSync(
+    new URL("../src-tauri/src/commands/events.rs", import.meta.url),
+    "utf8",
+  );
+}
+
+/// Flat wire params for a command, derived from the Rust handler
+/// signature: every declared parameter except the Tauri-managed
+/// `state` / `app` / `memory` slots and the `contract`. Param names
+/// are asserted as declared (snake_case, e.g. `session_id`).
+function expectedFlatParams(src: string, file: string, command: string): string[] {
+  const fnMatch = src.match(new RegExp(`pub fn ${command}\\(([\\s\\S]*?)\\) ->`));
+  assert.ok(fnMatch, `Rust handler ${command} not found in ${file}`);
+  const params = fnMatch[1];
+  // Split on commas that are not inside <...> (State<'_, Mutex<...>>).
+  const chunks: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of params) {
+    if (ch === "<") depth += 1;
+    if (ch === ">") depth -= 1;
+    if (ch === "," && depth === 0) {
+      chunks.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  chunks.push(cur);
+  const names = chunks
+    .map((c) => c.trim().match(/^(\w+)\s*:/)?.[1])
+    .filter((n): n is string => !!n);
+  const wire = names.filter((n) => !["state", "app", "memory", "contract"].includes(n));
+  assert.ok(wire.length > 0, `${command} declares no wire params in ${file}`);
+  return wire;
+}
+
+async function capturePayload(
+  command: string,
+  stubResult: unknown,
+  call: () => Promise<unknown>,
+): Promise<Record<string, unknown>> {
+  let seen: Record<string, unknown> = {};
+  setBridgeTransport(async (cmd, args) => {
+    assert.equal(cmd, command);
+    seen = args as Record<string, unknown>;
+    return stubResult;
+  });
+  await call();
+  setBridgeTransport(null);
+  return seen;
+}
+
+function sessionStubResult() {
+  return {
+    sessionId: "s1",
+    state: "Running",
+    unknownRecords: 0,
+    versionMismatches: 0,
+  };
+}
+
+test("session-client create: flat params match the Rust handler (CI P2-6)", async () => {
+  assert.deepEqual(expectedFlatParams(rustSessionSource(), "session.rs", "sen_session_create"), ["session_id"]);
+  const manager = new SessionManager();
+  const payload = await capturePayload(
+    "sen_session_create",
+    sessionStubResult(),
+    () => createSession(manager, contract(), "s1"),
+  );
+  assert.deepEqual(payload, { contract: contract(), session_id: "s1" });
+  assert.ok(!("args" in payload), "create takes flat params, so the payload must not carry an args key");
+  assert.ok(!("sessionId" in payload), "payload must use the declared snake_case session_id, not camelCase sessionId");
+});
+
+test("session-client steer: flat params match the Rust handler (CI P2-6)", async () => {
+  assert.deepEqual(expectedFlatParams(rustSessionSource(), "session.rs", "sen_session_steer"), ["session_id", "text"]);
+  const payload = await capturePayload(
+    "sen_session_steer",
+    sessionStubResult(),
+    () => steerSession(contract(), "s1", "hi"),
+  );
+  assert.deepEqual(payload, { contract: contract(), session_id: "s1", text: "hi" });
+  assert.ok(!("args" in payload), "steer takes flat params, so the payload must not carry an args key");
+});
+
+test("session-client follow_up: flat params match the Rust handler (CI P2-6)", async () => {
+  assert.deepEqual(expectedFlatParams(rustSessionSource(), "session.rs", "sen_session_follow_up"), ["session_id", "text"]);
+  const payload = await capturePayload(
+    "sen_session_follow_up",
+    sessionStubResult(),
+    () => followUpSession(contract(), "s1", "again"),
+  );
+  assert.deepEqual(payload, { contract: contract(), session_id: "s1", text: "again" });
+  assert.ok(!("args" in payload), "follow_up takes flat params, so the payload must not carry an args key");
+});
+
+test("session-client abort: flat params match the Rust handler (CI P2-6)", async () => {
+  assert.deepEqual(expectedFlatParams(rustSessionSource(), "session.rs", "sen_session_abort"), ["session_id"]);
+  const manager = new SessionManager();
+  setBridgeTransport(async (command, args) => {
+    const a = args as { session_id?: string };
+    return {
+      sessionId: a.session_id,
+      state: command === "sen_session_create" ? "Running" : "Cancelled",
+      unknownRecords: 0,
+      versionMismatches: 0,
+    };
+  });
+  await createSession(manager, contract(), "s1");
+  let abortPayload: Record<string, unknown> = {};
+  setBridgeTransport(async (cmd, args) => {
+    assert.equal(cmd, "sen_session_abort");
+    abortPayload = args as Record<string, unknown>;
+    return { sessionId: "s1", state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
+  });
+  await abortSession(manager, contract(), "s1");
+  setBridgeTransport(null);
+  assert.deepEqual(abortPayload, { contract: contract(), session_id: "s1" });
+  assert.ok(!("args" in abortPayload), "abort takes flat params, so the payload must not carry an args key");
+});
+
+test("session-client subscribe/unsubscribe: flat params match the Rust handler (CI P2-6)", async () => {
+  const events = rustEventsSource();
+  assert.deepEqual(expectedFlatParams(events, "events.rs", "sen_events_subscribe"), ["session_id"]);
+  assert.deepEqual(expectedFlatParams(events, "events.rs", "sen_events_unsubscribe"), ["session_id"]);
+  const subPayload = await capturePayload(
+    "sen_events_subscribe",
+    { sessionId: "s1", subscriberId: 1 },
+    () => subscribeSession(contract(), "s1"),
+  );
+  assert.deepEqual(subPayload, { contract: contract(), session_id: "s1" });
+  assert.ok(!("args" in subPayload), "subscribe takes flat params, so the payload must not carry an args key");
+  const unsubPayload = await capturePayload(
+    "sen_events_unsubscribe",
+    { sessionId: "s1", subscriberCount: 0 },
+    () => unsubscribeSession(contract(), "s1"),
+  );
+  assert.deepEqual(unsubPayload, { contract: contract(), session_id: "s1" });
+  assert.ok(!("args" in unsubPayload), "unsubscribe takes flat params, so the payload must not carry an args key");
 });
