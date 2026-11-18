@@ -61,8 +61,47 @@ export interface MorningBrief {
   unreadCount: number;
 }
 
+/**
+ * Strict ISO 8601 date or date-time: YYYY-MM-DD, optionally with a
+ * time (HH:mm, optional :ss and fractional seconds) and an optional
+ * zone (Z or +/-HH:mm / +/-HHmm). A date-only string is a UTC
+ * midnight instant. `Date.parse` alone is not enough: it accepts
+ * non-ISO strings ("17 Nov 2026 09:00") and rolls an impossible
+ * day over ("2026-02-30" parses as 2 March), so the shape is
+ * checked first and the written Y/M/D must round-trip through
+ * Date.UTC. A timezone-less time is parsed as local time, as
+ * Date.parse does everywhere else in this module.
+ */
+const ISO_DATE_TIME_RE =
+  /^\d{4}-\d{2}-\d{2}(?:[Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?)?$/;
+
 function isValidIso(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && !Number.isNaN(Date.parse(value));
+  if (typeof value !== "string" || !ISO_DATE_TIME_RE.test(value)) {
+    return false;
+  }
+  if (Number.isNaN(Date.parse(value))) {
+    return false;
+  }
+  const parts = /^(\d{4})-(\d{2})-(\d{2})/.exec(value);
+  if (parts === null) {
+    return false;
+  }
+  const year = Number(parts[1]);
+  const month = Number(parts[2]);
+  const day = Number(parts[3]);
+  const roundTrip = new Date(Date.UTC(year, month - 1, day));
+  return (
+    roundTrip.getUTCFullYear() === year &&
+    roundTrip.getUTCMonth() === month - 1 &&
+    roundTrip.getUTCDate() === day
+  );
+}
+
+/** UTC calendar day (YYYY-MM-DD) of an ISO instant. Never slice the
+ * raw string: an input with a timezone offset ("2026-11-17T01:00:00+07:00")
+ * has a written date that is not its UTC day. */
+function utcDayOf(iso: string): string {
+  return new Date(Date.parse(iso)).toISOString().slice(0, 10);
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -165,10 +204,62 @@ export function validateEvents(events: unknown): string[] {
 }
 
 // Markers that make an email count as needing a decision, matched
-// case-insensitively as substrings of subject + body. The list is
+// case-insensitively as standalone words or phrases in subject +
+// body — never as a substring inside another word. The list is
 // explicit and closed: nothing outside it counts, so a plain
 // informational email ("weekly report", "FYI") never becomes a
 // decision item by accident. Vietnamese first, then English.
+//
+// Word boundaries are Unicode-aware (`\b` is ASCII-only, so a
+// Vietnamese word ending in a diacritic would lose its boundary).
+// A marker must also not be the head of a known non-decision
+// compound: Vietnamese compounds are written with spaces, so a
+// boundary check alone still lets "quyết" match inside "quyết
+// toán" (settlement), "chốt" inside "chốt sổ" (closing the
+// books), and "confirm" inside the boilerplate "confirm receipt".
+// Those compounds are listed explicitly below; extend the list when
+// a new false-positive compound is found, instead of widening the
+// matcher.
+
+// Vietnamese compounds (and one English boilerplate phrase) that
+// look like a decision marker but are not one. An occurrence of a
+// marker at the head of one of these phrases does not count.
+const NON_DECISION_COMPOUNDS: readonly string[] = [
+  "quyết toán",
+  "chốt sổ",
+  "confirm receipt",
+];
+
+function isWordChar(ch: string): boolean {
+  return /[\p{L}\p{N}_]/u.test(ch);
+}
+
+/** True when `marker` occurs in `text` as a standalone word or
+ * phrase: bounded by a non-word character (or text edge) on both
+ * sides, and not the head of a NON_DECISION_COMPOUNDS phrase. */
+function matchesMarker(text: string, marker: string): boolean {
+  let from = 0;
+  for (;;) {
+    const at = text.indexOf(marker, from);
+    if (at === -1) {
+      return false;
+    }
+    const before = at === 0 ? "" : text[at - 1];
+    const after = at + marker.length >= text.length ? "" : text[at + marker.length];
+    const bounded =
+      (before === "" || !isWordChar(before)) && (after === "" || !isWordChar(after));
+    const inCompound = NON_DECISION_COMPOUNDS.some(
+      (compound) =>
+        compound.startsWith(marker) &&
+        text.startsWith(compound, at) &&
+        (at + compound.length >= text.length || !isWordChar(text[at + compound.length])),
+    );
+    if (bounded && !inCompound) {
+      return true;
+    }
+    from = at + 1;
+  }
+}
 export const DECISION_MARKERS: readonly string[] = [
   // Vietnamese
   "duyệt",
@@ -193,11 +284,16 @@ export const DECISION_MARKERS: readonly string[] = [
 ];
 
 export function emailNeedsDecision(email: EmailItem): boolean {
+  // An explicit flag wins both ways: true counts, false never
+  // counts, even when the body contains a marker.
   if (email.needsDecision === true) {
     return true;
   }
+  if (email.needsDecision === false) {
+    return false;
+  }
   const text = `${email.subject} ${email.body}`.toLowerCase();
-  return DECISION_MARKERS.some((marker) => text.includes(marker.toLowerCase()));
+  return DECISION_MARKERS.some((marker) => matchesMarker(text, marker.toLowerCase()));
 }
 
 function byTimeThenId(aTime: string, bTime: string, aId: string, bId: string): number {
@@ -248,7 +344,7 @@ export function buildMorningBrief(input: BuildMorningBriefInput): MorningBrief {
   }
   const nowMs = Date.parse(input.now);
   const windowEndMs = nowMs + windowDays * 24 * 60 * 60 * 1000;
-  const today = input.now.slice(0, 10);
+  const today = utcDayOf(input.now);
 
   const sortedEvents = [...input.events].sort((a, b) =>
     byTimeThenId(a.start, b.start, a.id, b.id),
@@ -298,7 +394,7 @@ export function buildMorningBrief(input: BuildMorningBriefInput): MorningBrief {
     .filter((email) => emailNeedsDecision(email))
     .sort((a, b) => byTimeThenId(a.receivedAt, b.receivedAt, a.id, b.id));
 
-  const todayEvents = sortedEvents.filter((event) => event.start.slice(0, 10) === today);
+  const todayEvents = sortedEvents.filter((event) => utcDayOf(event.start) === today);
 
   return {
     generatedAt: new Date(nowMs).toISOString(),
