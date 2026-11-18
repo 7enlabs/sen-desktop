@@ -24,6 +24,7 @@ import {
   defaultToolPolicy,
   evaluateToolCall,
   gateToolCall,
+  MAX_ACTIVITY_LOG_ENTRIES,
   validateToolPolicy,
   type ToolPolicy,
 } from "../../../packages/core/src/approval-gate.ts";
@@ -398,6 +399,69 @@ test("gate: revoke is session-scoped", () => {
   assert.notEqual(store.find("send_message", "k1", OTHER_SESSION_ID), undefined);
   assert.equal(store.revoke("send_message", "k1", SESSION_ID), false);
   assert.equal(store.list().length, 1);
+});
+
+// --- 1d. P2-5: the activity log is capped, FIFO, seq never reused ---
+// The cap is exercised through a small constructor bound so the tests
+// stay fast; the production default (MAX_ACTIVITY_LOG_ENTRIES) is
+// asserted, not filled, because recording 10,000 entries in a test
+// would prove nothing the small-cap tests do not already prove.
+// Same shape as packages/core/tests/raw-log.test.ts.
+
+function recordActivity(log: ActivityLog, i: number) {
+  return log.record({
+    actor: "tester",
+    tool: "read_file",
+    tier: "auto",
+    decision: "allow",
+    reason: `ok ${i}`,
+    result: "allowed",
+  });
+}
+
+test("gate: activity log default cap is 10000 entries", () => {
+  assert.equal(MAX_ACTIVITY_LOG_ENTRIES, 10000);
+  const log = new ActivityLog();
+  for (let i = 0; i < 3; i += 1) recordActivity(log, i);
+  assert.equal(log.length, 3);
+  assert.deepEqual(
+    log.entries().map((e) => e.seq),
+    [1, 2, 3],
+  );
+});
+
+test("gate: activity log non-positive cap is rejected at construction", () => {
+  assert.throws(() => new ActivityLog(0), /maxEntries must be a positive integer/);
+  assert.throws(() => new ActivityLog(-1), /maxEntries must be a positive integer/);
+});
+
+test("gate: activity log over the cap evicts oldest first and keeps the N newest in order", () => {
+  const log = new ActivityLog(5);
+  for (let i = 0; i < 7; i += 1) recordActivity(log, i);
+  assert.equal(log.length, 5);
+  // Oldest two (seq 1, 2) evicted; newest five kept in append order.
+  assert.deepEqual(
+    log.entries().map((e) => e.seq),
+    [3, 4, 5, 6, 7],
+  );
+  assert.deepEqual(
+    log.entries().map((e) => e.reason),
+    ["ok 2", "ok 3", "ok 4", "ok 5", "ok 6"],
+  );
+});
+
+test("gate: activity log seq keeps increasing monotonically after eviction, never reused", () => {
+  const log = new ActivityLog(3);
+  for (let i = 0; i < 3; i += 1) recordActivity(log, i);
+  recordActivity(log, 3);
+  recordActivity(log, 4);
+  assert.deepEqual(
+    log.entries().map((e) => e.seq),
+    [3, 4, 5],
+  );
+  // The next entry continues at 6, not back at 1: the seq gap (1-2 gone)
+  // is what makes eviction observable instead of silent.
+  assert.equal(recordActivity(log, 5).seq, 6);
 });
 
 test("gate: grant requires a non-empty session id", () => {

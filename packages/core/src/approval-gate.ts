@@ -304,14 +304,44 @@ export interface ActivityEntry {
   result: ActivityResult;
 }
 
+// Retention bound for the activity log (P2-5, same bound as
+// RawLog's MAX_RAW_LOG_EVENTS and the Rust ActivityLog's
+// MAX_ACTIVITY_LOG_ENTRIES). Why 10,000: one entry is recorded
+// per evaluated tool call, and a session makes only a handful of
+// tool calls per turn, so even a 1,000-turn session is a few
+// thousand entries; 10,000 sits an order of magnitude above any
+// ordinary session, so no useful history of a normal session is
+// lost. Why a bound at all: entries carry full reason strings, so
+// an unbounded log grows with session length without limit.
+// Eviction is FIFO: the oldest entry goes first, the surviving
+// entries keep their append order, and seq never reuses a number,
+// so a gap in seq is the observable trace that eviction happened.
+// The cap is not a delete function and does not change the
+// no-delete rule: no caller can delete anything, there is still no
+// public delete API, and eviction happens only inside record, only
+// to the oldest entry, only when the fixed bound is exceeded.
+export const MAX_ACTIVITY_LOG_ENTRIES = 10000;
+
 /**
  * Append-only activity log. There is deliberately no delete, no
  * update, and no clear: entries only ever get appended, seq never
- * reuses a number, and readers get copies.
+ * reuses a number, and readers get copies. The one exception is
+ * the retention cap above: when the log holds more than
+ * MAX_ACTIVITY_LOG_ENTRIES entries, record drops the oldest one
+ * (FIFO). That is eviction under a cap, not deletion — see the
+ * MAX_ACTIVITY_LOG_ENTRIES note.
  */
 export class ActivityLog {
   private entriesList: ActivityEntry[] = [];
   private nextSeq = 1;
+  private readonly maxEntries: number;
+
+  constructor(maxEntries: number = MAX_ACTIVITY_LOG_ENTRIES) {
+    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+      throw new RangeError("maxEntries must be a positive integer");
+    }
+    this.maxEntries = maxEntries;
+  }
 
   record(input: {
     actor: string;
@@ -334,6 +364,9 @@ export class ActivityLog {
     };
     this.nextSeq += 1;
     this.entriesList.push(entry);
+    if (this.entriesList.length > this.maxEntries) {
+      this.entriesList.shift();
+    }
     return { ...entry };
   }
 
