@@ -23,10 +23,15 @@
 // SOUL.md, USER.md, MEMORY.md, then the last 10 lines of today's daily
 // log. It is prepended to every turn on purpose: always correct (the
 // model never misses an edit, including a `quên`), at the cost of
-// repeating a small block in the CLI history. Only the daily part is
-// bounded (the last 10 lines): SOUL.md, USER.md and MEMORY.md go in
-// in full, so the block grows with those files — the "bounded" claim
-// in the first draft was wrong.
+// repeating a small block in the CLI history. Every part is bounded
+// (P2-4): SOUL.md to CONTEXT_SOUL_MAX_CHARS chars, USER.md and
+// MEMORY.md to the newest CONTEXT_USER_ITEMS / CONTEXT_MEMORY_ITEMS
+// items each, the daily log to the last CONTEXT_DAILY_LINES lines.
+// A cut section says so in the block itself, so the model knows older
+// facts exist that it cannot see. (The first draft claimed the block
+// was "bounded" when only the daily part was: SOUL.md, USER.md and
+// MEMORY.md went in in full, so the block grew with those files.)
+#[cfg(any(unix, windows))]
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,6 +46,21 @@ pub const LOG_TEXT_MAX_CHARS: usize = 1000;
 /// same-day continuity; the CLI session history already holds the full
 /// turns, so the block does not need more.
 pub const CONTEXT_DAILY_LINES: usize = 10;
+
+/// Durable facts (MEMORY.md) and user facts (USER.md) carried into the
+/// memory context block: the most recent N items each. The block is
+/// prepended to every turn, so an unbounded list grows the prompt
+/// forever as facts accumulate; the newest facts are the ones a turn
+/// most often needs. When older items are left out, the block says how
+/// many, so the cut is visible instead of silent.
+pub const CONTEXT_MEMORY_ITEMS: usize = 50;
+pub const CONTEXT_USER_ITEMS: usize = 50;
+
+/// Persona text (SOUL.md) carried into the memory context block, in
+/// chars. The persona is free-form and usually short; the cap only
+/// bites on a pasted wall of text. truncate_chars marks the cut with
+/// "...", so a cut persona never looks complete.
+pub const CONTEXT_SOUL_MAX_CHARS: usize = 2000;
 
 /// The assistant's own name. The context block always carries it, even
 /// when every memory file is empty, so the model always knows who it is.
@@ -168,6 +188,26 @@ fn truncate_chars(text: &str, max: usize) -> String {
     out
 }
 
+/// Append at most the last `max` items of `items` to the context block,
+/// one "- ..." line each (P2-4). When items are left out, a note line
+/// first says how many of how many total were kept, so the model knows
+/// older facts exist that it cannot see. A `quên` edit is still applied
+/// to the file, never to this block, so a cut fact is hidden, not lost.
+fn push_capped_items(block: &mut String, items: &[String], max: usize) {
+    let total = items.len();
+    let kept = &items[total.saturating_sub(max)..];
+    if kept.len() < total {
+        block.push_str(&format!(
+            "(chỉ lấy {} mục mới nhất trong tổng số {})\n",
+            kept.len(),
+            total
+        ));
+    }
+    for item in kept {
+        block.push_str(&format!("- {}\n", item));
+    }
+}
+
 /// Validate one fact text: non-empty after trimming, single line. A
 /// newline inside a fact would break the one-item-per-line layout and
 /// silently create phantom items.
@@ -207,28 +247,54 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (if m <= 2 { y + 1 } else { y } as i32, m, d)
 }
 
+/// Format one libc tm as ("YYYY-MM-DD", "HH:MM:SS"). Shared by the
+/// Unix (localtime_r) and Windows (localtime_s) branches of local_now:
+/// the tm fields have the same names on both.
+#[cfg(any(unix, windows))]
+fn format_tm(tm: &libc::tm) -> (String, String) {
+    (
+        format!(
+            "{:04}-{:02}-{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday
+        ),
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+    )
+}
+
 /// Local date + time ("YYYY-MM-DD", "HH:MM:SS") from the system clock.
 /// Local, not UTC: the daily log is the user's log, and the user is not
 /// on UTC. Falls back to UTC when localtime fails, never to a crash.
+/// (Windows: libc has no localtime_r there, only localtime_s, so the
+/// Windows branch below uses that; the tm fields have the same names
+/// on both, and the UTC fallback still covers a failure.)
 fn local_now() -> (String, String) {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let time_t = secs as libc::time_t;
-    let mut tm = MaybeUninit::<libc::tm>::uninit();
-    let ok = unsafe { libc::localtime_r(&time_t, tm.as_mut_ptr()) };
-    if !ok.is_null() {
-        let tm = unsafe { tm.assume_init() };
-        return (
-            format!(
-                "{:04}-{:02}-{:02}",
-                tm.tm_year + 1900,
-                tm.tm_mon + 1,
-                tm.tm_mday
-            ),
-            format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
-        );
+    // Unix: localtime_r. Windows: localtime_s (0 on success). Either
+    // way a failure falls through to the UTC computation below.
+    #[cfg(unix)]
+    {
+        let time_t = secs as libc::time_t;
+        let mut tm = MaybeUninit::<libc::tm>::uninit();
+        let ok = unsafe { libc::localtime_r(&time_t, tm.as_mut_ptr()) };
+        if !ok.is_null() {
+            let tm = unsafe { tm.assume_init() };
+            return format_tm(&tm);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let time_t = secs as libc::time_t;
+        let mut tm = MaybeUninit::<libc::tm>::uninit();
+        let err = unsafe { libc::localtime_s(tm.as_mut_ptr(), &time_t) };
+        if err == 0 {
+            let tm = unsafe { tm.assume_init() };
+            return format_tm(&tm);
+        }
     }
     let days = secs.div_euclid(86400);
     let (y, m, d) = civil_from_days(days);
@@ -479,7 +545,10 @@ impl MemoryStore {
 
     /// The memory context block: assistant name, persona, user facts,
     /// durable facts, today's recent events. Sections with no content
-    /// are left out, so an empty memory stays a short block.
+    /// are left out, so an empty memory stays a short block. Every
+    /// section is capped (P2-4, see the CONTEXT_* constants): the caps
+    /// keep the block from growing with the files on every turn, and a
+    /// cut section names the cut in the block itself.
     pub fn context_block(&self) -> String {
         let snapshot = self.read();
         let mut block = String::new();
@@ -490,20 +559,16 @@ impl MemoryStore {
         ));
         if !snapshot.soul.is_empty() {
             block.push_str("Tính cách:\n");
-            block.push_str(&snapshot.soul);
+            block.push_str(&truncate_chars(&snapshot.soul, CONTEXT_SOUL_MAX_CHARS));
             block.push('\n');
         }
         if !snapshot.user.is_empty() {
             block.push_str("Về người dùng:\n");
-            for item in &snapshot.user {
-                block.push_str(&format!("- {}\n", item));
-            }
+            push_capped_items(&mut block, &snapshot.user, CONTEXT_USER_ITEMS);
         }
         if !snapshot.memory.is_empty() {
             block.push_str("Dữ kiện bền:\n");
-            for item in &snapshot.memory {
-                block.push_str(&format!("- {}\n", item));
-            }
+            push_capped_items(&mut block, &snapshot.memory, CONTEXT_MEMORY_ITEMS);
         }
         let recent: Vec<&String> = snapshot
             .today
@@ -753,6 +818,70 @@ mod tests {
         assert!(block.contains("Tính cách:\nThẳng thắn."));
         assert!(block.contains("Về người dùng:\n- name is Zen"));
         assert!(block.contains("Dữ kiện bền:\n- likes tea"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P2-4: the context block caps MEMORY.md / USER.md to the newest
+    // items and names the cut in the block.
+    #[test]
+    fn context_block_caps_memory_and_user_items_and_names_the_cut() {
+        let (store, dir) = store("capitems");
+        for i in 1..=55 {
+            store
+                .add(Scope::Memory, &format!("memory item {:03}", i))
+                .unwrap();
+            store
+                .add(Scope::User, &format!("user item {:03}", i))
+                .unwrap();
+        }
+        let block = store.context_block();
+        // Newest 50 kept, oldest 5 cut, and the cut is named.
+        // (The last kept item is the last line of the block, and
+        // context_block trims the trailing newline, so it ends the
+        // block without "\n".)
+        assert!(block.ends_with("- memory item 055"), "block: {}", block);
+        assert!(!block.contains("- memory item 001\n"), "block: {}", block);
+        assert!(block.contains("- user item 055\n"), "block: {}", block);
+        assert!(!block.contains("- user item 001\n"), "block: {}", block);
+        assert!(
+            block.contains("(chỉ lấy 50 mục mới nhất trong tổng số 55)"),
+            "block: {}",
+            block
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P2-4: no cut note when everything fits under the caps.
+    #[test]
+    fn context_block_has_no_cut_note_when_under_the_caps() {
+        let (store, dir) = store("capnone");
+        store.add(Scope::Memory, "likes tea").unwrap();
+        store.add(Scope::User, "name is Zen").unwrap();
+        let block = store.context_block();
+        assert!(!block.contains("chỉ lấy"), "block: {}", block);
+        assert!(block.contains("- likes tea"));
+        assert!(block.contains("- name is Zen"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P2-4: the persona is capped by chars, and the cut is marked.
+    #[test]
+    fn context_block_caps_soul_chars_and_marks_the_cut() {
+        let (store, dir) = store("capsoul");
+        store
+            .set_soul(&"x".repeat(CONTEXT_SOUL_MAX_CHARS + 500))
+            .unwrap();
+        let block = store.context_block();
+        assert!(
+            block.contains(&format!("{}...", "x".repeat(CONTEXT_SOUL_MAX_CHARS))),
+            "block: {}",
+            block
+        );
+        assert!(
+            !block.contains(&"x".repeat(CONTEXT_SOUL_MAX_CHARS + 1)),
+            "block: {}",
+            block
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
