@@ -242,7 +242,14 @@ export function selectRoute(
   return resolveAttemptOrder(config, byokKeyPresent)[0];
 }
 
-/** Route after `failedId` in the attempt order, or undefined. */
+/**
+ * Route after `failedId` in the attempt order, or undefined when the
+ * chain is exhausted or `failedId` is not in the order. An unknown
+ * id never restarts at the first route: that route may already have
+ * been tried, and restarting it is how the fallback loop ran
+ * forever when the config changed mid-turn (P2-2, mirror of
+ * `next_route` in model_router.rs, PR #95).
+ */
 export function nextRoute(
   config: RouterConfig,
   failedId: string,
@@ -251,7 +258,7 @@ export function nextRoute(
   const order = resolveAttemptOrder(config, byokKeyPresent);
   const at = order.findIndex((r) => r.id === failedId);
   if (at < 0) {
-    return order[0];
+    return undefined;
   }
   return order[at + 1];
 }

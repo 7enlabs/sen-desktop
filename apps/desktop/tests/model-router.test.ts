@@ -21,6 +21,7 @@ import {
   describeRoute,
   errorCodeOf,
   isRetryableErrorCode,
+  nextRoute,
   resolveAttemptOrder,
   routeCostLabel,
   selectRoute,
@@ -114,6 +115,20 @@ test("router: fallback disabled means one attempt", () => {
   const config = defaultRouterConfig();
   config.fallbackEnabled = false;
   assert.equal(resolveAttemptOrder(config).length, 1);
+});
+
+test("router: nextRoute walks the chain and never restarts at the first route (P2-2)", () => {
+  // Mirror of next_route_never_restarts_at_the_first_route in
+  // model_router.rs (PR #95): an unknown failed id used to return
+  // the first route, which may be the route that just failed — the
+  // fallback loop then retried it forever when the config changed
+  // mid-turn.
+  const config = defaultRouterConfig();
+  assert.equal(nextRoute(config, "spark")?.id, "openrouter-free");
+  assert.equal(nextRoute(config, "openrouter-free")?.id, "ollama");
+  assert.equal(nextRoute(config, "ollama"), undefined);
+  assert.equal(nextRoute(config, "no-such-route"), undefined);
+  assert.equal(nextRoute(config, ""), undefined);
 });
 
 test("router: BYOK is skipped without approval or without a key", () => {
