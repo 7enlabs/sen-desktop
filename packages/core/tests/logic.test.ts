@@ -27,10 +27,11 @@ test("statechart: allowed transitions per point 854", () => {
   // AwaitingApproval, when rejected, goes to Cancelled, never hangs.
   assert.equal(canTransition("AwaitingApproval", "Cancelled"), true);
   assert.equal(canTransition("AwaitingApproval", "Error"), false);
-  // Error has exactly 2 paths: back to Running and on to Failed.
+  // Error has 3 paths: back to Running, on to Failed, and to
+  // Cancelled (P2-9 amendment: abort closes an errored session).
   assert.equal(canTransition("Error", "Running"), true);
   assert.equal(canTransition("Error", "Failed"), true);
-  assert.equal(canTransition("Error", "Cancelled"), false);
+  assert.equal(canTransition("Error", "Cancelled"), true);
   // Terminal states have no outgoing path.
   for (const terminal of ["Completed", "Cancelled", "Failed"] as const) {
     for (const to of ["Running", "AwaitingApproval", "Error", "Completed", "Cancelled", "Failed"] as const) {

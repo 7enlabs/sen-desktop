@@ -486,7 +486,16 @@ impl MemoryStore {
         };
         let removed = match &lines[pos] {
             MemLine::Item(item) => item.clone(),
-            MemLine::Other(_) => unreachable!(),
+            // P2-9: unreachable by construction — pos always comes
+            // from item_positions, which only holds positions of
+            // Item lines (the Text arm re-checks Item before
+            // collecting a match), and lines is not touched between
+            // computing pos and this read — but a panic here would
+            // crash the backend on a memory edit, so fail the command
+            // instead of panicking if the invariant ever breaks.
+            MemLine::Other(_) => {
+                return Err("Memory item vanished during forget, FAIL".to_string());
+            }
         };
         lines.remove(pos);
         Self::write_file(&path, &render_lines(&lines))?;

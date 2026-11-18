@@ -363,9 +363,9 @@ pub fn sen_session_follow_up(
 }
 
 /// sen_session_abort: escalates the running CLI turn first (SIGINT, 5s
-/// grace, SIGKILL), then Running or AwaitingApproval -> Cancelled, per
-/// the point-854 table. Error and terminal states refuse with a typed
-/// error. Split in three (R2B-07), like run_steer_turn: begin_abort
+/// grace, SIGKILL), then Running, AwaitingApproval, or Error ->
+/// Cancelled, per the point-854 table as amended by P2-9. Terminal
+/// states refuse with a typed error. Split in three (R2B-07), like run_steer_turn: begin_abort
 /// validates the transition and hands out the bridge (step 1), the
 /// bridge.abort() escalation runs with NO registry lock held so other
 /// Tauri commands are not blocked while it polls the grace period

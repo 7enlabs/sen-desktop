@@ -16,8 +16,20 @@
 // - Session state transitions mirror packages/core/src/session.ts exactly:
 //   Running -> AwaitingApproval | Error | Completed | Cancelled | Failed,
 //   AwaitingApproval -> Running | Cancelled (rejection never hangs),
-//   Error -> Running | Failed (exactly 2 paths),
+//   Error -> Running | Failed | Cancelled (P2-9: the third path is
+//   the abort of an errored session — without it Error is a trap:
+//   abort refuses and retry is the only exit, so a user who wants
+//   to close an errored session cannot),
 //   terminal states (Completed, Cancelled, Failed) have no outgoing path.
+// - A turn's outcome moves the state (P2-9): a successful turn leaves
+//   the session Running — one live session serves every chat turn, so
+//   Completed after a turn would terminal the session after the first
+//   message; an error turn moves Running -> Error, and a second
+//   consecutive error turn moves Error -> Failed (terminal). A
+//   successful turn from Error recovers to Running. A turn that
+//   fails before any result record (no result, timeout, validation)
+//   leaves the state untouched: the session stays usable and the
+//   retry still runs.
 // - Every command validates the full IPC action contract first (same
 //   required fields as apps/desktop/src/ipc/types.ts). A missing field
 //   means FAIL, never a silent default.
@@ -115,7 +127,7 @@ pub fn can_transition(from: SessionState, to: SessionState) -> bool {
             AwaitingApproval | Error | Completed | Cancelled | Failed
         ),
         AwaitingApproval => matches!(to, Running | Cancelled),
-        Error => matches!(to, Running | Failed),
+        Error => matches!(to, Running | Failed | Cancelled),
         Completed | Cancelled | Failed => false,
     }
 }
@@ -653,7 +665,9 @@ impl Registry {
     }
 
     /// sen_session_steer / sen_session_follow_up, step 1 of 3: validate
-    /// the contract, the text, and the Running gate, then either hand
+    /// the contract, the text, and the steer gate (Running, or Error:
+    /// a session whose last turn errored may retry — the Error ->
+    /// Running recovery path, P2-9), then either hand
     /// out the session's bridge (Run) or, when this exact steer already
     /// completed on the session, return the recorded turn result
     /// (Duplicate) so the caller returns it without running the model
@@ -685,11 +699,11 @@ impl Registry {
             ));
         }
         let record = self.get_mut_or_unknown(session_id)?;
-        if record.state != SessionState::Running {
+        if record.state != SessionState::Running && record.state != SessionState::Error {
             return Err(CommandError::new(
                 ERR_ILLEGAL_TRANSITION,
                 &format!(
-                    "Cannot steer a session in state {}, only Running accepts steer/follow-up",
+                    "Cannot steer a session in state {}, only Running or Error accepts steer/follow-up",
                     record.state.as_str()
                 ),
             ));
@@ -759,8 +773,17 @@ impl Registry {
     /// the refusal path (the session left Running, abort won the race)
     /// the key must still not leak, so a later steer is never refused
     /// for a turn that already ended (BUG-10 extra, tin 9645/9650). If
-    /// the session left Running meanwhile (abort won the race), the turn
-    /// is NOT recorded and this refuses.
+    /// the session left Running or Error meanwhile (abort won the
+    /// race), the turn is NOT recorded and this refuses.
+    // P2-9: the turn's outcome moves the state. A successful turn
+    // leaves the session Running: one live session serves every
+    // chat turn, so a turn that succeeds does not end the session
+    // (there is no finish/close command that would produce
+    // Completed — a session ends via abort, to Cancelled). An error
+    // turn (is_error=true) moves Running -> Error; a second
+    // consecutive error turn moves Error -> Failed (terminal), so
+    // a session that keeps failing is failed, not left Running
+    // forever. A successful turn from Error recovers to Running.
     pub fn complete_steer(
         &mut self,
         session_id: &str,
@@ -774,7 +797,7 @@ impl Registry {
         }
         let state = {
             let record = self.get_mut_or_unknown(session_id)?;
-            if record.state != SessionState::Running {
+            if record.state != SessionState::Running && record.state != SessionState::Error {
                 return Err(CommandError::new(
                     ERR_ILLEGAL_TRANSITION,
                     &format!(
@@ -784,6 +807,19 @@ impl Registry {
                 ));
             }
             record.log.push(format!("steer:{}:{}", kind, turn.subtype));
+            // P2-9: move the state by the turn's outcome (see the doc
+            // above). A successful turn always lands on Running, from
+            // either entry state; an error turn steps one failure
+            // further (Running -> Error, Error -> Failed).
+            let next = if turn.is_error {
+                match record.state {
+                    SessionState::Error => SessionState::Failed,
+                    _ => SessionState::Error,
+                }
+            } else {
+                SessionState::Running
+            };
+            record.state = next;
             record.state
         };
         // R2B-02: an error turn (is_error=true) is not a completed
@@ -953,12 +989,12 @@ impl Registry {
     /// sen_session_abort, step 3 of 3 (R2B-07): re-check the transition
     /// — the state may have changed while bridge.abort() ran lock-free
     /// (a concurrent abort may already have cancelled the session) —
-    /// then Running or AwaitingApproval -> Cancelled, per the
-    /// point-854 table, with the subscriber count reset to 0 and the
-    /// log entry matching the AbortOutcome, exactly as the old
-    /// one-call abort did. Error has no path to Cancelled (only
-    /// Running and Failed), and terminal states have no outgoing path
-    /// at all.
+    /// then Running, AwaitingApproval, or Error -> Cancelled, per the
+    /// point-854 table as amended by P2-9 (Error gains the Cancelled
+    /// path so an errored session can still be closed), with the
+    /// subscriber count reset to 0 and the log entry matching the
+    /// AbortOutcome, exactly as the old one-call abort did. Terminal
+    /// states have no outgoing path at all.
     pub fn complete_abort(
         &mut self,
         session_id: &str,
@@ -1179,6 +1215,11 @@ mod tests {
         }
     }
 
+    // P2-9: the Error table edge is live now (Error -> Cancelled,
+    // so an errored session can still be closed). The point-854
+    // table said "Error has exactly 2 paths"; the third path is
+    // the P2-9 amendment: without it an errored session is a trap
+    // (abort refuses, and retry is the only exit).
     #[test]
     fn statechart_point_854() {
         use SessionState::*;
@@ -1188,7 +1229,7 @@ mod tests {
         assert!(!can_transition(AwaitingApproval, Error));
         assert!(can_transition(Error, Running));
         assert!(can_transition(Error, Failed));
-        assert!(!can_transition(Error, Cancelled));
+        assert!(can_transition(Error, Cancelled));
         for terminal in [Completed, Cancelled, Failed] {
             for to in [
                 Running,
@@ -1230,6 +1271,16 @@ mod tests {
 {"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0},"model":"m:free","session_id":"s1","v":1}
 EOF
 exit 0"#;
+
+    // P2-9: a turn that ran to a result record carrying is_error=true
+    // (the real CLI's behaviour on a bad key: HTTP 401). The model
+    // ran, so complete_steer records it; the session must move to
+    // Error, not stay Running as if the turn had succeeded.
+    const ERROR_BODY: &str = r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}
+{"type":"result","subtype":"error_during_execution","is_error":true,"result":"HTTP 401 Unauthorized","duration_ms":1,"num_turns":0,"usage":{},"model":"m:free","session_id":"s1","v":1}
+EOF
+exit 1"#;
 
     #[test]
     fn create_then_duplicate_then_unknown() {
@@ -1432,14 +1483,18 @@ exit 1; fi"#,
         let mut reg = Registry::new();
         reg.set_zen_bin(fake_zen("r2b02", &body));
         reg.create("s1", &contract()).unwrap();
-        // Steer 1: the error turn. The backend ack is Ok(Running) -
-        // the error is visible in the event stream, not as a failure.
+        // Steer 1: the error turn. The backend ack is Ok(Error) -
+        // the error is visible in the event stream, not as a failure,
+        // and the session records that its last turn errored (P2-9:
+        // Running -> Error) instead of staying Running as if
+        // nothing had happened.
         let mut events: Vec<SenEvent> = Vec::new();
         let mut emit = |ev: SenEvent| events.push(ev);
         assert_eq!(
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
-            Ok(SessionState::Running)
+            Ok(SessionState::Error)
         );
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Error);
         assert_eq!(events.len(), 2, "error turn must still emit its events");
         assert!(matches!(events[1], SenEvent::Result { is_error: true, .. }));
         if let SenEvent::Result { subtype, text, .. } = &events[1] {
@@ -1463,13 +1518,16 @@ exit 1; fi"#,
         );
         // Steer 2, same key + contract + text: must run the model
         // again (events emitted, fake binary ran a second time and
-        // returned the happy result), not replay the error.
+        // returned the happy result), not replay the error. The
+        // session recovers: a successful turn from Error goes back
+        // to Running (P2-9: the Error -> Running path).
         let mut retry_events: Vec<SenEvent> = Vec::new();
         let mut emit = |ev: SenEvent| retry_events.push(ev);
         assert_eq!(
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
             Ok(SessionState::Running)
         );
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
         assert_eq!(
             retry_events.len(),
             3,
@@ -1499,6 +1557,163 @@ exit 1; fi"#,
             "replayed event must be identical to the live Result event"
         );
         let _ = std::fs::remove_file(&marker);
+    }
+
+    // P2-9: an error turn moves the session Running -> Error, the
+    // turn is logged but not cached (R2B-02, unchanged), and a retry
+    // from Error runs the model again and recovers to Running on
+    // success. Before the fix the error turn left the session
+    // Running, so no caller could tell the last turn had errored.
+    #[test]
+    fn p2_9_error_turn_moves_session_to_error_and_retry_recovers() {
+        let marker = std::env::temp_dir().join(format!("sen_reg_p29_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // First run: no marker yet -> the error result, exit 1 (the
+        // real CLI's behaviour on a bad key). Later runs: marker
+        // exists -> the happy output (key fixed, model runs).
+        let body = format!(
+            r#"if [ -f '{marker}' ]; then cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+{{"type":"assistant","uuid":"u1","session_id":"s1","message":{{"role":"assistant","content":"hello"}},"parent_tool_use_id":null,"v":1}}
+{{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":7,"num_turns":1,"usage":{{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0}},"model":"m:free","session_id":"s1","v":1}}
+EOF
+exit 0; else touch '{marker}'; cat <<'EOF'
+{{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
+{{"type":"result","subtype":"error_during_execution","is_error":true,"result":"HTTP 401 Unauthorized","duration_ms":1,"num_turns":0,"usage":{{}},"model":"m:free","session_id":"s1","v":1}}
+EOF
+exit 1; fi"#,
+            marker = marker.display()
+        );
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("p29err", &body));
+        reg.create("s1", &contract()).unwrap();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Error)
+        );
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Error);
+        assert_eq!(events.len(), 2, "error turn must still emit its events");
+        assert!(matches!(events[1], SenEvent::Result { is_error: true, .. }));
+        assert_eq!(reg.get("s1").unwrap().log.len(), 2);
+        assert_eq!(
+            reg.get("s1").unwrap().log[1],
+            "steer:steer:error_during_execution"
+        );
+        assert_eq!(
+            reg.completed_steers
+                .get("s1")
+                .map(|done| done.len())
+                .unwrap_or(0),
+            0,
+            "error turn must not be recorded in completed_steers"
+        );
+        // Retry from Error, same key: begin_steer accepts the Error
+        // state, the turn re-runs (not a replay: nothing was cached),
+        // and the session recovers to Running on success.
+        let mut retry_events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| retry_events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(retry_events.len(), 3, "retry must run the model");
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    // P2-9: a second consecutive error turn fails the session
+    // terminally (Error -> Failed, the table's second Error path).
+    // A Failed session refuses steer and subscribe, like any
+    // terminal state; abort refuses too (terminal has no outgoing
+    // path). Before the fix both error turns left the session
+    // Running, so Failed was unreachable.
+    #[test]
+    fn p2_9_second_consecutive_error_turn_fails_session() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("p29fail", ERROR_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Error)
+        );
+        // Same key again: error turns are never cached, so the retry
+        // runs the model a second time — and errors a second time.
+        let mut other = contract();
+        other.idempotency_key = "k2".to_string();
+        let mut emit = |_ev: SenEvent| {};
+        assert_eq!(
+            reg.steer("s1", &other, "steer", "hi", &mut emit),
+            Ok(SessionState::Failed)
+        );
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Failed);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 3);
+        let mut emit = |_ev: SenEvent| {};
+        let err = reg
+            .steer("s1", &contract(), "steer", "again", &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        let err = reg.subscribe("s1", &contract()).unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        let err = reg.abort("s1", &contract()).unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+    }
+
+    // P2-9: abort from Error reaches Cancelled (the table's third
+    // Error path, added by this fix). Before the fix the session
+    // never entered Error, so this edge was dead; without the edge
+    // an errored session is a trap — abort refuses and retry is
+    // the only exit, so a user who wants to close the session
+    // cannot.
+    #[test]
+    fn p2_9_abort_from_error_cancels() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("p29abort", ERROR_BODY));
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.subscribe("s1", &contract()), Ok(1));
+        let mut emit = |_ev: SenEvent| {};
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Error)
+        );
+        assert_eq!(reg.abort("s1", &contract()), Ok(SessionState::Cancelled));
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Cancelled);
+        assert_eq!(reg.get("s1").unwrap().subscribers, 0);
+    }
+
+    // P2-9, deliberate deviation from the brief's literal "Completed
+    // when a turn succeeds": a successful turn keeps the session
+    // Running. One live session serves every chat turn (chat.ts:
+    // steer once, then follow_up for each later message; main.ts
+    // attaches one session per app lifetime), so Completed after a
+    // turn would terminal the session after the first message and
+    // refuse every later one with ILLEGAL_TRANSITION — and break
+    // Duplicate replay (BUG-10: begin_steer refuses terminal
+    // sessions). Completed stays defined but unreachable: no
+    // finish/close command exists, a session ends via abort
+    // (Cancelled). This test pins the live behaviour.
+    #[test]
+    fn p2_9_success_turn_keeps_session_running_for_next_turn() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("p29live", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        assert_eq!(
+            reg.steer("s1", &contract(), "follow_up", "again", &mut emit),
+            Ok(SessionState::Running)
+        );
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
     }
 
     // BUG-10 extra (tin 9645/9650): a second steer identical to one

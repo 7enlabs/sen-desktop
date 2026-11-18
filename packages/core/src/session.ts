@@ -22,12 +22,21 @@ export type SessionState =
 const TERMINAL: SessionState[] = ["Completed", "Cancelled", "Failed"];
 
 // Point 854: AwaitingApproval, when rejected, goes to Cancelled, never hangs.
-// Error has exactly 2 paths: back to Running and on to Failed.
+// Error has 3 paths: back to Running (a later turn succeeds), on to
+// Failed (a second consecutive error turn), and to Cancelled (abort
+// closes an errored session — P2-9 amendment; without it Error is a
+// trap, abort refuses and retry is the only exit).
 // Only the 3 terminal states have no outgoing path.
+// The backend (registry.rs complete_steer) drives the turn outcome
+// into this table: an error turn moves Running -> Error, a second
+// consecutive error turn moves Error -> Failed, a successful turn
+// lands on Running (one live session serves every chat turn, so a
+// turn that succeeds does not end the session — there is no
+// finish/close command that would produce Completed).
 const ALLOWED: Record<SessionState, SessionState[]> = {
   Running: ["AwaitingApproval", "Error", "Completed", "Cancelled", "Failed"],
   AwaitingApproval: ["Running", "Cancelled"],
-  Error: ["Running", "Failed"],
+  Error: ["Running", "Failed", "Cancelled"],
   Completed: [],
   Cancelled: [],
   Failed: [],
