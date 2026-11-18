@@ -72,6 +72,33 @@ jobs:
       - name: Check Rust code
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
 
+  rust-windows:
+    name: Rust tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # No apt step: Windows runners already carry WebView2, which is
+      # what Tauri needs there; the webkit2gtk/gtk stacks are
+      # Linux-only. No rustfmt component and no fmt step: the rust job
+      # already checks formatting, and fmt is platform-independent.
+      - name: Run Rust test suite
+        # cargo test builds the crate and runs every test except the
+        # two modules skipped below. The skip is explicit, not silent:
+        # commands::cli_spawn and commands::registry spawn a fake `zen`
+        # binary written as a #!/bin/sh script, which cannot execute on
+        # Windows. Covering them on Windows needs a .bat/.exe fake
+        # first (follow-up, not this job). Everything else runs,
+        # including the memory_store caps (P2-4) and the atomic_file
+        # suite: the SIGKILL crash test itself is #[cfg(unix)] and is
+        # compiled out on Windows, and its Windows marker test
+        # (crash_mid_write_skipped_on_windows_no_sigkill) shows that
+        # skip in the test list. The crate compiles on Windows because
+        # local_now uses localtime_s there (P2-4); libc has no
+        # localtime_r on Windows.
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --skip commands::cli_spawn --skip commands::registry
+
   coverage:
     name: Tauri coverage
     runs-on: ubuntu-latest

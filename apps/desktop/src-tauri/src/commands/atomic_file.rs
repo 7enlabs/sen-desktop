@@ -159,6 +159,13 @@ mod tests {
     // a real #[test] so it runs inside the same test binary the
     // parent spawns; it does nothing unless SEN_ATOMIC_CRASH_CHILD=1
     // is set, so a normal suite run never hangs on it.
+    // Windows: this test is #[cfg(unix)] and does NOT run on Windows
+    // — Windows has no SIGKILL (and libc::kill is Unix-only), so the
+    // kill-mid-write case cannot be reproduced there. The skip is
+    // marked by crash_mid_write_skipped_on_windows_no_sigkill below,
+    // so it shows up in the Windows test list instead of vanishing
+    // silently; the atomicity itself is still covered on Windows by
+    // the other write_atomic tests in this module.
     const CRASH_PAYLOAD_A: &[u8] = &[b'A'; 65_536];
     const CRASH_PAYLOAD_B: &[u8] = &[b'B'; 65_537];
 
@@ -229,5 +236,15 @@ mod tests {
             // cleanup here.
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Windows marker for the crash test above: it only exists so the
+    // #[cfg(unix)] skip is visible in `cargo test` output on Windows
+    // (a test name in the list, not a silent absence). It asserts
+    // nothing about atomicity — see the other tests in this module.
+    #[test]
+    #[cfg(windows)]
+    fn crash_mid_write_skipped_on_windows_no_sigkill() {
+        eprintln!("SKIPPED on Windows: no SIGKILL, so the crash test is #[cfg(unix)]");
     }
 }
