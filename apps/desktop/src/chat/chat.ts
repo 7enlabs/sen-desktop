@@ -43,6 +43,25 @@ import {
 } from "../ipc/memory-client.ts";
 import { COMMAND_USAGE, parseChatCommand, type ChatCommand } from "./commands.ts";
 import {
+  buildMorningBrief,
+  renderMorningBriefText,
+  type CalendarEvent,
+  type EmailItem,
+} from "../../../../packages/core/src/morning-brief.ts";
+import { renderMorningBriefHtml } from "../app/morning-brief-ui.ts";
+// Type-only: McpClient, SkillRegistry, and delegateToolCallToCliCore
+// are node-only (node:child_process / node:fs), so this module must
+// never import their VALUES — a value import here would enter the
+// webview graph (main.ts -> chat-ui -> chat) and break vite build.
+// The runtime functions arrive as injected options instead (see
+// ChatSessionOptions); the wiring-p2-9 suite locks the graph.
+import type { Skill } from "../../../../packages/core/src/skill-registry.ts";
+import type {
+  CliDelegateInput,
+  CliDelegateResult,
+  McpServerConfig,
+} from "../../../../packages/core/src/mcp-client.ts";
+import {
   describeRouterRoute,
   type RouterSettingResult,
 } from "../ipc/settings-client.ts";
@@ -163,6 +182,37 @@ export interface ChatSessionOptions {
   /// preferred route is still the route that failed, so the turn
   /// result — not the stored preference — decides the line).
   onRouterStatus?: (text: string) => void;
+  /// Morning-brief data source (CI P2-9, P0-4). When provided, /brief
+  /// and a morning-brief skill match build a real brief from it with
+  /// buildMorningBrief. When omitted, the brief commands say so
+  /// honestly: there is no Gmail/calendar fetch in the app yet, so
+  /// no source is invented here.
+  briefSource?: () => Promise<{
+    emails: EmailItem[];
+    events: CalendarEvent[];
+  }>;
+  /// Called with the rendered brief HTML when a brief is built, so
+  /// the desktop UI can show the rich panel (chat-ui showBrief).
+  /// The HTML is fully escaped by renderMorningBriefHtml.
+  onBrief?: (html: string) => void;
+  /// Skill matcher (CI P2-9, P0-5): a function built from a real
+  /// SkillRegistry (see ./skill-matcher.ts, node side). A plain
+  /// message matching the morning-brief skill runs the local brief
+  /// flow instead of a model turn; any other match, or no matcher,
+  /// falls through to the model as before.
+  skillMatcher?: (query: string) => Skill | undefined;
+  /// MCP server configs by name (CI P2-9, P0-5). /mcp looks the
+  /// server up here; an unknown name is an honest refusal, never a
+  /// guessed config.
+  mcpServers?: Record<string, McpServerConfig>;
+  /// Delegate one MCP tool call to the CLI core (CI P2-9, P0-5):
+  /// the real delegateToolCallToCliCore, injected by a node side
+  /// that can spawn `zen`. Omitted in the webview boot (no spawn
+  /// there), so /mcp says so honestly until a backend command owns
+  /// the delegate path.
+  delegateToolCall?: (
+    input: CliDelegateInput,
+  ) => Promise<CliDelegateResult>;
 }
 
 interface PendingTurn {
@@ -344,6 +394,15 @@ export class ChatSession {
     }
     this.append(channel, "user", trimmed, telegramChatId);
     await this.logBestEffort("user", channel, trimmed);
+    // CI P2-9 (P0-5): a plain message matching the morning-brief
+    // skill runs the local brief flow instead of a model turn — the
+    // skill body says the brief is built with buildMorningBrief.
+    // Any other match, or no matcher, falls through to the model.
+    const skill = this.options.skillMatcher?.(trimmed);
+    if (skill?.name === "morning-brief") {
+      await this.showMorningBrief(channel, telegramChatId);
+      return;
+    }
     await this.runModelTurn(channel, trimmed, telegramChatId);
   }
 
@@ -356,7 +415,7 @@ export class ChatSession {
     const contract = this.options.makeContract(channel, "memory command");
     let reply: string;
     try {
-      reply = await this.runCommand(contract, command);
+      reply = await this.runCommand(contract, command, channel);
     } catch (error) {
       reply =
         "Không làm được: " +
@@ -372,8 +431,20 @@ export class ChatSession {
   private async runCommand(
     contract: ActionContract,
     command: ChatCommand,
+    channel: ChatChannel,
   ): Promise<string> {
     switch (command.kind) {
+      case "morning-brief": {
+        const built = await this.buildBrief();
+        if ("error" in built) {
+          return built.error;
+        }
+        this.options.onBrief?.(built.html);
+        return built.text;
+      }
+      case "mcp-call": {
+        return this.runMcpCall(command);
+      }
       case "memory-add": {
         const result = await this.memory.add(
           contract,
@@ -453,6 +524,122 @@ export class ChatSession {
       }
       case "unknown":
         return COMMAND_USAGE;
+    }
+  }
+
+  /// Build the morning brief from the injected source (CI P2-9,
+  /// P0-4): one buildMorningBrief call, rendered as plain text for
+  /// the transcript and as escaped HTML for the UI panel. Returns an
+  /// error string instead of a brief when no source is injected, the
+  /// source fails, or the data is invalid — never a made-up brief.
+  private async buildBrief(): Promise<
+    | { text: string; html: string }
+    | { error: string }
+  > {
+    const source = this.options.briefSource;
+    if (!source) {
+      return {
+        error:
+          "Chưa nối nguồn email/lịch nên chưa lập được bản tin sáng. " +
+          "Cần một nguồn email + lịch thật trước khi /brief chạy.",
+      };
+    }
+    let data: { emails: EmailItem[]; events: CalendarEvent[] };
+    try {
+      data = await source();
+    } catch (error) {
+      return {
+        error:
+          "Không lấy được email/lịch: " +
+          (error instanceof Error ? error.message : String(error)),
+      };
+    }
+    try {
+      const brief = buildMorningBrief({
+        emails: data.emails,
+        events: data.events,
+        now: new Date().toISOString(),
+      });
+      return {
+        text: renderMorningBriefText(brief),
+        html: renderMorningBriefHtml(brief),
+      };
+    } catch (error) {
+      return {
+        error:
+          "Không lập được bản tin sáng: " +
+          (error instanceof Error ? error.message : String(error)),
+      };
+    }
+  }
+
+  /// Show the brief for a skill-routed plain message: same build as
+  /// /brief, appended as a system entry (and sent back to Telegram
+  /// when the message came from there) instead of a model turn.
+  private async showMorningBrief(
+    channel: ChatChannel,
+    telegramChatId?: number,
+  ): Promise<void> {
+    const built = await this.buildBrief();
+    if ("error" in built) {
+      this.append(channel, "system", built.error, telegramChatId);
+      if (telegramChatId !== undefined) {
+        await this.sendTelegramBestEffort(telegramChatId, built.error);
+      }
+      return;
+    }
+    this.options.onBrief?.(built.html);
+    this.append(channel, "system", built.text, telegramChatId);
+    if (telegramChatId !== undefined) {
+      await this.sendTelegramBestEffort(telegramChatId, built.text);
+    }
+  }
+
+  /// Run one MCP tool call through the injected delegate (CI P2-9,
+  /// P0-5). The delegate spawns the `zen` CLI with the server
+  /// config; the session id is the chat session id, which the CLI
+  /// requires to be a UUID (P0-1). A missing delegate, an unknown
+  /// server, or a delegate failure is an honest system reply — the
+  /// tool never pretends to have run.
+  private async runMcpCall(
+    command: Extract<ChatCommand, { kind: "mcp-call" }>,
+  ): Promise<string> {
+    const delegate = this.options.delegateToolCall;
+    if (!delegate) {
+      return (
+        "Đường ủy quyền MCP chưa được nối trong app nên tool chưa " +
+        "chạy: cần một đường delegate tới CLI core trước khi /mcp chạy."
+      );
+    }
+    const config = this.options.mcpServers?.[command.server];
+    if (!config) {
+      return (
+        `Chưa cấu hình MCP server "${command.server}". ` +
+        "Các server đã cấu hình: " +
+        Object.keys(this.options.mcpServers ?? {}).join(", ") +
+        "."
+      );
+    }
+    const sessionId = this.sessionId;
+    if (!sessionId) {
+      return "Chưa có phiên làm việc.";
+    }
+    try {
+      const result = await delegate({
+        serverName: command.server,
+        serverConfig: config,
+        tool: command.tool,
+        arguments: command.args,
+        sessionId,
+      });
+      return (
+        `Kết quả từ ${command.server}/${command.tool}:\n` + result.text
+      );
+    } catch (error) {
+      return (
+        `Không gọi được tool ${command.server}/${command.tool}: ` +
+        (error instanceof Error ? error.message : String(error))
+      );
     }
   }
 

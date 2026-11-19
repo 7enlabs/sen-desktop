@@ -35,6 +35,17 @@ export type ChatCommand =
   // its route). Never sent to the model.
   | { kind: "model-show" }
   | { kind: "model-set"; routeId: string }
+  // CI P2-9: /brief builds the morning brief from the injected
+  // brief source (ChatSession); /mcp <server> <tool> [args-json]
+  // delegates one MCP tool call to the CLI core through the injected
+  // delegate. Both are local commands, never sent to the model.
+  | { kind: "morning-brief" }
+  | {
+      kind: "mcp-call";
+      server: string;
+      tool: string;
+      args: Record<string, unknown>;
+    }
   | { kind: "unknown"; text: string };
 
 function forgetTarget(
@@ -104,6 +115,36 @@ export function parseChatCommand(text: string): ChatCommand | null {
   if (modelSet) {
     return { kind: "model-set", routeId: modelSet[1] };
   }
+  if (/^\/brief\s*$/.test(trimmed)) {
+    return { kind: "morning-brief" };
+  }
+  const mcpCall = /^\/mcp\s+(\S+)\s+(\S+)(?:\s+(.+))?$/.exec(trimmed);
+  if (mcpCall) {
+    const rest = (mcpCall[3] ?? "").trim();
+    let args: Record<string, unknown> = {};
+    if (rest) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rest);
+      } catch {
+        return { kind: "unknown", text: trimmed };
+      }
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+      ) {
+        return { kind: "unknown", text: trimmed };
+      }
+      args = parsed as Record<string, unknown>;
+    }
+    return {
+      kind: "mcp-call",
+      server: mcpCall[1] as string,
+      tool: mcpCall[2] as string,
+      args,
+    };
+  }
   if (trimmed.startsWith("/")) {
     return { kind: "unknown", text: trimmed };
   }
@@ -115,4 +156,5 @@ export const COMMAND_USAGE =
   "Lệnh không rõ. Các lệnh: /nhớ <nội dung>, /tôi <nội dung>, " +
   "/quên <số hoặc chữ>, /quên tôi <số hoặc chữ>, /sửa <số> <nội dung>, " +
   "/sửa tôi <số> <nội dung>, /sửa soul <nội dung>, /xem, /nhật ký, " +
-  "/model, /model <tên đường: spark, openrouter-free, ollama>.";
+  "/model, /model <tên đường: spark, openrouter-free, ollama>, " +
+  "/brief, /mcp <server> <tool> [args-json].";
