@@ -49,10 +49,22 @@ async function connectedClient(timeoutMs = 5000) {
 test("config: a stdio config and an HTTP config validate clean", () => {
   assert.deepEqual(validateMcpServerConfig(stdioConfig()), []);
   assert.deepEqual(
-    validateMcpServerConfig({ url: "http://127.0.0.1:9/mcp" }),
+    validateMcpServerConfig({
+      type: "http",
+      url: "http://127.0.0.1:9/mcp",
+    }),
     [],
   );
+  // Classification only: a typeless url is still "http" by
+  // isHttpServerConfig, but it does NOT validate — the CLI loader
+  // skips a url server with no explicit type (url_missing_type,
+  // live probe 19/11 against the real `zen` 0.1.0).
   assert.equal(isHttpServerConfig({ url: "http://127.0.0.1:9/mcp" }), true);
+  assert.ok(
+    validateMcpServerConfig({ url: "http://127.0.0.1:9/mcp" }).some((e) =>
+      e.includes("url_missing_type"),
+    ),
+  );
   assert.equal(isHttpServerConfig(stdioConfig()), false);
   assert.equal(
     isHttpServerConfig({ type: "http", url: "https://example.com/mcp" }),
@@ -454,18 +466,25 @@ function startHttpFake(): Promise<{
 
 test("client: HTTP transport speaks JSON and SSE replies", async () => {
   const fake = await startHttpFake();
-  const client = await connectHttpMcp({ url: fake.url }, { timeoutMs: 5000 });
+  // The fake server must close even when connect throws: an open
+  // listener keeps the test file's process alive and hangs the
+  // whole suite (seen 19/11: a connect failure left the server
+  // running and node --test never finished the file).
   try {
-    const tools = await client.listTools();
-    assert.deepEqual(tools.map((t) => t.name), ["echo"]);
-    const result = await client.callTool("echo", { a: 1 });
-    assert.equal(
-      (result.content[0] as { text: string }).text,
-      JSON.stringify({ a: 1 }),
-    );
-    await client.ping();
+    const client = await connectHttpMcp({ url: fake.url }, { timeoutMs: 5000 });
+    try {
+      const tools = await client.listTools();
+      assert.deepEqual(tools.map((t) => t.name), ["echo"]);
+      const result = await client.callTool("echo", { a: 1 });
+      assert.equal(
+        (result.content[0] as { text: string }).text,
+        JSON.stringify({ a: 1 }),
+      );
+      await client.ping();
+    } finally {
+      await client.close();
+    }
   } finally {
-    await client.close();
     await fake.close();
   }
 });

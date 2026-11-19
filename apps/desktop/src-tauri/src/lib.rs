@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use commands::memory_store::MemoryStore;
 use commands::registry::Registry;
+use commands::skills::SkillsState;
 use commands::telegram::TelegramState;
 use tauri::Manager;
 
@@ -36,11 +37,16 @@ use tauri::Manager;
 //   directly, not wrapped in another Mutex: a poll round must never
 //   hold one lock across its 30s long-poll. No token is stored
 //   anywhere else, and no command ever returns one.
+// - Mutex<SkillsState>: the skills root the Rust SkillRegistry
+//   scans (Tauri follow-up 3, 19/11). Set in setup to the app
+//   config dir's `skills/` folder (SEN_SKILLS_ROOT overrides);
+//   None until then, and the skills commands fail loudly.
 pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::new(Registry::new()))
         .manage(Mutex::new(None::<MemoryStore>))
         .manage(TelegramState::new())
+        .manage(Mutex::new(SkillsState::new()))
         .setup(|app| {
             // Local CLI settings live in the app config dir
             // (cli-settings.json, model id + optional base URL, never a
@@ -50,7 +56,22 @@ pub fn run() {
             if let Ok(dir) = app.path().app_config_dir() {
                 if let Some(state) = app.try_state::<Mutex<Registry>>() {
                     if let Ok(mut registry) = state.lock() {
-                        registry.set_settings_dir(dir);
+                        registry.set_settings_dir(dir.clone());
+                    }
+                }
+                // Skills root for the Rust SkillRegistry (Tauri
+                // follow-up 3): <config dir>/skills. SEN_SKILLS_ROOT
+                // overrides it (dev override, e.g. the repo's
+                // skills/ dir). A missing dir scans as empty, so a
+                // fresh install still works.
+                if let Some(state) = app.try_state::<Mutex<SkillsState>>() {
+                    if let Ok(mut skills) = state.lock() {
+                        let root = std::env::var("SEN_SKILLS_ROOT")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| dir.join("skills"));
+                        skills.root = Some(root);
                     }
                 }
             }
@@ -101,6 +122,10 @@ pub fn run() {
             commands::telegram::sen_telegram_status,
             commands::telegram::sen_telegram_poll_once,
             commands::telegram::sen_telegram_send,
+            commands::mcp::sen_mcp_delegate,
+            commands::skills::sen_skills_list,
+            commands::skills::sen_skill_match,
+            commands::brief::sen_brief_source,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

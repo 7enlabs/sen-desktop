@@ -49,18 +49,18 @@ import {
   type EmailItem,
 } from "../../../../packages/core/src/morning-brief.ts";
 import { renderMorningBriefHtml } from "../app/morning-brief-ui.ts";
-// Type-only: McpClient, SkillRegistry, and delegateToolCallToCliCore
-// are node-only (node:child_process / node:fs), so this module must
-// never import their VALUES — a value import here would enter the
-// webview graph (main.ts -> chat-ui -> chat) and break vite build.
-// The runtime functions arrive as injected options instead (see
+// Type-only: McpClient and delegateToolCallToCliCore are node-only
+// (node:child_process / node:fs), so this module must never import
+// their VALUES — a value import here would enter the webview graph
+// (main.ts -> chat-ui -> chat) and break vite build. The runtime
+// functions arrive as injected options instead (see
 // ChatSessionOptions); the wiring-p2-9 suite locks the graph.
-import type { Skill } from "../../../../packages/core/src/skill-registry.ts";
 import type {
   CliDelegateInput,
   CliDelegateResult,
   McpServerConfig,
 } from "../../../../packages/core/src/mcp-client.ts";
+import type { SkillMeta } from "../ipc/skills-client.ts";
 import {
   describeRouterRoute,
   type RouterSettingResult,
@@ -195,21 +195,23 @@ export interface ChatSessionOptions {
   /// the desktop UI can show the rich panel (chat-ui showBrief).
   /// The HTML is fully escaped by renderMorningBriefHtml.
   onBrief?: (html: string) => void;
-  /// Skill matcher (CI P2-9, P0-5): a function built from a real
-  /// SkillRegistry (see ./skill-matcher.ts, node side). A plain
-  /// message matching the morning-brief skill runs the local brief
-  /// flow instead of a model turn; any other match, or no matcher,
-  /// falls through to the model as before.
-  skillMatcher?: (query: string) => Skill | undefined;
+  /// Skill matcher (Tauri follow-up 3, 19/11): an async function
+  /// backed by the Rust SkillRegistry command (sen_skill_match),
+  /// returning skill METADATA only — the frontend matches on
+  /// metadata, never on a skill body. A plain message matching
+  /// the morning-brief skill runs the local brief flow instead of
+  /// a model turn; any other match, or no matcher, falls through
+  /// to the model as before.
+  skillMatcher?: (query: string) => Promise<SkillMeta | undefined>;
   /// MCP server configs by name (CI P2-9, P0-5). /mcp looks the
   /// server up here; an unknown name is an honest refusal, never a
   /// guessed config.
   mcpServers?: Record<string, McpServerConfig>;
-  /// Delegate one MCP tool call to the CLI core (CI P2-9, P0-5):
-  /// the real delegateToolCallToCliCore, injected by a node side
-  /// that can spawn `zen`. Omitted in the webview boot (no spawn
-  /// there), so /mcp says so honestly until a backend command owns
-  /// the delegate path.
+  /// Delegate one MCP tool call to the CLI core (Tauri follow-up
+  /// 1, 19/11): the Rust sen_mcp_delegate command, which spawns
+  /// `zen -p --mcp-config <temp file>` on a fresh delegate bridge.
+  /// Omitted in tests that do not inject it, so /mcp says so
+  /// honestly until the delegate is wired.
   delegateToolCall?: (
     input: CliDelegateInput,
   ) => Promise<CliDelegateResult>;
@@ -398,7 +400,9 @@ export class ChatSession {
     // skill runs the local brief flow instead of a model turn — the
     // skill body says the brief is built with buildMorningBrief.
     // Any other match, or no matcher, falls through to the model.
-    const skill = this.options.skillMatcher?.(trimmed);
+    // The match is async: the matcher asks the Rust registry
+    // command (Tauri follow-up 3), which scans the skills dir.
+    const skill = await this.options.skillMatcher?.(trimmed);
     if (skill?.name === "morning-brief") {
       await this.showMorningBrief(channel, telegramChatId);
       return;
