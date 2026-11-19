@@ -27,6 +27,7 @@ import {
 import {
   attachLiveSession,
   closeLiveSession,
+  endLiveSession,
 } from "../src/ipc/live-client.ts";
 import { SessionManager } from "../../../packages/core/src/session.ts";
 
@@ -616,5 +617,174 @@ test("live-client close (V-04): unlisten runs BEFORE backend unsubscribe and abo
     "sen_events_unsubscribe",
     "sen_session_abort",
   ]);
+  setBridgeTransport(null);
+});
+
+// --- sen_session_end (T12, Q1-Q9) ---
+
+function endLiveTransport() {
+  const calls: string[] = [];
+  setBridgeTransport(async (command, args) => {
+    calls.push(command);
+    const a = args as { session_id?: string };
+    if (command === "sen_session_create") {
+      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    }
+    if (command === "sen_events_subscribe") {
+      return { sessionId: a.session_id, subscriberId: 7 };
+    }
+    if (command === "sen_events_unsubscribe") {
+      return { sessionId: a.session_id, subscriberCount: 0 };
+    }
+    if (command === "sen_session_end") {
+      return {
+        sessionId: a.session_id,
+        state: "Completed",
+        alreadyEnded: false,
+        endedFrom: "Running",
+        turnsCompleted: 0,
+        approvalsRevoked: 0,
+      };
+    }
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+  });
+  return calls;
+}
+
+test("live-client end: backend + local Completed through the IPC bridge", async () => {
+  const transportCalls = endLiveTransport();
+  const manager = new SessionManager();
+  const attached = await attachLiveSession(manager, contract(), "s1");
+  const res = await endLiveSession(manager, contract(), "s1");
+  assert.deepEqual(res, {
+    sessionId: "s1",
+    state: "Completed",
+    alreadyEnded: false,
+    endedFrom: "Running",
+    turnsCompleted: 0,
+    approvalsRevoked: 0,
+  });
+  // BUG-09: end unsubscribes before ending, so the backend subscriber
+  // count drops instead of leaking.
+  assert.deepEqual(transportCalls, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "sen_events_unsubscribe",
+    "sen_session_end",
+  ]);
+  assert.equal(attached.sessionId, "s1");
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  // b.8: the raw log carries the transition plus one `session_end`
+  // entry with the receipt.
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub", "session_transition", "session_end"],
+  );
+  setBridgeTransport(null);
+});
+
+test("live-client end: a session that was never created refuses, no local record invented", async () => {
+  const transportCalls = endLiveTransport();
+  const manager = new SessionManager();
+  await assert.rejects(
+    () => endLiveSession(manager, contract(), "s1"),
+    /does not exist/,
+  );
+  assert.deepEqual(transportCalls, [
+    "sen_events_unsubscribe",
+  ]);
+  // R2B-10: end still unsubscribes first, but endSession now
+  // refuses before the backend call when the manager holds no record,
+  // so no sen_session_end reaches the backend for a session that
+  // was never created here.
+  assert.throws(() => manager.transition("s1", "Running"), /does not exist/);
+  setBridgeTransport(null);
+});
+
+test("live-client end (V-04): unlisten runs BEFORE backend unsubscribe and end", async () => {
+  // Same join contract as closeLiveSession (V-04): endLiveSession
+  // must stop the frontend listener first, then unsubscribe, then
+  // end. A future UI close path passes StartedApp.unlisten as the
+  // 4th argument; the order inside endLiveSession is what this
+  // test pins, not a caller that does not exist yet.
+  const order: string[] = [];
+  setBridgeTransport(async (command, args) => {
+    order.push(command);
+    const a = args as { session_id?: string };
+    if (command === "sen_session_create") {
+      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    }
+    if (command === "sen_events_subscribe") {
+      return { sessionId: a.session_id, subscriberId: 7 };
+    }
+    if (command === "sen_events_unsubscribe") {
+      return { sessionId: a.session_id, subscriberCount: 0 };
+    }
+    if (command === "sen_session_end") {
+      return {
+        sessionId: a.session_id,
+        state: "Completed",
+        alreadyEnded: false,
+        endedFrom: "Running",
+        turnsCompleted: 0,
+        approvalsRevoked: 0,
+      };
+    }
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+  });
+  const manager = new SessionManager();
+  const attached = await attachLiveSession(manager, contract(), "s1");
+  const unlisten = attached.unlisten;
+  assert.equal(typeof unlisten, "function");
+  await endLiveSession(manager, contract(), "s1", () => {
+    order.push("unlisten");
+    if (unlisten) {
+      unlisten();
+    }
+  });
+  assert.deepEqual(order, [
+    "sen_session_create",
+    "sen_events_subscribe",
+    "unlisten",
+    "sen_events_unsubscribe",
+    "sen_session_end",
+  ]);
+  setBridgeTransport(null);
+});
+
+test("live-client end: an end failure leaves the listener stopped and the subscriber dropped", async () => {
+  // Mirror of the close failure path: the listener stopped and the
+  // subscriber dropped before the backend call, so a refused end
+  // (for example ERR_TURN_IN_FLIGHT) leaves no listener leaking
+  // past the attempt and no subscriber held.
+  const transportCalls = endLiveTransport();
+  const manager = new SessionManager();
+  const attached = await attachLiveSession(manager, contract(), "s1");
+  const send = capturedEvents.send as (payload: unknown) => void;
+  send({ type: "message", sessionId: "s1", text: "before end" });
+  assert.equal(capturedEvents.unlistened, false);
+  setBridgeTransport(async (command, args) => {
+    transportCalls.push(command);
+    const a = args as { session_id?: string };
+    if (command === "sen_events_unsubscribe") {
+      return { sessionId: a.session_id, subscriberCount: 0 };
+    }
+    if (command === "sen_session_end") {
+      throw new Error("ERR_TURN_IN_FLIGHT: A turn is still running on this session");
+    }
+    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+  });
+  await assert.rejects(
+    () => endLiveSession(manager, contract(), "s1", attached.unlisten),
+    /ERR_TURN_IN_FLIGHT/,
+  );
+  assert.equal(capturedEvents.unlistened, true);
+  send({ type: "message", sessionId: "s1", text: "after end" });
+  // No event is delivered after the listener stopped, and the
+  // refused end wrote no transition: the session is still Running.
+  assert.deepEqual(
+    manager.rawLog.eventsFor("s1").map((event) => event.kind),
+    ["session_create_stub", "session_event"],
+  );
   setBridgeTransport(null);
 });

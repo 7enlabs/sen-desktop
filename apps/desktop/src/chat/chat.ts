@@ -232,6 +232,16 @@ export class ChatSession {
   private started = false;
   private busy = false;
   private pending: PendingTurn | null = null;
+  /// Set by end(): the session is over (Completed on the backend,
+  /// via endLiveSession in the layer above). No new send runs after
+  /// this — not a model turn, not a local command — and a send
+  /// already queued but not started yet is refused at the head of
+  /// sendNow instead of running a steer that fails
+  /// ILLEGAL_TRANSITION on the backend. The backend call itself
+  /// lives in the layer above (endLiveSession), never here: this
+  /// class only knows steerSession/followUpSession, like the
+  /// abort path, which also lives outside it.
+  private ended = false;
 
   constructor(options: ChatSessionOptions) {
     this.options = options;
@@ -244,6 +254,24 @@ export class ChatSession {
 
   getSessionId(): string | null {
     return this.sessionId;
+  }
+
+  /// End this chat locally after the backend ended the session
+  /// (sen_session_end, Completed): no backend call here, no daily
+  /// log entry, nothing sent to Telegram — one system entry in the
+  /// in-memory transcript, for display only. Idempotent: a second
+  /// end adds no second entry. After this, send() refuses every
+  /// new message with the same system entry.
+  end(): void {
+    if (this.ended) {
+      return;
+    }
+    this.ended = true;
+    this.append("desktop", "system", "Phiên đã kết thúc.");
+  }
+
+  isEnded(): boolean {
+    return this.ended;
   }
 
   getTranscript(): TranscriptEntry[] {
@@ -383,6 +411,15 @@ export class ChatSession {
   ): Promise<void> {
     const trimmed = text.trim();
     if (!trimmed) {
+      return;
+    }
+    // The session ended (end() above): refuse the send here, at the
+    // head of the queued run, so a send queued before the end never
+    // reaches a steer. No new entry: end() already wrote "Phiên đã
+    // kết thúc." to the transcript, and a duplicate per refused
+    // send would spam it. No backend call, no daily log entry,
+    // nothing to Telegram.
+    if (this.ended) {
       return;
     }
     if (this.sessionId === null) {

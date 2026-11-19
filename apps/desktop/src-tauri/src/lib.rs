@@ -101,6 +101,7 @@ pub fn run() {
             commands::session::sen_session_steer,
             commands::session::sen_session_follow_up,
             commands::session::sen_session_abort,
+            commands::session::sen_session_end,
             commands::tools::sen_tool_call,
             commands::tools::sen_tool_approve,
             commands::tools::sen_tool_revoke,

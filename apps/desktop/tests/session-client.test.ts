@@ -19,6 +19,7 @@ import type { ActionContract } from "../src/ipc/types.ts";
 import {
   abortSession,
   createSession,
+  endSession,
   followUpSession,
   steerSession,
   subscribeSession,
@@ -312,4 +313,113 @@ test("session-client subscribe/unsubscribe: flat params match the Rust handler (
   );
   assert.deepEqual(unsubPayload, { contract: contract(), session_id: "s1" });
   assert.ok(!("args" in unsubPayload), "unsubscribe takes flat params, so the payload must not carry an args key");
+});
+
+// --- sen_session_end (T11, Q1-Q9) ---
+
+function endStubResult() {
+  return {
+    sessionId: "s1",
+    state: "Completed",
+    alreadyEnded: false,
+    endedFrom: "Running",
+    turnsCompleted: 1,
+    approvalsRevoked: 2,
+  };
+}
+
+test("session-client end: flat params match the Rust handler (CI P2-6)", async () => {
+  assert.deepEqual(expectedFlatParams(rustSessionSource(), "session.rs", "sen_session_end"), ["session_id"]);
+  const manager = new SessionManager();
+  manager.create("s1");
+  const payload = await capturePayload(
+    "sen_session_end",
+    endStubResult(),
+    () => endSession(manager, contract(), "s1"),
+  );
+  assert.deepEqual(payload, { contract: contract(), session_id: "s1" });
+  assert.ok(!("args" in payload), "end takes flat params, so the payload must not carry an args key");
+  assert.ok(!("sessionId" in payload), "payload must use the declared snake_case session_id, not camelCase sessionId");
+});
+
+test("session-client end: receipt fields reach the frontend, local lands on Completed", async () => {
+  setBridgeTransport(async (command, args) => {
+    const a = args as { session_id?: string };
+    if (command === "sen_session_create") {
+      return {
+        sessionId: a.session_id,
+        state: "Running",
+        unknownRecords: 0,
+        versionMismatches: 0,
+      };
+    }
+    return endStubResult();
+  });
+  const manager = new SessionManager();
+  await createSession(manager, contract(), "s1");
+  const res = await endSession(manager, contract(), "s1");
+  assert.equal(res.state, "Completed");
+  assert.equal(res.alreadyEnded, false);
+  assert.equal(res.endedFrom, "Running");
+  assert.equal(res.turnsCompleted, 1);
+  assert.equal(res.approvalsRevoked, 2);
+  // The local record is terminal now: no transition out of it.
+  assert.throws(() => manager.transition("s1", "Running"), /Terminal state/);
+  setBridgeTransport(null);
+});
+
+test("session-client end: result missing the receipt fields is refused", async () => {
+  setBridgeTransport(async (command, args) => {
+    const a = args as { session_id?: string };
+    if (command === "sen_session_create") {
+      return {
+        sessionId: a.session_id,
+        state: "Running",
+        unknownRecords: 0,
+        versionMismatches: 0,
+      };
+    }
+    // End result without the receipt fields: malformed, FAIL.
+    return { sessionId: a.session_id, state: "Completed" };
+  });
+  const manager = new SessionManager();
+  await createSession(manager, contract(), "s1");
+  await assert.rejects(() => endSession(manager, contract(), "s1"), /malformed/);
+  setBridgeTransport(null);
+});
+
+test("session-client end (R2B-10): foreign manager refuses before any backend call", async () => {
+  const calls: string[] = [];
+  setBridgeTransport(async (command) => {
+    calls.push(command);
+    return endStubResult();
+  });
+  const foreign = new SessionManager();
+  await assert.rejects(
+    () => endSession(foreign, contract(), "s1"),
+    /does not exist/,
+  );
+  assert.deepEqual(calls, []);
+  setBridgeTransport(null);
+});
+
+test("session-client end: backend/local mismatch is refused", async () => {
+  setBridgeTransport(async (command, args) => {
+    const a = args as { session_id?: string };
+    if (command === "sen_session_create") {
+      return {
+        sessionId: a.session_id,
+        state: "Running",
+        unknownRecords: 0,
+        versionMismatches: 0,
+      };
+    }
+    // Backend says Cancelled while the local transition goes to
+    // Completed: the two sides disagree, FAIL.
+    return { ...endStubResult(), state: "Cancelled" };
+  });
+  const manager = new SessionManager();
+  await createSession(manager, contract(), "s1");
+  await assert.rejects(() => endSession(manager, contract(), "s1"), /mismatch/);
+  setBridgeTransport(null);
 });

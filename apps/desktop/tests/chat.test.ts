@@ -465,3 +465,59 @@ test("chat: transcript snapshots are copies, onTranscript fires per change", asy
   });
   assert.equal(h.chat.getTranscript().length, 2);
 });
+
+// --- ChatSession.end (T14, Q1-Q9) ---
+// end() is local only: the backend call lives in the layer above
+// (endLiveSession). These tests prove the local half: new sends
+// are refused with the system entry end() wrote, no steer runs,
+// nothing reaches the daily log or Telegram, and a send already
+// queued but not started never runs a steer either.
+
+test("chat: end blocks new sends with a system entry, no backend call", async () => {
+  const h = makeChat();
+  await h.chat.send("desktop", "hi");
+  assert.deepEqual(h.commands, ["sen_session_steer"]);
+  h.chat.end();
+  assert.equal(h.chat.isEnded(), true);
+  await h.chat.send("desktop", "after the end");
+  await h.chat.send("telegram", "after the end", 123);
+  // No steer ran after the end, on either channel.
+  assert.deepEqual(h.commands, ["sen_session_steer"]);
+  assert.deepEqual(view(h.chat.getTranscript()), [
+    { role: "user", channel: "desktop", text: "hi" },
+    { role: "assistant", channel: "desktop", text: "reply to hi" },
+    { role: "system", channel: "desktop", text: "Phiên đã kết thúc." },
+  ]);
+  // The refused sends wrote nothing to the daily log and nothing
+  // went to Telegram.
+  assert.deepEqual(
+    h.memory.logs.map((entry) => entry.kind),
+    ["user", "assistant"],
+  );
+  assert.deepEqual(h.sent, []);
+});
+
+test("chat: a send queued before end never runs a steer", async () => {
+  const h = makeChat();
+  // send() queues the run as a microtask; end() runs synchronously
+  // before it, so the queued send meets the ended flag at the head
+  // of sendNow and never reaches a steer.
+  const queued = h.chat.send("desktop", "queued before the end");
+  h.chat.end();
+  await queued;
+  assert.deepEqual(h.commands, []);
+  assert.deepEqual(h.texts, []);
+  assert.deepEqual(view(h.chat.getTranscript()), [
+    { role: "system", channel: "desktop", text: "Phiên đã kết thúc." },
+  ]);
+  assert.deepEqual(h.memory.logs, []);
+});
+
+test("chat: end is idempotent, a second end adds no entry", () => {
+  const h = makeChat();
+  h.chat.end();
+  h.chat.end();
+  assert.equal(h.chat.isEnded(), true);
+  assert.equal(h.chat.getTranscript().length, 1);
+  assert.equal(h.chat.getTranscript()[0].text, "Phiên đã kết thúc.");
+});

@@ -61,6 +61,21 @@ export interface BackendUnsubscribeResult {
   subscriberCount: number;
 }
 
+// sen_session_end result (b.1): the end receipt, not a turn result.
+// alreadyEnded is true on an idempotent replay with the same key;
+// endedFrom is the state the session left ("Running" or "Error");
+// turnsCompleted counts the successful steers recorded before the
+// end; approvalsRevoked counts the live grants the end purged
+// (0 on a replay).
+export interface BackendSessionEndResult {
+  sessionId: string;
+  state: string;
+  alreadyEnded: boolean;
+  endedFrom: string;
+  turnsCompleted: number;
+  approvalsRevoked: number;
+}
+
 function asSessionResult(value: unknown, expectedId: string): BackendSessionResult {
   const res = value as BackendSessionResult | null;
   if (
@@ -200,6 +215,81 @@ export async function abortSession(
         local,
     );
   }
+  return res;
+}
+
+function asSessionEndResult(
+  value: unknown,
+  expectedId: string,
+): BackendSessionEndResult {
+  const res = value as BackendSessionEndResult | null;
+  if (
+    !res ||
+    typeof res.sessionId !== "string" ||
+    typeof res.state !== "string" ||
+    typeof res.alreadyEnded !== "boolean" ||
+    typeof res.endedFrom !== "string" ||
+    typeof res.turnsCompleted !== "number" ||
+    typeof res.approvalsRevoked !== "number"
+  ) {
+    throw new Error(
+      "Backend session end result malformed, FAIL: " + JSON.stringify(value),
+    );
+  }
+  if (res.sessionId !== expectedId) {
+    throw new Error(
+      "Backend session id mismatch, FAIL: expected " +
+        expectedId +
+        ", got " +
+        res.sessionId,
+    );
+  }
+  return res;
+}
+
+// sen_session_end (Q1-Q9, Leader tin 17652): mirror of abortSession,
+// but the backend lands on Completed, not Cancelled, and refuses
+// while a turn runs (ERR_TURN_IN_FLIGHT) instead of killing it.
+// Backend Completed first, then the local transition, with the
+// same R2B-10 guard and backend/local mismatch check as abort.
+// No production caller yet (Q3: infrastructure first, like
+// closeLiveSession) — the UI close path is a later step.
+export async function endSession(
+  manager: SessionManager,
+  contract: ActionContract,
+  sessionId: string,
+): Promise<BackendSessionEndResult> {
+  if (!manager.hasSession(sessionId)) {
+    throw new Error(
+      "Session does not exist: " +
+        sessionId +
+        " (end refused before backend call)",
+    );
+  }
+  const raw = await invoke("sen_session_end", {
+    contract,
+    session_id: sessionId,
+  });
+  const res = asSessionEndResult(raw, sessionId);
+  const local = manager.transition(sessionId, "Completed");
+  if (local !== res.state) {
+    throw new Error(
+      "Backend/local session state mismatch, FAIL: backend " +
+        res.state +
+        ", local " +
+        local,
+    );
+  }
+  // b.8: one `session_end` entry in the session's raw log, carrying
+  // the receipt, next to the `session_transition` entry that
+  // transition() just wrote. Display/diagnostics only — no file,
+  // no daily log entry.
+  manager.rawLog.append(sessionId, "session_end", {
+    alreadyEnded: res.alreadyEnded,
+    endedFrom: res.endedFrom,
+    turnsCompleted: res.turnsCompleted,
+    approvalsRevoked: res.approvalsRevoked,
+  });
   return res;
 }
 
