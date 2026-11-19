@@ -83,24 +83,31 @@ and writes an explicit allow rule.
 - `apps/desktop/src-tauri/src/commands/registry.rs` — the
   enforcing side: `Registry` holds the policy (starts empty),
   the approvals, and the activity log; `tool_call()` validates
-  the contract, asserts the 6-step gate order, runs the approval
-  gate, records the evaluation, then refuses (`APPROVAL_REQUIRED`
-  / `APPROVAL_NEVER_DENIED` / `TOOL_POLICY_DENIED`) or — when the
+  the contract, rejects a contract with no session id
+  (fail closed, `INVALID_CONTRACT`), asserts the 6-step gate
+  order, runs the approval gate scoped to the contract's session,
+  records the evaluation, then refuses (`APPROVAL_REQUIRED` /
+  `APPROVAL_NEVER_DENIED` / `TOOL_POLICY_DENIED`) or — when the
   gate passes — fails with `TOOL_EXECUTION_NOT_WIRED`, because
   execution is not filled in yet. `allow_tool()` adds a rule,
-  `approve_tool()` grants an approval, `revoke_tool()` removes
-  one (bool: a live grant was removed), `activity_log()` /
+  `approve_tool()` grants an approval in one session (empty
+  session id fails closed), `revoke_tool()` removes one in one
+  session (bool: a live grant was removed), `activity_log()` /
   `list_approvals()` read the state back (clones). The Rust
-  grant carries `expiresAtSecs` (granted-at + 900 s) and is
-  spent by `gate_tool_call` on the first allow, exactly like
-  the TS side (`APPROVAL_TTL_MS`, `consume()`).
+  grant carries `expiresAtSecs` (granted-at + 900 s) and
+  `sessionId`, and is spent by `gate_tool_call` on the first
+  allow, exactly like the TS side (`APPROVAL_TTL_MS`,
+  `consume()`). The store key is session + tool + key, so the
+  same tool + key in another session is a different grant.
 - `apps/desktop/src-tauri/src/commands/tools.rs` — thin Tauri
-  wrappers: `sen_tool_call` (unchanged wire shape),
-  `sen_tool_approve` (contract + `{ toolName, idempotencyKey,
-  grantedBy }` under `args`), `sen_tool_revoke` (contract +
-  `{ toolName, idempotencyKey }` under `args`, returns whether a
-  live grant was removed), `sen_tool_activity_log` (contract,
-  returns the entries). Registered in `main.rs`.
+  wrappers: `sen_tool_call` (contract now carries `sessionId`,
+  the live session's id), `sen_tool_approve` (contract +
+  `{ toolName, idempotencyKey, grantedBy }` under `args`, session
+  from the contract), `sen_tool_revoke` (contract +
+  `{ toolName, idempotencyKey }` under `args`, session from the
+  contract, returns whether a live grant was removed),
+  `sen_tool_activity_log` (contract, returns the entries).
+  Registered in `main.rs`.
 - `packages/tools/src/index.ts` — the `tool_call` event hook is
   filled in: it runs the same gate (contract checks first, then
   tier + policy + approval), records the evaluation in the log
@@ -111,7 +118,12 @@ and writes an explicit allow rule.
   (`approveTool`, `revokeTool`, `getActivityLog`, all validated
   like the other clients; no key field ever travels). The
   frontend `Approval` carries `expiresAtSecs` (epoch seconds,
-  the Rust grant's expiry).
+  the Rust grant's expiry) and `sessionId` (the live session
+  the grant belongs to; an approval without one is malformed).
+  The contract builders in `apps/desktop/src/app/main.ts`
+  (`appLiveContract`, `chatContract`) set `sessionId` from the
+  session they were built for, so every contract the app sends
+  already carries the live session's id.
 
 ### The activity log
 
@@ -274,6 +286,76 @@ commands is covered by mocked-transport tests, and the shared gate
 logic is covered by the Rust `approval_gate` + `registry` tests,
 but the wrapper code path itself is uncompiled here.
 
+## P1-4 Rust session — 19/11/2026 (tin 16891, ZC Leader)
+
+The rev2 follow-up: the Rust side is now session-scoped too,
+closing the "Chưa làm" item rev2 left open.
+
+1. Wire shape: `ActionContract` carries `sessionId` (TS type:
+   optional on the shared type, set by both app contract
+   builders from the live session; Rust `ContractArgs.session_id`
+   with a serde default, so an older frontend payload still
+   deserializes and then fails closed instead of failing to
+   parse). `validate_contract` is unchanged on purpose: a
+   settings/memory read has no session to scope to. Only the
+   tool path requires a session — `validate_tool_session`
+   (`registry.rs`) rejects an empty one with `INVALID_CONTRACT`
+   before any grant, spend, or evaluation.
+2. Store: `Approval.sessionId`, keyed `(session, tool, key)` —
+   the same tool + key in another session is a different grant.
+   `grant` / `find` / `consume` / `revoke` and
+   `evaluate_tool_call` / `gate_tool_call` all take the session;
+   argument order mirrors the TS side (`grant(tool, key, by,
+   session)`, `find(tool, key, session)`). `Registry`:
+   `approve_tool` / `revoke_tool` take the session and return
+   `Result` (empty session fails closed); `tool_call` passes
+   `contract.session_id` to the gate. `sen_tool_approve` /
+   `sen_tool_revoke` take the session from the contract.
+   Frontend `Approval.sessionId` is validated in `asApproval`.
+3. TTL: `APPROVAL_TTL_SECS` stays 900 (15 minutes) — confirmed
+   by the Leader in the same message (tin 16891), no longer the
+   seat's own choice.
+
+Evidence (this box, 19/11, rebased onto 389d525, CI P2-6):
+`npm test` 257 pass / 0 fail on re-run (256 baseline at
+389d525, measured 256/256 clean here before the patch, + 1 new TS
+test — an approval without a session id is malformed; the
+first full run after the patch was 256 pass / 1 fail on the
+CI P2-6 wire-shape test (stub lacked `sessionId`, see below);
+after that 1-line stub fix the next run was 256 pass / 1 fail
+on the pre-existing flaky `MCP_TIMEOUT` test, then 257 / 0 on
+re-run);
+`npm run typecheck` (`tsc --noEmit`) clean;
+`npm run build --prefix apps/desktop` vite green, built in
+363 ms; Rust pure-module harness
+(`~/workspace/sen-p1-ts4-rust-session-check`, 8 modules,
+serde 1.0.229 / serde_json 1.0.154 / libc 0.2.191 from the
+offline cache) 159 pass / 0 fail (154 baseline at 389d525 + 5 new:
+grant in session A cannot authorize session B, same tool +
+key in two sessions are two grants, tool_call approval scoped
+to session, tool_call without session id fails closed, revoke
+scoped to session); `rustfmt --check` clean on the 4 touched
+Rust files; `git diff --check` clean. New tests were written
+first and failed on the unmodified source (the Rust tests
+failed to compile — 28 errors: new signatures missing; the TS
+test failed with "Missing expected rejection"), then passed
+after the fix. Rebase onto 389d525 (CI P2-6) needed one
+reconciliation, not a silent drop: the CI P2-6 wire-shape test
+stubbed a backend approval with no `sessionId`, which TS4's
+`asApproval` now rejects as malformed — the stub now carries
+`sessionId: SESSION_ID`, modelling the real post-TS4 backend,
+while the wire-shape assertions themselves are untouched.
+
+NOT RUN (same blocker as P0-2/rev2): `cargo test` in
+`apps/desktop/src-tauri` (full crate incl. `tools.rs`,
+`registry.rs`, `session.rs`, `main.rs`) — `gdk-3.0` missing
+on this box (`gdk-sys` build error, `gdk-3.0.pc` not found;
+`find / -name gdk-3.0.pc` returns nothing); run on the Leader
+VM. That leaves the Tauri wrappers (`sen_tool_approve` /
+`sen_tool_revoke` session plumbing, `ContractArgs.session_id`
+deserialization) uncompiled anywhere — reviewed by reading,
+not by running. `cargo clippy`: same blocker.
+
 ## P1-4 rev2 — 17/11/2026 (tin 14959, ZC Leader)
 
 Three additions on top of the rev1 TS patch (expiry + single-use
@@ -297,10 +379,9 @@ on the TS side only):
    UUID (`mcp-client.ts`: `input.sessionId ?? randomUUID()`).
    `onToolCall` throws when the event carries no session id;
    `executeMcpTool` and `applyDecision` take it as a required
-   input. The Rust side is NOT session-scoped yet: the
-   `ActionContract` on the `sen_tool_call` path carries no
-   session id, so scoping it needs a wire change — follow-up,
-   not this patch.
+   input. The Rust side was NOT session-scoped yet at rev2 time:
+   the `ActionContract` on the `sen_tool_call` path carried no
+   session id — done 19/11, see "P1-4 Rust session" above.
 3. Revoke as a Tauri command: `sen_tool_revoke` in `tools.rs`
    (contract validated first, non-empty tool + key, returns
    whether a live grant was removed), `Registry::revoke_tool`,

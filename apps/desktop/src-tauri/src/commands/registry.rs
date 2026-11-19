@@ -182,6 +182,15 @@ pub struct ActionContract {
     pub timeout_ms: u64,
     pub approval_required: bool,
     pub audit_required: bool,
+    /// The live session this contract acts for (P1-4 Rust session,
+    /// 19/11): the SessionManager key / CLI --session-id UUID, set
+    /// by the frontend contract builder from the session it
+    /// created. The approval gate keys every grant by it, so a
+    /// grant from another session never authorizes a call here.
+    /// Empty on contracts that predate the field (wire default):
+    /// the tool path rejects an empty session id before any gate
+    /// evaluation, so nothing is ever granted or spent without one.
+    pub session_id: String,
 }
 
 pub fn validate_contract(contract: &ActionContract) -> Result<(), CommandError> {
@@ -228,6 +237,23 @@ pub fn validate_contract(contract: &ActionContract) -> Result<(), CommandError> 
                 "IPC contract illegal side effect class, FAIL",
             ));
         }
+    }
+    Ok(())
+}
+
+/// The tool path needs a session id on top of the shared contract
+/// check: approvals are keyed by session, so a tool call, a grant,
+/// or a revoke without one cannot be scoped and fails closed
+/// (INVALID_CONTRACT) before anything is granted, spent, or
+/// evaluated. Kept out of validate_contract on purpose: a settings
+/// or memory read has no session to scope to, and must not need
+/// one — only the tool/approval path requires it.
+pub fn validate_tool_session(contract: &ActionContract) -> Result<(), CommandError> {
+    if contract.session_id.trim().is_empty() {
+        return Err(CommandError::new(
+            ERR_INVALID_CONTRACT,
+            "Tool call missing session id, FAIL",
+        ));
     }
     Ok(())
 }
@@ -1100,13 +1126,17 @@ impl Registry {
     ///   The policy starts empty (default-deny), so this is the only
     ///   way a tool becomes runnable at all.
     /// - `approve_tool` grants one approval for one tool + one
-    ///   idempotency key, by a named granter. A grant for a
-    ///   never-tier tool is recorded but never honored. A grant
+    ///   idempotency key in one session, by a named granter. A grant
+    ///   for a never-tier tool is recorded but never honored. A grant
     ///   lives APPROVAL_TTL_SECS (15 minutes) and is spent the
-    ///   first time the gate allows a call with it (P1-4).
-    /// - `revoke_tool` removes one approval: the next call with
-    ///   that tool + key waits for a fresh approval. It never
-    ///   touches the activity log (the log has no delete path).
+    ///   first time the gate allows a call with it (P1-4); a grant
+    ///   from another session never authorizes a call here. An empty
+    ///   session id fails closed (INVALID_CONTRACT): approvals are
+    ///   keyed by session, so there is no session-less grant.
+    /// - `revoke_tool` removes one approval in one session: the next
+    ///   call with that tool + key in that session waits for a fresh
+    ///   approval. Revoking in the wrong session removes nothing. It
+    ///   never touches the activity log (the log has no delete path).
     /// - `activity_log` / `list_approvals` read back the gate state
     ///   (clones; the log has no delete or update path).
     pub fn allow_tool(&mut self, tool_name: &str) {
@@ -1122,12 +1152,34 @@ impl Registry {
         tool_name: &str,
         idempotency_key: &str,
         granted_by: &str,
-    ) -> Approval {
-        self.approvals.grant(tool_name, idempotency_key, granted_by)
+        session_id: &str,
+    ) -> Result<Approval, CommandError> {
+        if session_id.trim().is_empty() {
+            return Err(CommandError::new(
+                ERR_INVALID_CONTRACT,
+                "Tool call missing session id, FAIL",
+            ));
+        }
+        Ok(self
+            .approvals
+            .grant(tool_name, idempotency_key, granted_by, session_id))
     }
 
-    pub fn revoke_tool(&mut self, tool_name: &str, idempotency_key: &str) -> bool {
-        self.approvals.revoke(tool_name, idempotency_key)
+    pub fn revoke_tool(
+        &mut self,
+        tool_name: &str,
+        idempotency_key: &str,
+        session_id: &str,
+    ) -> Result<bool, CommandError> {
+        if session_id.trim().is_empty() {
+            return Err(CommandError::new(
+                ERR_INVALID_CONTRACT,
+                "Tool call missing session id, FAIL",
+            ));
+        }
+        Ok(self
+            .approvals
+            .revoke(tool_name, idempotency_key, session_id))
     }
 
     pub fn activity_log(&self) -> Vec<ActivityEntry> {
@@ -1152,6 +1204,7 @@ impl Registry {
         tool_name: &str,
     ) -> Result<(), CommandError> {
         validate_contract(contract)?;
+        validate_tool_session(contract)?;
         if tool_name.is_empty() {
             return Err(CommandError::new(
                 ERR_INVALID_CONTRACT,
@@ -1166,6 +1219,7 @@ impl Registry {
             &contract.actor,
             tool_name,
             &contract.idempotency_key,
+            &contract.session_id,
         );
         match evaluation.decision {
             GateDecision::Allow => Err(CommandError::new(
@@ -1210,6 +1264,7 @@ mod tests {
             risk: "low".to_string(),
             idempotency_key: "k1".to_string(),
             timeout_ms: 1000,
+            session_id: "s1".to_string(),
             approval_required: false,
             audit_required: false,
         }
@@ -2229,7 +2284,7 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let err = reg.tool_call(&contract(), "send_message").unwrap_err();
         assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
         assert_eq!(reg.activity_log()[0].result, "awaiting-approval");
-        reg.approve_tool("send_message", "k1", "zen");
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
         let err = reg.tool_call(&contract(), "send_message").unwrap_err();
         assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
         let entries = reg.activity_log();
@@ -2253,7 +2308,7 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         // approval instead of passing on the spent grant.
         let mut reg = Registry::new();
         reg.allow_tool("send_message");
-        reg.approve_tool("send_message", "k1", "zen");
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
         let err = reg.tool_call(&contract(), "send_message").unwrap_err();
         assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
         let err = reg.tool_call(&contract(), "send_message").unwrap_err();
@@ -2261,15 +2316,76 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         assert_eq!(reg.list_approvals().len(), 0);
     }
 
+    // P1-4 Rust session (19/11, tin 16891): a grant belongs to one
+    // live session. Approving in the contract's session never
+    // authorizes a call in another session, even with the same tool
+    // + idempotency key; the session id comes from the contract (the
+    // live session's id), never invented by the gate.
+    #[test]
+    fn tool_call_approval_is_scoped_to_session() {
+        let mut reg = Registry::new();
+        reg.allow_tool("send_message");
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
+        // Same tool + key, other session: still waiting.
+        let mut other = contract();
+        other.session_id = "s-B".to_string();
+        let err = reg.tool_call(&other, "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+        // Same session: the gate passes (execution is still not
+        // wired, so this ends in TOOL_EXECUTION_NOT_WIRED).
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
+        // The allow spent the grant: the same session waits again now.
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+        assert!(reg.list_approvals().is_empty());
+    }
+
+    // P1-4 Rust session: a tool call with no session id fails
+    // closed (INVALID_CONTRACT) before any evaluation is recorded
+    // — no grant can ever be looked up without a session to scope it
+    // to, and the refusal leaves no log entry behind.
+    #[test]
+    fn tool_call_without_session_id_fails_closed() {
+        let mut reg = Registry::new();
+        reg.allow_tool("send_message");
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
+        let mut no_session = contract();
+        no_session.session_id.clear();
+        let err = reg.tool_call(&no_session, "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_INVALID_CONTRACT);
+        assert!(err.message.contains("session"));
+        assert!(reg.activity_log().is_empty());
+        // The grant is untouched: session A still passes the gate.
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
+    }
+
+    // P1-4 Rust session: revoke is scoped the same way — revoking
+    // in the wrong session removes nothing and leaves the grant
+    // usable in its own session.
+    #[test]
+    fn revoke_tool_is_scoped_to_session() {
+        let mut reg = Registry::new();
+        reg.allow_tool("send_message");
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
+        assert_eq!(reg.revoke_tool("send_message", "k1", "s-B"), Ok(false));
+        assert_eq!(reg.list_approvals().len(), 1);
+        assert_eq!(reg.revoke_tool("send_message", "k1", "s1"), Ok(true));
+        assert!(reg.list_approvals().is_empty());
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+    }
+
     #[test]
     fn revoke_tool_removes_the_grant_and_the_next_call_waits() {
         let mut reg = Registry::new();
         reg.allow_tool("send_message");
-        assert!(!reg.revoke_tool("send_message", "k1"));
-        reg.approve_tool("send_message", "k1", "zen");
+        assert_eq!(reg.revoke_tool("send_message", "k1", "s1"), Ok(false));
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
         assert_eq!(reg.list_approvals().len(), 1);
-        assert!(reg.revoke_tool("send_message", "k1"));
-        assert!(!reg.revoke_tool("send_message", "k1"));
+        assert_eq!(reg.revoke_tool("send_message", "k1", "s1"), Ok(true));
+        assert_eq!(reg.revoke_tool("send_message", "k1", "s1"), Ok(false));
         assert!(reg.list_approvals().is_empty());
         // The revoked grant authorizes nothing: the call waits.
         let err = reg.tool_call(&contract(), "send_message").unwrap_err();
@@ -2289,7 +2405,7 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
             "access_other_account",
         ] {
             reg.allow_tool(tool);
-            reg.approve_tool(tool, "k1", "zen");
+            reg.approve_tool(tool, "k1", "zen", "s1").unwrap();
             let err = reg.tool_call(&contract(), tool).unwrap_err();
             assert_eq!(err.code, ERR_APPROVAL_NEVER_DENIED, "{tool}");
         }
