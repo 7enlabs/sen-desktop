@@ -243,19 +243,26 @@ export function selectRoute(
 }
 
 /**
- * Route after `failedId` in the attempt order, or undefined when the
- * chain is exhausted or `failedId` is not in the order. An unknown
- * id never restarts at the first route: that route may already have
- * been tried, and restarting it is how the fallback loop ran
- * forever when the config changed mid-turn (P2-2, mirror of
- * `next_route` in model_router.rs, PR #95).
+ * Route after `failedId` in a caller-supplied attempt-order
+ * snapshot, or undefined when the chain is exhausted or `failedId`
+ * is not in the snapshot. A turn snapshots its order once at start
+ * with resolveAttemptOrder (P2-2) and walks the snapshot, so a
+ * config change mid-turn cannot move routes under the loop — the TS
+ * mirror of `next_route_in` in model_router.rs (the retry loop in
+ * registry.rs walks the snapshot the same way). The snapshot is a
+ * plain Route[]: exactly what resolveAttemptOrder returns, no new
+ * shape invented. An unknown id never restarts at the first route:
+ * that route may already have been tried, and restarting it is how
+ * the fallback loop ran forever when the config changed mid-turn
+ * (PR #96). L2 follow-up to PR #96: nextRoute used to take the
+ * config and re-resolve the order on every call, so a config change
+ * between two calls could move routes under the loop — the same
+ * root cause PR #96 fixed for unknown ids.
  */
 export function nextRoute(
-  config: RouterConfig,
+  order: Route[],
   failedId: string,
-  byokKeyPresent = false,
 ): Route | undefined {
-  const order = resolveAttemptOrder(config, byokKeyPresent);
   const at = order.findIndex((r) => r.id === failedId);
   if (at < 0) {
     return undefined;

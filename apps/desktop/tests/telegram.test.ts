@@ -234,10 +234,37 @@ async function capturePayload(
     seen = args as Record<string, unknown>;
     return stubResult;
   });
-  await call();
-  setBridgeTransport(null);
+  try {
+    await call();
+  } finally {
+    setBridgeTransport(null);
+  }
   return seen;
 }
+
+test("telegram capturePayload: a failing call still restores the real transport (CI P2-6)", async () => {
+  // Same try/finally as approval-gate.test.ts: a call that throws
+  // after the stub answered must not leave the stub installed for
+  // the next test.
+  await assert.rejects(
+    capturePayload(
+      "sen_telegram_send",
+      { sent: true },
+      async () => {
+        await sendTelegramMessage(contract(), 100, "hello");
+        throw new Error("boom after call");
+      },
+    ),
+    /boom after call/,
+  );
+  // With the stub gone, the next call reaches the real Tauri invoke,
+  // which throws under node ("window is not defined") — not the
+  // stale stub's answer.
+  await assert.rejects(
+    () => sendTelegramMessage(contract(), 100, "hello"),
+    /window is not defined/,
+  );
+});
 
 test("telegram send: payload matches the Rust handler wire shape (CI P2-6)", async () => {
   const { paramKey, fields } = expectedWireShape(rustTelegramSource(), "sen_telegram_send");
