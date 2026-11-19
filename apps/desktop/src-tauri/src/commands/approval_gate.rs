@@ -357,6 +357,27 @@ impl ApprovalStore {
             .is_some()
     }
 
+    /// Revoke every live grant of one session (sen_session_end): a
+    /// session that ends must leave no unused approval behind for
+    /// it, or the grant would outlive its session by up to the TTL.
+    /// Only live grants are removed and counted: a grant already
+    /// spent is not in the store, and an expired grant is dead
+    /// already (find/list drop it on read), so it is neither
+    /// counted nor removed here. Returns the number revoked.
+    /// Grants of other sessions are untouched.
+    pub fn revoke_all_for_session(&mut self, session_id: &str) -> u64 {
+        let now_secs = epoch_seconds_now_u64();
+        let before = self.grants.len();
+        self.grants.retain(|_, approval| {
+            approval.session_id != session_id || Self::is_expired(approval, now_secs)
+        });
+        // The retained set lost only this session's live grants:
+        // every other entry (other sessions, plus this session's
+        // already-expired grants) is still there, so the drop in
+        // size is exactly the revoked count.
+        (before - self.grants.len()) as u64
+    }
+
     pub fn list(&mut self) -> Vec<Approval> {
         let now_secs = epoch_seconds_now_u64();
         // Drop expired grants first, so a dead grant never shows

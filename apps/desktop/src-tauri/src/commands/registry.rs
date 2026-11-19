@@ -16,10 +16,11 @@
 // - Session state transitions mirror packages/core/src/session.ts exactly:
 //   Running -> AwaitingApproval | Error | Completed | Cancelled | Failed,
 //   AwaitingApproval -> Running | Cancelled (rejection never hangs),
-//   Error -> Running | Failed | Cancelled (P2-9: the third path is
+//   Error -> Running | Completed | Failed | Cancelled (P2-9: the third path is
 //   the abort of an errored session — without it Error is a trap:
 //   abort refuses and retry is the only exit, so a user who wants
-//   to close an errored session cannot),
+//   to close an errored session cannot; sen_session_end adds the
+//   Completed path, Q1, so an errored session can end cleanly too),
 //   terminal states (Completed, Cancelled, Failed) have no outgoing path.
 // - A turn's outcome moves the state (P2-9): a successful turn leaves
 //   the session Running — one live session serves every chat turn, so
@@ -83,7 +84,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::approval_gate::{
-    gate_tool_call, ActivityEntry, ActivityLog, Approval, ApprovalStore, GateDecision, ToolPolicy,
+    gate_tool_call, ActivityEntry, ActivityLog, Approval, ApprovalStore, ApprovalTier,
+    GateDecision, ToolPolicy,
 };
 use super::cli_settings::CliSettings;
 // Test-only: DEFAULT_MODEL is asserted in tests only.
@@ -139,7 +141,12 @@ pub fn can_transition(from: SessionState, to: SessionState) -> bool {
             AwaitingApproval | Error | Completed | Cancelled | Failed
         ),
         AwaitingApproval => matches!(to, Running | Cancelled),
-        Error => matches!(to, Running | Failed | Cancelled),
+        // Q1 (Leader tin 17652): Error may end cleanly to Completed
+        // via sen_session_end, alongside the P2-9 abort path to
+        // Cancelled. AwaitingApproval still has no path to
+        // Completed: an undecided approval must be granted or
+        // rejected first, never ended around.
+        Error => matches!(to, Running | Completed | Failed | Cancelled),
         Completed | Cancelled | Failed => false,
     }
 }
@@ -176,6 +183,12 @@ pub const ERR_TOOL_EXECUTION_NOT_WIRED: &str = "TOOL_EXECUTION_NOT_WIRED";
 pub const ERR_APPROVAL_REQUIRED: &str = "APPROVAL_REQUIRED";
 pub const ERR_APPROVAL_NEVER_DENIED: &str = "APPROVAL_NEVER_DENIED";
 pub const ERR_TOOL_POLICY_DENIED: &str = "TOOL_POLICY_DENIED";
+/// sen_session_end refuses while a turn runs (Q2): end never kills
+/// a running turn, so the caller waits for it or aborts instead.
+pub const ERR_TURN_IN_FLIGHT: &str = "ERR_TURN_IN_FLIGHT";
+/// sen_session_end refuses while the session waits on an approval
+/// (b.4): the approval must be granted or rejected first.
+pub const ERR_PENDING_APPROVAL: &str = "ERR_PENDING_APPROVAL";
 
 // --- IPC action contract (mirror of apps/desktop/src/ipc/types.ts) ---
 
@@ -321,12 +334,40 @@ pub const MAX_SESSIONS: usize = 100;
 pub const MAX_COMPLETED_STEERS_PER_SESSION: usize = 100;
 pub const MAX_SESSION_LOG_ENTRIES: usize = 100;
 
+/// What one sen_session_end returns (b.1/b.5): the receipt of the
+/// first end, stored on the SessionRecord so a retry with the same
+/// idempotency key replays it instead of ending twice. `state` is
+/// always Completed on a receipt; `ended_from` is the state the
+/// session left (Running or Error); `turns_completed` counts the
+/// successful steers recorded on the session (completed_steers, so
+/// an error turn that was never cached does not count);
+/// `approvals_revoked` counts the live grants purged by this end —
+/// 0 on a replay, which purges nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEndReceipt {
+    pub session_id: String,
+    pub state: SessionState,
+    pub already_ended: bool,
+    pub ended_from: SessionState,
+    pub turns_completed: u64,
+    pub approvals_revoked: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub id: String,
     pub state: SessionState,
     pub log: Vec<String>,
     pub subscribers: u32,
+    /// The receipt of this session's first end, with the
+    /// idempotency key that produced it (b.5). Set only when the
+    /// session reaches Completed via end(); None otherwise. The
+    /// receipt lives and dies with the record (eviction under the
+    /// cap drops both), so no separate map can outgrow the
+    /// registry. A replay returns this receipt with
+    /// already_ended=true and approvals_revoked=0.
+    pub end_receipt: Option<SessionEndReceipt>,
+    pub end_key: Option<String>,
     /// Active model-router route id for this session (P0-3). Changes
     /// when a turn falls back to the next route.
     pub route_id: String,
@@ -586,6 +627,8 @@ impl Registry {
                 state: SessionState::Running,
                 log: vec!["session_create".to_string()],
                 subscribers: 0,
+                end_receipt: None,
+                end_key: None,
                 route_id: route.id.clone(),
             },
         );
@@ -844,9 +887,9 @@ impl Registry {
     // P2-9: the turn's outcome moves the state. A successful turn
     // leaves the session Running: one live session serves every
     // chat turn, so a turn that succeeds does not end the session
-    // (there is no finish/close command that would produce
-    // Completed — a session ends via abort, to Cancelled). An error
-    // turn (is_error=true) moves Running -> Error; a second
+    // (Completed comes only from the explicit sen_session_end
+    // command — a session ends via end, to Completed, or via
+    // abort, to Cancelled). An error turn (is_error=true) moves Running -> Error; a second
     // consecutive error turn moves Error -> Failed (terminal), so
     // a session that keeps failing is failed, not left Running
     // forever. A successful turn from Error recovers to Running.
@@ -1112,6 +1155,141 @@ impl Registry {
         self.complete_abort(session_id, outcome)
     }
 
+    /// sen_session_end (Q1-Q9, Leader tin 17652): Running or Error
+    /// -> Completed, in ONE atomic step under the registry lock —
+    /// no begin/complete split, because no step runs outside the
+    /// lock: the guards below refuse while a turn runs, so there
+    /// is no child to kill and no event to wait for. End is not
+    /// abort renamed: abort kills the running turn and lands on
+    /// Cancelled; end refuses while a turn runs and lands on
+    /// Completed. Guards run in the b.4 order, stopping at the
+    /// first failure with no state change: validate the contract,
+    /// check the session exists, check the contract session id
+    /// matches the session, replay or refuse a terminal session,
+    /// refuse an undecided approval (ERR_PENDING_APPROVAL),
+    /// refuse a turn in flight (ERR_TURN_IN_FLIGHT), then flip
+    /// to Completed, drop subscribers to 0, log `session_end`,
+    /// purge the session's unused approvals (b.7), store the
+    /// receipt, and record one activity-log entry.
+    pub fn end(
+        &mut self,
+        session_id: &str,
+        contract: &ActionContract,
+    ) -> Result<SessionEndReceipt, CommandError> {
+        validate_contract(contract)?;
+        let state = match self.sessions.get(session_id) {
+            Some(record) => record.state,
+            None => {
+                return Err(CommandError::new(
+                    ERR_UNKNOWN_SESSION,
+                    &format!("Session does not exist: {}", session_id),
+                ));
+            }
+        };
+        // Approvals are keyed by session (P1-4), so a contract for
+        // another session must never end this one. New check: abort
+        // and steer never made it, end does.
+        if contract.session_id.trim().is_empty() || contract.session_id != session_id {
+            return Err(CommandError::new(
+                ERR_INVALID_CONTRACT,
+                "IPC contract session_id does not match the session to end, FAIL",
+            ));
+        }
+        // Terminal: a Completed session replays its receipt on the
+        // same idempotency key (b.5, BUG-10 pattern); any other
+        // terminal end — a different key on Completed, or any key
+        // on Cancelled/Failed — refuses like a second abort.
+        if state.is_terminal() {
+            if state == SessionState::Completed {
+                let record = self.sessions.get(session_id).unwrap();
+                if let (Some(key), Some(receipt)) = (&record.end_key, &record.end_receipt) {
+                    if key == &contract.idempotency_key {
+                        let mut replay = receipt.clone();
+                        replay.already_ended = true;
+                        // The replay purges nothing: the grants
+                        // went with the first end, so this call
+                        // revoked 0.
+                        replay.approvals_revoked = 0;
+                        return Ok(replay);
+                    }
+                }
+            }
+            return Err(CommandError::new(
+                ERR_ILLEGAL_TRANSITION,
+                &format!("Illegal state transition: {} to Completed", state.as_str()),
+            ));
+        }
+        if state == SessionState::AwaitingApproval {
+            return Err(CommandError::new(
+                ERR_PENDING_APPROVAL,
+                "Session is awaiting approval: grant or reject the approval before ending the session",
+            ));
+        }
+        // A turn in flight means a child may be running: refuse
+        // outright (Q2), never kill the turn, never end under it.
+        // The turn keeps running and completes normally; the
+        // caller ends after it lands, or aborts for Cancelled.
+        let in_flight = self
+            .in_flight_steers
+            .get(session_id)
+            .map(|running| !running.is_empty())
+            .unwrap_or(false);
+        if in_flight {
+            return Err(CommandError::new(
+                ERR_TURN_IN_FLIGHT,
+                "A turn is still running on this session: wait for it to finish, or abort to stop it now (the session will be Cancelled)",
+            ));
+        }
+        // Flip, purge, record — all under this one lock hold, so no
+        // turn can begin between the in-flight check above and the
+        // state change (begin_steer needs the same lock).
+        let ended_from = state;
+        let turns_completed = self
+            .completed_steers
+            .get(session_id)
+            .map(|done| done.len() as u64)
+            .unwrap_or(0);
+        {
+            let record = self.sessions.get_mut(session_id).unwrap();
+            record.state = SessionState::Completed;
+            // BUG-09, same as abort: a completed session has no
+            // listeners left, so the count resets to 0.
+            record.subscribers = 0;
+            record.push_log("session_end".to_string());
+        }
+        let approvals_revoked = self.approvals.revoke_all_for_session(session_id);
+        let receipt = SessionEndReceipt {
+            session_id: session_id.to_string(),
+            state: SessionState::Completed,
+            already_ended: false,
+            ended_from,
+            turns_completed,
+            approvals_revoked,
+        };
+        {
+            let record = self.sessions.get_mut(session_id).unwrap();
+            record.end_key = Some(contract.idempotency_key.clone());
+            record.end_receipt = Some(receipt.clone());
+        }
+        // One activity-log entry for the end, carrying the purge
+        // count in its reason (b.7). Revoke writes no entry per
+        // grant, same as revoke_tool. The end itself is not a tool
+        // call, so it is logged as an allowed operator action, not
+        // a gate evaluation.
+        self.activity_log.record(
+            &contract.actor,
+            "sen.session.end",
+            ApprovalTier::Auto,
+            GateDecision::Allow,
+            &format!(
+                "Session ended from {}; revoked {} unused approval(s)",
+                ended_from.as_str(),
+                approvals_revoked
+            ),
+        );
+        Ok(receipt)
+    }
+
     /// sen_events_subscribe: records one subscriber on the session. The
     /// event stream itself will flow from the backend (Tauri events) once
     /// the CLI bridge lands; this record is the backend bookkeeping for
@@ -1322,6 +1500,12 @@ mod tests {
         assert!(can_transition(AwaitingApproval, Running));
         assert!(can_transition(AwaitingApproval, Cancelled));
         assert!(!can_transition(AwaitingApproval, Error));
+        // Q1 (Leader tin 17652): Error may end cleanly to
+        // Completed via sen_session_end. AwaitingApproval still
+        // has no path to Completed: an undecided approval must be
+        // granted or rejected first.
+        assert!(can_transition(Error, Completed));
+        assert!(!can_transition(AwaitingApproval, Completed));
         assert!(can_transition(Error, Running));
         assert!(can_transition(Error, Failed));
         assert!(can_transition(Error, Cancelled));
@@ -1787,9 +1971,9 @@ exit 1; fi"#,
     // turn would terminal the session after the first message and
     // refuse every later one with ILLEGAL_TRANSITION — and break
     // Duplicate replay (BUG-10: begin_steer refuses terminal
-    // sessions). Completed stays defined but unreachable: no
-    // finish/close command exists, a session ends via abort
-    // (Cancelled). This test pins the live behaviour.
+    // sessions). Completed comes only from the explicit
+    // sen_session_end command, never from a turn. This test pins
+    // the live behaviour.
     #[test]
     fn p2_9_success_turn_keeps_session_running_for_next_turn() {
         let mut reg = Registry::new();
@@ -2224,6 +2408,194 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         assert_eq!(reg.abort("s1", &contract()), Ok(SessionState::Cancelled));
         let err = reg.abort("s1", &contract()).unwrap_err();
         assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+    }
+
+    // sen_session_end (T2): Running -> Completed in one atomic
+    // step. The log carries `session_end`, subscribers drop to 0
+    // (BUG-09, like abort), the route stays put, the bridge stays
+    // in the map (Q5: no CLI cleanup), and no later steer runs.
+    #[test]
+    fn end_from_running_completes() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("endrun", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(reg.subscribe("s1", &contract()), Ok(1));
+        let mut emit = |_ev: SenEvent| {};
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        let route_before = reg.route_id("s1").unwrap();
+        let receipt = reg.end("s1", &contract()).unwrap();
+        assert_eq!(receipt.state, SessionState::Completed);
+        assert!(!receipt.already_ended);
+        assert_eq!(receipt.ended_from, SessionState::Running);
+        assert_eq!(receipt.turns_completed, 1);
+        assert_eq!(receipt.approvals_revoked, 0);
+        let record = reg.get("s1").unwrap();
+        assert_eq!(record.state, SessionState::Completed);
+        assert_eq!(record.subscribers, 0);
+        assert!(record.log.contains(&"session_end".to_string()));
+        assert_eq!(record.route_id, route_before);
+        assert!(reg.bridge("s1").is_some());
+        let mut emit = |_ev: SenEvent| {};
+        let err = reg
+            .steer("s1", &contract(), "steer", "later", &mut emit)
+            .unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+    }
+
+    // sen_session_end (T3, Q1): Error -> Completed, the path the
+    // Leader opened so an errored session can end cleanly instead
+    // of only aborting to Cancelled.
+    #[test]
+    fn end_from_error_completes() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("enderror", ERROR_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Error)
+        );
+        let receipt = reg.end("s1", &contract()).unwrap();
+        assert_eq!(receipt.state, SessionState::Completed);
+        assert_eq!(receipt.ended_from, SessionState::Error);
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Completed);
+    }
+
+    // sen_session_end (T4, b.5): a second end with the same
+    // idempotency key replays the first receipt — already_ended,
+    // no new log line, nothing purged a second time.
+    #[test]
+    fn end_replay_with_same_key_returns_old_receipt() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        let first = reg.end("s1", &contract()).unwrap();
+        assert!(!first.already_ended);
+        let log_len = reg.get("s1").unwrap().log.len();
+        let replay = reg.end("s1", &contract()).unwrap();
+        assert!(replay.already_ended);
+        assert_eq!(replay.state, SessionState::Completed);
+        assert_eq!(replay.ended_from, first.ended_from);
+        assert_eq!(replay.turns_completed, first.turns_completed);
+        assert_eq!(replay.approvals_revoked, 0);
+        assert_eq!(reg.get("s1").unwrap().log.len(), log_len);
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Completed);
+    }
+
+    // sen_session_end (T5, b.5): the same end with a DIFFERENT key
+    // on a Completed session is a second end, not a replay — and a
+    // terminal session has no second end, so ILLEGAL_TRANSITION,
+    // like a second abort on a Cancelled session.
+    #[test]
+    fn end_with_different_key_on_completed_refuses() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        reg.end("s1", &contract()).unwrap();
+        let mut other = contract();
+        other.idempotency_key = "k2".to_string();
+        let err = reg.end("s1", &other).unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+    }
+
+    // sen_session_end (T6, Q2): end while a turn runs refuses with
+    // ERR_TURN_IN_FLIGHT, the session stays Running, and the turn
+    // still completes normally afterwards — end never kills a turn.
+    #[test]
+    fn end_while_turn_in_flight_refuses_and_turn_completes() {
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("endflight", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let bridge = match reg.begin_steer("s1", &contract(), "steer", "hi").unwrap() {
+            SteerStart::Run(bridge) => bridge,
+            SteerStart::Duplicate { .. } | SteerStart::InFlight { .. } => {
+                panic!("first steer must Run")
+            }
+        };
+        let err = reg.end("s1", &contract()).unwrap_err();
+        assert_eq!(err.code, ERR_TURN_IN_FLIGHT);
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
+        // The refused end left no receipt behind: the session is
+        // still live, and the turn records normally when it lands.
+        assert!(reg.get("s1").unwrap().end_receipt.is_none());
+        let mut events: Vec<SenEvent> = Vec::new();
+        let mut emit = |ev: SenEvent| events.push(ev);
+        let turn = bridge.run_turn("steer", "hi", &mut emit).unwrap();
+        assert_eq!(
+            reg.complete_steer("s1", &contract(), "steer", "hi", &turn),
+            Ok(SessionState::Running)
+        );
+        // Now that no turn runs, the same end succeeds.
+        let receipt = reg.end("s1", &contract()).unwrap();
+        assert_eq!(receipt.state, SessionState::Completed);
+    }
+
+    // sen_session_end (T7, b.7): the session's live grants are
+    // purged in the same step; another session's grants survive,
+    // and the purge count lands in the receipt and the activity
+    // log. A grant already spent is not in the store, so it is
+    // never counted twice.
+    #[test]
+    fn end_purges_only_this_sessions_grants() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        reg.create("s2", &contract()).unwrap();
+        reg.approve_tool("tool-a", "key-a", "tester", "s1").unwrap();
+        reg.approve_tool("tool-b", "key-b", "tester", "s1").unwrap();
+        reg.approve_tool("tool-a", "key-a", "tester", "s2").unwrap();
+        let receipt = reg.end("s1", &contract()).unwrap();
+        assert_eq!(receipt.approvals_revoked, 2);
+        let remaining = reg.list_approvals();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "s2");
+        let entries = reg.activity_log();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.tool == "sen.session.end" && e.reason.contains("revoked 2")),
+            "end must record one activity-log entry with the purge count, got: {:?}",
+            entries
+        );
+    }
+
+    // sen_session_end (T8, b.4): input errors, in guard order —
+    // unknown session, bad contract, contract for another session.
+    #[test]
+    fn end_rejects_unknown_session_bad_contract_and_wrong_session() {
+        let mut reg = Registry::new();
+        let err = reg.end("nope", &contract()).unwrap_err();
+        assert_eq!(err.code, ERR_UNKNOWN_SESSION);
+        reg.create("s1", &contract()).unwrap();
+        let mut bad = contract();
+        bad.id = String::new();
+        let err = reg.end("s1", &bad).unwrap_err();
+        assert_eq!(err.code, ERR_INVALID_CONTRACT);
+        // A contract minted for another session must never end
+        // this one — the check abort and steer never made.
+        let mut foreign = contract();
+        foreign.session_id = "s2".to_string();
+        let err = reg.end("s1", &foreign).unwrap_err();
+        assert_eq!(err.code, ERR_INVALID_CONTRACT);
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Running);
+        // Ending a Cancelled session refuses with any key.
+        reg.abort("s1", &contract()).unwrap();
+        let err = reg.end("s1", &contract()).unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+    }
+
+    // sen_session_end (T9, Q2/Q5): end never calls CliBridge::abort
+    // — no SIGINT, no SIGKILL, no aborted flag — and the bridge
+    // handle stays in the map for diagnostics.
+    #[test]
+    fn end_never_calls_bridge_abort() {
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        let bridge = reg.bridge("s1").unwrap();
+        assert!(!bridge.was_aborted());
+        reg.end("s1", &contract()).unwrap();
+        assert!(!bridge.was_aborted());
+        assert!(reg.bridge("s1").is_some());
     }
 
     #[test]

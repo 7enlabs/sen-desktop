@@ -401,3 +401,54 @@ pub fn sen_session_abort(
     let (route_id, cost) = route_cost(&registry, &session_id);
     Ok(result(&session_id, next, &route_id, &cost))
 }
+
+/// Result of sen_session_end: the end receipt, camelCase on the
+/// wire like SessionResult. A separate struct on purpose (b.1):
+/// SessionResult carries turn counts, route and cost, none of
+/// which describe an end; this one carries the state the session
+/// left, how many turns it completed, and how many unused
+/// approvals the end purged.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEndResult {
+    pub session_id: String,
+    /// Always "Completed" on Ok.
+    pub state: String,
+    /// True when this call replayed an earlier end with the same
+    /// idempotency key (b.5); false on the first end.
+    pub already_ended: bool,
+    /// "Running" or "Error": the state the session left.
+    pub ended_from: String,
+    /// Successful steers recorded on the session before the end.
+    pub turns_completed: u64,
+    /// Live approval grants of this session purged by the end
+    /// (0 on a replay, which purges nothing).
+    pub approvals_revoked: u64,
+}
+
+/// sen_session_end: Running or Error -> Completed, in one atomic
+/// registry step (Q1-Q9). Thin wrapper like sen_session_abort,
+/// but with no bridge step at all: the registry refuses while a
+/// turn runs (ERR_TURN_IN_FLIGHT) instead of killing it, and
+/// refuses an undecided approval (ERR_PENDING_APPROVAL) instead
+/// of ending around it. No transcript file, no CLI cleanup, no
+/// new session is created after the end (Q4, Q5, Q9).
+#[tauri::command]
+pub fn sen_session_end(
+    state: State<'_, Mutex<Registry>>,
+    session_id: String,
+    contract: ContractArgs,
+) -> Result<SessionEndResult, String> {
+    let mut registry = state.lock().map_err(|e| e.to_string())?;
+    let receipt = registry
+        .end(&session_id, &contract.to_registry())
+        .map_err(|e| e.to_wire())?;
+    Ok(SessionEndResult {
+        session_id: receipt.session_id,
+        state: receipt.state.as_str().to_string(),
+        already_ended: receipt.already_ended,
+        ended_from: receipt.ended_from.as_str().to_string(),
+        turns_completed: receipt.turns_completed,
+        approvals_revoked: receipt.approvals_revoked,
+    })
+}

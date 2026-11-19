@@ -22,6 +22,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   abortSession,
   createSession,
+  endSession,
   subscribeSession,
   unsubscribeSession,
 } from "./session-client.ts";
@@ -162,4 +163,29 @@ export async function closeLiveSession(
   }
   await unsubscribeSession(contract, sessionId);
   return abortSession(manager, contract, sessionId);
+}
+
+// Ends a live session cleanly (Q1-Q9, Leader tin 17652): mirror of
+// closeLiveSession, but the backend + local path lands on Completed
+// through endSession instead of Cancelled through abortSession.
+// Same order (unlisten, unsubscribe, end), locked by the V-04-style
+// test in live-client.test.ts. No production caller yet (Q3:
+// infrastructure first, like closeLiveSession) — when the UI builds
+// a close path it passes StartedApp.unlisten here.
+export async function endLiveSession(
+  manager: SessionManager,
+  contract: ActionContract,
+  sessionId: string,
+  unlisten?: UnlistenFn | null,
+): Promise<unknown> {
+  // Stop receiving first, so no event is delivered after the session
+  // ends; then drop the backend subscriber (BUG-09), then the
+  // backend + local Completed path (endSession through the IPC
+  // bridge). End itself also resets the count to 0, so a direct end
+  // that bypasses this path leaks nothing either.
+  if (unlisten) {
+    unlisten();
+  }
+  await unsubscribeSession(contract, sessionId);
+  return endSession(manager, contract, sessionId);
 }

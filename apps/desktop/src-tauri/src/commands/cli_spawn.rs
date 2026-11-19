@@ -405,6 +405,15 @@ impl CliBridge {
         self.state.lock().map(|s| s.started).unwrap_or(false)
     }
 
+    /// Test-only: whether abort() was ever called on this handle.
+    /// sen_session_end must never call abort (it refuses while a
+    /// turn runs instead of killing it), so the end tests assert
+    /// this stays false after an end.
+    #[cfg(test)]
+    pub fn was_aborted(&self) -> bool {
+        self.state.lock().map(|s| s.aborted).unwrap_or(false)
+    }
+
     /// Mark this handle as resuming an existing CLI session (P0-3
     /// fallback): the next turn uses -r instead of --session-id, so
     /// the turn keeps the session history the failed bridge already
