@@ -38,12 +38,14 @@ pub const POLL_TIMEOUT_SECS: u64 = 30;
 /// margin.
 pub const HTTP_TIMEOUT_SECS: u64 = 35;
 
-/// The poll loop is caller-driven: poll_once is the unit under test,
-/// and the caller (the desktop chat layer) calls it again after each
-/// round, with a 1s backoff after an error. There is no background
-/// thread in the backend: the chat layer owns the loop, so stopping is
-/// just not calling again, and no stop flag can race a 30s long-poll
-/// round.
+// The poll loop is caller-driven: poll_once is the unit under test,
+// and the caller (the desktop chat layer) calls it again after each
+// round, with a 1s backoff after an error. There is no background
+// thread in the backend: the chat layer owns the loop, so stopping is
+// just not calling again, and no stop flag can race a 30s long-poll
+// round. (Plain comment, not a doc comment: it describes the loop,
+// not the constant below, so it must not sit directly above it as
+// `///`, which clippy flags as an empty line after a doc comment.)
 
 /// Telegram's per-message text limit, in UTF-16 code units — that is
 /// how Telegram counts it. A longer reply is sent as several messages,
@@ -620,10 +622,15 @@ mod tests {
     /// every call (URL + POST body) for assertions. State is shared
     /// through Arc, so a clone made for the client under test still
     /// records into the same log the test reads.
+    ///
+    /// The call log type is aliased: the bare
+    /// `Arc<Mutex<Vec<(String, Option<String>)>>>` trips
+    /// clippy::type_complexity.
+    type FakeCallLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
     #[derive(Clone)]
     struct FakeHttp {
         gets: Arc<Mutex<Vec<String>>>,
-        calls: Arc<Mutex<Vec<(String, Option<String>)>>>,
+        calls: FakeCallLog,
         fail_get: Arc<Mutex<Option<String>>>,
         fail_post: Arc<Mutex<Option<String>>>,
     }

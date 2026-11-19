@@ -80,6 +80,12 @@ impl TelegramState {
     }
 }
 
+impl Default for TelegramState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Build the poller from the environment. Ok(None) when no token is
 /// configured: the bridge is not set up, which is a normal state
 /// (the desktop chat still works). Err only when the allowlist value

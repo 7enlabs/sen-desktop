@@ -45,7 +45,10 @@ impl ProviderKind {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<ProviderKind> {
+    // Named from_id, not from_str: a from_str here would shadow the
+    // std::str::FromStr::from_str name (clippy::should_implement_trait)
+    // without implementing the trait.
+    pub fn from_id(value: &str) -> Option<ProviderKind> {
         match value {
             "spark" => Some(ProviderKind::Spark),
             "openrouter-free" => Some(ProviderKind::OpenRouterFree),
@@ -369,8 +372,10 @@ mod tests {
 
     #[test]
     fn select_prefers_the_preferred_route_and_falls_back_in_order() {
-        let mut config = RouterConfig::default();
-        config.preferred_route = Some("ollama".to_string());
+        let config = RouterConfig {
+            preferred_route: Some("ollama".to_string()),
+            ..Default::default()
+        };
         let order = resolve_attempt_order(&config);
         assert_eq!(order[0].id, "ollama");
         assert_eq!(order[1].id, "spark");
@@ -415,8 +420,10 @@ mod tests {
 
     #[test]
     fn fallback_disabled_means_one_attempt() {
-        let mut config = RouterConfig::default();
-        config.fallback_enabled = false;
+        let config = RouterConfig {
+            fallback_enabled: false,
+            ..Default::default()
+        };
         assert_eq!(resolve_attempt_order(&config).len(), 1);
     }
 
@@ -460,8 +467,10 @@ mod tests {
         unsafe {
             std::env::remove_var("SEN_TEST_BYOK_KEY_PRESENT");
         }
-        let mut config = RouterConfig::default();
-        config.routes = vec![byok_route()];
+        let config = RouterConfig {
+            routes: vec![byok_route()],
+            ..Default::default()
+        };
         unsafe {
             std::env::set_var("SEN_TEST_BYOK_KEY_PRESENT", "x");
         }
@@ -474,8 +483,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_bad_config() {
-        let mut config = RouterConfig::default();
-        config.routes = vec![];
+        let config = RouterConfig {
+            routes: vec![],
+            ..Default::default()
+        };
         assert!(validate_router_config(&config)
             .iter()
             .any(|e| e.contains("non-empty array")));
@@ -484,8 +495,10 @@ mod tests {
         assert!(validate_router_config(&config)
             .iter()
             .any(|e| e.contains("duplicate route id")));
-        let mut config = RouterConfig::default();
-        config.preferred_route = Some("no-such-route".to_string());
+        let config = RouterConfig {
+            preferred_route: Some("no-such-route".to_string()),
+            ..Default::default()
+        };
         assert!(validate_router_config(&config)
             .iter()
             .any(|e| e.contains("not a route id")));
