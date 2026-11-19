@@ -77,14 +77,26 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+// Test-only: Duration is used by the #[cfg(test)] abort-grace field
+// and helper only; the bin target would flag a plain import as unused.
+#[cfg(test)]
 use std::time::Duration;
 
 use super::approval_gate::{
     gate_tool_call, ActivityEntry, ActivityLog, Approval, ApprovalStore, GateDecision, ToolPolicy,
 };
-use super::cli_settings::{CliSettings, DEFAULT_MODEL};
-use super::cli_spawn::{AbortOutcome, BridgeError, CliBridge, TurnResult};
+use super::cli_settings::CliSettings;
+// Test-only: DEFAULT_MODEL is asserted in tests only.
+#[cfg(test)]
+use super::cli_settings::DEFAULT_MODEL;
+use super::cli_spawn::{AbortOutcome, CliBridge, TurnResult};
+// Test-only: BridgeError is used by the #[cfg(test)] steer helper only.
+#[cfg(test)]
+use super::cli_spawn::BridgeError;
 use super::model_router::{next_route_in, resolve_attempt_order, Route, RouterConfig};
+// Test-only: SenEvent is used by the #[cfg(test)] steer helper and
+// the tests only; the bin target would flag a plain import as unused.
+#[cfg(test)]
 use super::stream_json::SenEvent;
 
 // --- Session statechart (point 854, mirror of packages/core) ---
@@ -413,13 +425,19 @@ pub enum SteerStart {
     Run(Arc<CliBridge>),
     Duplicate {
         state: SessionState,
-        turn: TurnResult,
+        // Boxed: TurnResult is ~225 bytes, so the plain field makes
+        // this enum 232 bytes (clippy::large_enum_variant). The box
+        // costs one heap allocation on the replay path only.
+        turn: Box<TurnResult>,
     },
     InFlight {
         state: SessionState,
     },
 }
 
+// Test-only: used by the #[cfg(test)] steer helper below; a plain
+// fn would be dead code in the non-test build.
+#[cfg(test)]
 fn bridge_error_to_command(error: BridgeError) -> CommandError {
     CommandError::new(&error.code, &error.message)
 }
@@ -746,7 +764,7 @@ impl Registry {
         {
             return Ok(SteerStart::Duplicate {
                 state,
-                turn: prior.clone(),
+                turn: Box::new(prior.clone()),
             });
         }
         // Concurrent duplicate (BUG-10 extra, tin 9645/9650): the same
@@ -785,8 +803,8 @@ impl Registry {
     /// turn AFTER the model ran. The log entry is written only here, so
     /// the backend never records a steer that did not run a model — the
     /// BUG-06 lesson. A turn that ran to a SUCCESS result is also stored
-    /// under its steer key, so a later retry of the same key + contract
-    /// + text replays this result instead of running again (BUG-10,
+    /// under its steer key, so a later retry of the same key + contract +
+    /// text replays this result instead of running again (BUG-10,
     /// #25). A turn whose result record carries is_error=true (R2B-02)
     /// is NOT stored: the model call failed (e.g. HTTP 401), so there is
     /// no completed result to replay, and a retry with the same key must
@@ -2809,8 +2827,10 @@ exit 4"#;
         let dir = std::env::temp_dir().join(format!("sen_reg_p03pref_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut config = RouterConfig::default();
-        config.preferred_route = Some("ollama".to_string());
+        let config = RouterConfig {
+            preferred_route: Some("ollama".to_string()),
+            ..Default::default()
+        };
         CliSettings {
             model: "some/model:free".to_string(),
             base_url: None,

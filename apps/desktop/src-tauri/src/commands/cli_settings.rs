@@ -385,8 +385,10 @@ mod tests {
     #[test]
     fn router_round_trips_and_file_has_no_key_value() {
         let dir = tmpdir("router");
-        let mut config = RouterConfig::default();
-        config.preferred_route = Some("ollama".to_string());
+        let config = RouterConfig {
+            preferred_route: Some("ollama".to_string()),
+            ..Default::default()
+        };
         let settings = CliSettings {
             model: "some/model:free".to_string(),
             base_url: None,

@@ -175,8 +175,8 @@ pub fn sen_session_create(
 /// released before the error returns, so a retry with the same key
 /// still executes.
 ///
-/// Memory (P0-1): the text the bridge runs is the memory context block
-/// + the user's text (MemoryStore::turn_prompt), never the bare text:
+/// Memory (P0-1): the text the bridge runs is the memory context block +
+/// the user's text (MemoryStore::turn_prompt), never the bare text:
 /// the model always sees the current memory, including a `quên` that
 /// just deleted a fact. The idempotency key still uses the bare user
 /// text (begin_steer / complete_steer take `text`), so a memory edit
