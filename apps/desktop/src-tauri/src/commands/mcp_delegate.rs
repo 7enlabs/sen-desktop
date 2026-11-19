@@ -419,6 +419,7 @@ pub fn run_mcp_delegate_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     const DELEGATE_SESSION: &str = "11111111-2222-4333-8444-555555555555";
@@ -427,16 +428,52 @@ mod tests {
     /// prints "zen 0.1.0" for --version, else the canned
     /// stream-json turn on stdout. Records its argv to `marker`
     /// when set, so the test can prove --mcp-config was passed.
-    fn fake_zen(tag: &str, body: &str) -> PathBuf {
+    ///
+    /// `lines` is the canned turn as stream-json records, not
+    /// shell code: the Unix fake prints them from a heredoc, the
+    /// Windows fake echoes them from a `.bat` file. A `.bat` file
+    /// is what Windows needs: an extensionless `sh` script fails
+    /// to spawn there (error 193, "%1 is not a valid Win32
+    /// application"), which is what failed the probe in PR #104
+    /// CI (mcp_delegate.rs:644 and 736). `.bat` (not `.cmd`):
+    /// the std docs name `.bat` for the CreateProcessW
+    /// conversion to `cmd.exe /c`, so the same spawn path
+    /// (`Command::new` on the fake path) works on both platforms.
+    ///
+    /// Rev2: the Windows fake records argv INLINE with `%*`
+    /// (no subroutine). V1 called `call :record_argv` with no
+    /// arguments, but a `call :label` subroutine only sees the
+    /// arguments passed after the label (Microsoft Learn, `call`:
+    /// `<arguments>` is "the command-line information to be
+    /// passed to the new instance of the batch program,
+    /// beginning at :<label>"), so `%1` was empty at once and
+    /// the marker was never written. `%*` is the script's own
+    /// argv as one raw command-line remainder (Microsoft Learn
+    /// Q&A on `%*`; SS64: "%* refers to all the arguments"),
+    /// so recording it inline cannot hit that trap. The marker
+    /// therefore holds the RAW command line, not one argv per
+    /// line: the Windows test asserts substrings (see the
+    /// delegate test), never exact argv equality, because Rust
+    /// escapes `.bat` arguments "according to cmd.exe rules"
+    /// (std docs, `std::process`, "Batch file special handling")
+    /// and warns some characters "might not be possible to
+    /// safely escape" — exact token reconstruction through
+    /// cmd.exe is not guaranteed, and the delegate prompt
+    /// contains `"` characters, which cmd.exe treats as a quote
+    /// toggle with backslash literal (not the MSVC `\"`
+    /// escape). Quote-free prompt fragments are asserted
+    /// instead: they survive any cmd.exe re-quoting.
+    fn fake_zen(tag: &str, marker: Option<&Path>, lines: &[&str]) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("sen_fake_zen_mcp_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("zen");
-        let mut script = String::from("#!/bin/sh\n");
-        script.push_str("if [ \"$1\" = \"--version\" ]; then echo \"zen 0.1.0\"; exit 0; fi\n");
-        script.push_str(body);
-        script.push('\n');
+        let (name, script) = if cfg!(windows) {
+            ("zen.bat", fake_zen_bat_script(marker, lines))
+        } else {
+            ("zen", fake_zen_sh_script(marker, lines))
+        };
+        let path = dir.join(name);
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
         {
@@ -446,11 +483,82 @@ mod tests {
         path
     }
 
-    const HAPPY_BODY: &str = r#"cat <<'EOF'
-{"type":"system","subtype":"init","session_id":"s1","cwd":"/tmp","model":"m:free","tools":[],"mcp_servers":[],"permissionMode":"default","slash_commands":[],"v":1}
-{"type":"result","subtype":"success","is_error":false,"result":"echo: hello","duration_ms":7,"num_turns":1,"usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0},"model":"m:free","session_id":"s1","v":1}
-EOF
-exit 0"#;
+    /// The Unix fake: a `sh` script. The marker is recorded with
+    /// `printf '%s\n' "$@"` (one argv per line, an empty argv as
+    /// a blank line); `lines` are printed from a quoted heredoc,
+    /// so no JSON quoting can break the script.
+    fn fake_zen_sh_script(marker: Option<&Path>, lines: &[&str]) -> String {
+        let mut script = String::from("#!/bin/sh\n");
+        script.push_str("if [ \"$1\" = \"--version\" ]; then echo \"zen 0.1.0\"; exit 0; fi\n");
+        if let Some(marker) = marker {
+            script.push_str(&format!("printf '%s\\n' \"$@\" > '{}'\n", marker.display()));
+        }
+        script.push_str("cat <<'EOF'\n");
+        for line in lines {
+            script.push_str(line);
+            script.push('\n');
+        }
+        script.push_str("EOF\nexit 0\n");
+        script
+    }
+
+    /// The Windows fake: a `.bat` file (CRLF: cmd.exe misreads
+    /// LF-only batch files). `lines` must not contain `&` or `%`
+    /// (batch metacharacters) — the canned stream-json records
+    /// used here contain neither. The argv is recorded INLINE
+    /// with `%*` (one raw line, redirection first so an argv
+    /// ending in a digit — the UUID — is not misread as a stream
+    /// number); there is deliberately NO subroutine, NO `call
+    /// :record_argv`, NO `shift`/`goto` loop: a subroutine only
+    /// sees arguments passed after its label, and v1 passed
+    /// none, so the marker was never written. The delegate argv
+    /// must also contain no cmd.exe metacharacters (`& | < >
+    /// ^`) or `%` besides the `%*` itself — the prompt contains
+    /// none (only `"`, `{`, `}`, `:`, `,` and spaces), so the
+    /// raw `echo %*` line prints it verbatim.
+    fn fake_zen_bat_script(marker: Option<&Path>, lines: &[&str]) -> String {
+        let mut script = String::from("@echo off\r\n");
+        script.push_str("if \"%~1\"==\"--version\" (\r\n  echo zen 0.1.0\r\n  exit /b 0\r\n)\r\n");
+        if let Some(marker) = marker {
+            script.push_str(&format!(">\"{}\" echo %*\r\n", marker.display()));
+        }
+        for line in lines {
+            script.push_str("echo ");
+            script.push_str(line);
+            script.push_str("\r\n");
+        }
+        script.push_str("exit /b 0\r\n");
+        script
+    }
+
+    /// On Windows the marker holds the raw `%*` command line,
+    /// not one argv per line: find `--mcp-config` and take the
+    /// next token (quoted `"..."` or bare up to whitespace) as
+    /// the config path. A config path never contains `"`, so
+    /// this split is exact for the path even though the prompt
+    /// later in the line cannot be split reliably.
+    #[cfg(windows)]
+    fn windows_config_path_from_raw_argv(raw: &str) -> &str {
+        let rest = raw
+            .split("--mcp-config")
+            .nth(1)
+            .expect("marker must record --mcp-config");
+        let rest = rest.trim_start();
+        if let Some(quoted) = rest.strip_prefix('"') {
+            quoted.split('"').next().unwrap_or("")
+        } else {
+            rest.split_whitespace().next().unwrap_or("")
+        }
+    }
+
+    const HAPPY_LINES: &[&str] = &[
+        r#"{"type":"system","subtype":"init","session_id":"s1","cwd":"/tmp","model":"m:free","tools":[],"mcp_servers":[],"permissionMode":"default","slash_commands":[],"v":1}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"echo: hello","duration_ms":7,"num_turns":1,"usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0},"model":"m:free","session_id":"s1","v":1}"#,
+    ];
+
+    const ERR_LINES: &[&str] = &[
+        r#"{"type":"result","subtype":"error","is_error":true,"result":"tool exploded","duration_ms":3,"num_turns":1,"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0},"model":"m:free","session_id":"s1","v":1}"#,
+    ];
 
     fn stdio_config() -> McpServerConfig {
         McpServerConfig {
@@ -617,14 +725,52 @@ exit 0"#;
     }
 
     #[test]
+    fn windows_fake_bat_script_records_argv_and_prints_turn() {
+        // Static guard for the Windows fake: there is no Windows
+        // box here, so the .bat text is checked line by line
+        // instead of spawned (the real spawn is proven by CI on
+        // the PR). The marker path is a Windows path on purpose:
+        // backslashes must survive verbatim into the file.
+        let marker = std::path::Path::new(r"C:\Users\runner\AppData\Local\Temp\sen_mcp_argv_1");
+        let script = fake_zen_bat_script(Some(marker), HAPPY_LINES);
+        assert!(script.starts_with("@echo off\r\n"));
+        assert!(
+            script.contains("if \"%~1\"==\"--version\" (\r\n  echo zen 0.1.0\r\n  exit /b 0\r\n)")
+        );
+        // Regression guard for the v1 failure (verify FAIL 19/11):
+        // the argv is recorded INLINE with %* in the script body.
+        // There must be NO subroutine at all: v1 called
+        // `call :record_argv` with no arguments, and a `call
+        // :label` subroutine only sees arguments passed after
+        // the label, so %1 was empty at once and the marker was
+        // never written. A bare `call :record_argv` anywhere in
+        // this text fails this test by design.
+        assert!(script.contains(&format!(">\"{}\" echo %*\r\n", marker.display())));
+        assert!(!script.contains("call :record_argv"));
+        assert!(!script.contains(":record_argv"));
+        assert!(!script.contains("record_argv"));
+        assert!(!script.contains("shift\r\n"));
+        assert!(!script.contains("goto :record_argv"));
+        // The canned turn is echoed line by line, then exit 0.
+        assert!(script.contains(&format!("echo {}\r\n", HAPPY_LINES[0])));
+        assert!(script.contains(&format!("echo {}\r\n", HAPPY_LINES[1])));
+        assert!(script.contains("\r\nexit /b 0\r\n"));
+        // No marker, no argv recording at all (the error-result
+        // test's fake).
+        let no_marker = fake_zen_bat_script(None, ERR_LINES);
+        assert!(!no_marker.contains("record_argv"));
+        assert!(!no_marker.contains("echo %*"));
+        assert!(no_marker.contains(&format!("echo {}\r\n", ERR_LINES[0])));
+        // CRLF throughout: cmd.exe misreads LF-only batch files.
+        assert!(!script.replace("\r\n", "").contains('\n'));
+        assert!(!no_marker.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
     fn delegate_turn_passes_mcp_config_and_returns_result_text() {
         let marker = std::env::temp_dir().join(format!("sen_mcp_argv_{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
-        let body = format!(
-            "printf '%s\\n' \"$@\" > '{marker}'\n{HAPPY_BODY}",
-            marker = marker.display()
-        );
-        let bin = fake_zen("delegate", &body);
+        let bin = fake_zen("delegate", Some(&marker), HAPPY_LINES);
         let bridge = CliBridge::new(Some(bin), DELEGATE_SESSION, "m:free", None);
         let events: Arc<Mutex<Vec<SenEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
@@ -647,19 +793,68 @@ exit 0"#;
         assert_eq!(result.subtype, "success");
         // The spawned argv really carried --mcp-config pointing at a
         // file that held the server config...
-        let argv = std::fs::read_to_string(&marker).unwrap();
-        let argv: Vec<&str> = argv.lines().collect();
-        let cfg_pos = argv.iter().position(|a| *a == "--mcp-config").unwrap();
-        let cfg_path = argv[cfg_pos + 1];
-        // ...and the temp dir is gone after the turn (guard drop).
-        assert!(
-            !std::path::Path::new(cfg_path).exists(),
-            "temp config file must be removed after the turn"
-        );
-        assert_eq!(
-            argv.last().unwrap(),
-            &build_delegate_prompt("calc", "echo", &serde_json::json!({"hello": "world"}))
-        );
+        let recorded = std::fs::read_to_string(&marker).unwrap();
+        #[cfg(windows)]
+        {
+            // Windows: the marker holds ONE raw `%*` line, not one
+            // argv per line, so exact argv equality is NOT
+            // asserted here: Rust escapes `.bat` arguments per
+            // cmd.exe rules and warns some characters may not be
+            // safely escapable (std docs, `std::process`, "Batch
+            // file special handling"), and the prompt contains
+            // `"`, which cmd.exe reads as a quote toggle with a
+            // literal backslash — not the MSVC `\"` escape — so
+            // the prompt cannot be reconstructed token by token
+            // from the raw line. What IS asserted: --mcp-config
+            // is present, the config path after it is a real
+            // (now removed) temp file, and quote-free fragments
+            // of the prompt survived the round trip verbatim.
+            assert!(
+                recorded.contains("--mcp-config"),
+                "marker must record --mcp-config, got: {recorded}"
+            );
+            assert!(recorded.contains("mcp-servers.json"));
+            assert!(recorded.contains(DELEGATE_SESSION));
+            let cfg_path = windows_config_path_from_raw_argv(&recorded);
+            assert!(!cfg_path.is_empty(), "config path must follow --mcp-config");
+            // ...and the temp dir is gone after the turn (guard drop).
+            assert!(
+                !std::path::Path::new(cfg_path).exists(),
+                "temp config file must be removed after the turn"
+            );
+            for fragment in [
+                "Call the MCP tool",
+                "on MCP server",
+                "with arguments",
+                "Reply with only the tool result",
+                "calc",
+                "echo",
+                "hello",
+                "world",
+            ] {
+                assert!(
+                    recorded.contains(fragment),
+                    "marker must contain prompt fragment {fragment:?}, got: {recorded}"
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix: the sh fake records one argv per line, so
+            // exact argv equality holds here and stays asserted.
+            let argv: Vec<&str> = recorded.lines().collect();
+            let cfg_pos = argv.iter().position(|a| *a == "--mcp-config").unwrap();
+            let cfg_path = argv[cfg_pos + 1];
+            // ...and the temp dir is gone after the turn (guard drop).
+            assert!(
+                !std::path::Path::new(cfg_path).exists(),
+                "temp config file must be removed after the turn"
+            );
+            assert_eq!(
+                argv.last().unwrap(),
+                &build_delegate_prompt("calc", "echo", &serde_json::json!({"hello": "world"}))
+            );
+        }
         let _ = std::fs::remove_file(&marker);
     }
 
@@ -667,11 +862,7 @@ exit 0"#;
     fn delegate_turn_rejects_bad_config_before_spawn() {
         let marker = std::env::temp_dir().join(format!("sen_mcp_nospawn_{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
-        let body = format!(
-            "printf '%s\\n' \"$@\" > '{marker}'\n{HAPPY_BODY}",
-            marker = marker.display()
-        );
-        let bin = fake_zen("nospawn", &body);
+        let bin = fake_zen("nospawn", Some(&marker), HAPPY_LINES);
         let bridge = CliBridge::new(Some(bin), DELEGATE_SESSION, "m:free", None);
         let mut emit = |_: SenEvent| {};
         let bad = McpServerConfig {
@@ -716,11 +907,7 @@ exit 0"#;
 
     #[test]
     fn delegate_turn_returns_error_result_as_turn_result() {
-        let body = r#"cat <<'EOF'
-{"type":"result","subtype":"error","is_error":true,"result":"tool exploded","duration_ms":3,"num_turns":1,"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0},"model":"m:free","session_id":"s1","v":1}
-EOF
-exit 0"#;
-        let bin = fake_zen("errresult", body);
+        let bin = fake_zen("errresult", None, ERR_LINES);
         let bridge = CliBridge::new(Some(bin), DELEGATE_SESSION, "m:free", None);
         let mut emit = |_: SenEvent| {};
         let input = McpDelegateInput {
