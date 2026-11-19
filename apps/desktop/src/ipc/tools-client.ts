@@ -18,6 +18,10 @@ export interface Approval {
   /** Epoch seconds after which the grant no longer counts (P1-4:
    * the Rust grant expires APPROVAL_TTL_SECS after it is granted). */
   expiresAtSecs: number;
+  /** The live session this grant belongs to (P1-4 Rust session,
+   * 19/11): a grant never authorizes a call in another session,
+   * even with the same tool + idempotency key. */
+  sessionId: string;
 }
 
 export type ApprovalTier = "auto" | "ask-first" | "never";
@@ -48,7 +52,9 @@ function asApproval(value: unknown): Approval {
     typeof res.grantedAt !== "string" ||
     !res.grantedAt ||
     typeof res.expiresAtSecs !== "number" ||
-    !Number.isFinite(res.expiresAtSecs)
+    !Number.isFinite(res.expiresAtSecs) ||
+    typeof res.sessionId !== "string" ||
+    !res.sessionId
   ) {
     throw new Error(
       "Backend approval malformed, FAIL: " + JSON.stringify(value),

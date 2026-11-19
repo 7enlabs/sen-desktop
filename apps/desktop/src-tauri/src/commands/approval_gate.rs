@@ -163,13 +163,16 @@ impl ToolPolicy {
     }
 }
 
-/// One explicit approval: granted by a person, for one tool call.
-/// A grant is bounded two ways (Sen P1-4, same as the TS side): it
-/// expires APPROVAL_TTL_SECS after it is granted, and it is spent
-/// the first time a gate allows a call with it — a second call with
-/// the same tool + key waits for a fresh approval. Expiry is
-/// epoch seconds (no chrono in this crate), matching the
-/// `epoch-<seconds>` shape of granted_at.
+/// One explicit approval: granted by a person, for one tool call,
+/// in one live session. A grant is bounded three ways (Sen P1-4,
+/// same as the TS side): it belongs to exactly one session (the
+/// live session's id — the SessionManager key / CLI --session-id
+/// UUID, never invented by the gate), it expires APPROVAL_TTL_SECS
+/// after it is granted, and it is spent the first time a gate allows
+/// a call with it — a second call with the same tool + key waits for
+/// a fresh approval, and a call in another session never sees this
+/// grant at all. Expiry is epoch seconds (no chrono in this crate),
+/// matching the `epoch-<seconds>` shape of granted_at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Approval {
@@ -179,6 +182,10 @@ pub struct Approval {
     pub granted_at: String,
     /// Epoch seconds after which the grant no longer counts.
     pub expires_at_secs: u64,
+    /// The live session this grant belongs to. A grant never
+    /// authorizes a call in another session, even with the same
+    /// tool + idempotency key.
+    pub session_id: String,
 }
 
 /// Default lifetime of a grant: 15 minutes, the same window as
@@ -187,11 +194,14 @@ pub struct Approval {
 /// that an approval from long ago can never authorize a later run.
 pub const APPROVAL_TTL_SECS: u64 = 15 * 60;
 
-/// In-memory approval grants. A grant matches one tool + one key,
-/// lives at most APPROVAL_TTL_SECS, and is spent on first use.
+/// In-memory approval grants. A grant matches one session + one
+/// tool + one key, lives at most APPROVAL_TTL_SECS, and is spent on
+/// first use. The session is the first key part on purpose: the
+/// same tool + key in another session is a different grant, so a
+/// session can never spend another session's approval.
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalStore {
-    grants: HashMap<(String, String), Approval>,
+    grants: HashMap<(String, String, String), Approval>,
 }
 
 fn epoch_seconds_now_u64() -> u64 {
@@ -212,8 +222,27 @@ impl ApprovalStore {
         }
     }
 
-    pub fn grant(&mut self, tool_name: &str, idempotency_key: &str, granted_by: &str) -> Approval {
-        self.grant_with_ttl(tool_name, idempotency_key, granted_by, APPROVAL_TTL_SECS)
+    /// Grant one approval for one tool + key in one session. The
+    /// session id is the live session's id (SessionManager key /
+    /// CLI --session-id UUID), never invented here: callers pass the
+    /// session they are granting for, and the Tauri boundary
+    /// (Registry::approve_tool) rejects an empty one before this
+    /// runs. Argument order mirrors the TS side:
+    /// grant(tool, key, by, sessionId).
+    pub fn grant(
+        &mut self,
+        tool_name: &str,
+        idempotency_key: &str,
+        granted_by: &str,
+        session_id: &str,
+    ) -> Approval {
+        self.grant_with_ttl(
+            tool_name,
+            idempotency_key,
+            granted_by,
+            session_id,
+            APPROVAL_TTL_SECS,
+        )
     }
 
     /// Grant with an explicit lifetime in seconds. A ttl of 0
@@ -224,6 +253,7 @@ impl ApprovalStore {
         tool_name: &str,
         idempotency_key: &str,
         granted_by: &str,
+        session_id: &str,
         ttl_secs: u64,
     ) -> Approval {
         let granted_secs = epoch_seconds_now_u64();
@@ -231,6 +261,7 @@ impl ApprovalStore {
             tool_name,
             idempotency_key,
             granted_by,
+            session_id,
             granted_secs.saturating_add(ttl_secs),
         )
     }
@@ -243,6 +274,7 @@ impl ApprovalStore {
         tool_name: &str,
         idempotency_key: &str,
         granted_by: &str,
+        session_id: &str,
         expires_at_secs: u64,
     ) -> Approval {
         let approval = Approval {
@@ -251,9 +283,14 @@ impl ApprovalStore {
             granted_by: granted_by.to_string(),
             granted_at: epoch_seconds_now(),
             expires_at_secs,
+            session_id: session_id.to_string(),
         };
         self.grants.insert(
-            (tool_name.to_string(), idempotency_key.to_string()),
+            (
+                session_id.to_string(),
+                tool_name.to_string(),
+                idempotency_key.to_string(),
+            ),
             approval.clone(),
         );
         approval
@@ -263,8 +300,20 @@ impl ApprovalStore {
         approval.expires_at_secs <= now_secs
     }
 
-    pub fn find(&mut self, tool_name: &str, idempotency_key: &str) -> Option<Approval> {
-        let key = (tool_name.to_string(), idempotency_key.to_string());
+    /// Look a grant up by session + tool + key. A grant from
+    /// another session reads as absent here, exactly like a grant
+    /// that was never made.
+    pub fn find(
+        &mut self,
+        tool_name: &str,
+        idempotency_key: &str,
+        session_id: &str,
+    ) -> Option<Approval> {
+        let key = (
+            session_id.to_string(),
+            tool_name.to_string(),
+            idempotency_key.to_string(),
+        );
         let found = self.grants.get(&key).cloned()?;
         // An expired grant counts as absent, and is dropped so it
         // can never be honored later: expiry is enforced on read,
@@ -279,18 +328,32 @@ impl ApprovalStore {
     /// Spend a grant: return it only if it is still live, and
     /// remove it either way, so one approval authorizes exactly
     /// one allowed call. Returns None for an absent or expired
-    /// grant.
-    pub fn consume(&mut self, tool_name: &str, idempotency_key: &str) -> Option<Approval> {
-        let found = self.find(tool_name, idempotency_key)?;
-        self.grants
-            .remove(&(tool_name.to_string(), idempotency_key.to_string()));
+    /// grant — including a grant that belongs to another session.
+    pub fn consume(
+        &mut self,
+        tool_name: &str,
+        idempotency_key: &str,
+        session_id: &str,
+    ) -> Option<Approval> {
+        let found = self.find(tool_name, idempotency_key, session_id)?;
+        self.grants.remove(&(
+            session_id.to_string(),
+            tool_name.to_string(),
+            idempotency_key.to_string(),
+        ));
         Some(found)
     }
 
     /// Revoking a grant removes the grant, never a log entry.
-    pub fn revoke(&mut self, tool_name: &str, idempotency_key: &str) -> bool {
+    /// Scoped to the session: revoking in the wrong session removes
+    /// nothing and returns false.
+    pub fn revoke(&mut self, tool_name: &str, idempotency_key: &str, session_id: &str) -> bool {
         self.grants
-            .remove(&(tool_name.to_string(), idempotency_key.to_string()))
+            .remove(&(
+                session_id.to_string(),
+                tool_name.to_string(),
+                idempotency_key.to_string(),
+            ))
             .is_some()
     }
 
@@ -302,8 +365,9 @@ impl ApprovalStore {
             .retain(|_, approval| !Self::is_expired(approval, now_secs));
         let mut approvals: Vec<Approval> = self.grants.values().cloned().collect();
         approvals.sort_by(|a, b| {
-            a.tool_name
-                .cmp(&b.tool_name)
+            a.session_id
+                .cmp(&b.session_id)
+                .then(a.tool_name.cmp(&b.tool_name))
                 .then(a.idempotency_key.cmp(&b.idempotency_key))
         });
         approvals
@@ -462,11 +526,15 @@ pub struct GateEvaluation {
 /// reads as absent here too; a live grant is never spent by this
 /// function — only the caller that acts on an allow spends it.)
 /// Takes &mut approvals because find() drops expired grants.
+/// The session id scopes the approval lookup: a grant from another
+/// session is no grant at all, so the call waits for its own
+/// approval.
 pub fn evaluate_tool_call(
     policy: &ToolPolicy,
     approvals: &mut ApprovalStore,
     tool: &str,
     idempotency_key: &str,
+    session_id: &str,
 ) -> GateEvaluation {
     let tier = classify_tool(tool);
     if tier == ApprovalTier::Never {
@@ -487,7 +555,7 @@ pub fn evaluate_tool_call(
         };
     }
     if tier == ApprovalTier::AskFirst {
-        match approvals.find(tool, idempotency_key) {
+        match approvals.find(tool, idempotency_key, session_id) {
             None => {
                 return GateEvaluation {
                     tier,
@@ -528,8 +596,9 @@ pub fn gate_tool_call(
     actor: &str,
     tool: &str,
     idempotency_key: &str,
+    session_id: &str,
 ) -> GateEvaluation {
-    let evaluation = evaluate_tool_call(policy, approvals, tool, idempotency_key);
+    let evaluation = evaluate_tool_call(policy, approvals, tool, idempotency_key, session_id);
     log.record(
         actor,
         tool,
@@ -538,7 +607,7 @@ pub fn gate_tool_call(
         &evaluation.reason,
     );
     if evaluation.decision == GateDecision::Allow && evaluation.tier == ApprovalTier::AskFirst {
-        approvals.consume(tool, idempotency_key);
+        approvals.consume(tool, idempotency_key, session_id);
     }
     evaluation
 }
@@ -625,7 +694,7 @@ mod tests {
         let policy = ToolPolicy::new();
         let mut approvals = ApprovalStore::new();
         for tool in ["read_file", "send_message", "trade_securities"] {
-            let eval = evaluate_tool_call(&policy, &mut approvals, tool, "k1");
+            let eval = evaluate_tool_call(&policy, &mut approvals, tool, "k1", "s1");
             assert_eq!(eval.decision, GateDecision::Deny, "{tool}");
         }
     }
@@ -634,7 +703,7 @@ mod tests {
     fn auto_tool_allowed_only_with_an_explicit_rule() {
         let mut approvals = ApprovalStore::new();
         let policy = policy_allowing(&["read_file"]);
-        let eval = evaluate_tool_call(&policy, &mut approvals, "read_file", "k1");
+        let eval = evaluate_tool_call(&policy, &mut approvals, "read_file", "k1", "s1");
         assert_eq!(eval.tier, ApprovalTier::Auto);
         assert_eq!(eval.decision, GateDecision::Allow);
         assert!(eval.reason.contains("auto-tier and explicitly allowed"));
@@ -644,14 +713,14 @@ mod tests {
     fn ask_first_blocked_without_approval_allowed_with_it() {
         let policy = policy_allowing(&["send_message"]);
         let mut approvals = ApprovalStore::new();
-        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k1");
+        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k1", "s1");
         assert_eq!(eval.decision, GateDecision::AskFirst);
-        approvals.grant("send_message", "k1", "zen");
-        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k1");
+        approvals.grant("send_message", "k1", "zen", "s1");
+        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k1", "s1");
         assert_eq!(eval.decision, GateDecision::Allow);
         assert!(eval.reason.contains("approved by zen"));
         // A different key is a different call: still waiting.
-        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k2");
+        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k2", "s1");
         assert_eq!(eval.decision, GateDecision::AskFirst);
     }
 
@@ -659,8 +728,8 @@ mod tests {
     fn ask_first_approval_without_a_policy_rule_still_denies() {
         let policy = ToolPolicy::new();
         let mut approvals = ApprovalStore::new();
-        approvals.grant("delete_file", "k1", "zen");
-        let eval = evaluate_tool_call(&policy, &mut approvals, "delete_file", "k1");
+        approvals.grant("delete_file", "k1", "zen", "s1");
+        let eval = evaluate_tool_call(&policy, &mut approvals, "delete_file", "k1", "s1");
         assert_eq!(eval.decision, GateDecision::Deny);
         assert!(eval.reason.contains("default-deny"));
     }
@@ -671,8 +740,8 @@ mod tests {
             policy_allowing(&["trade_securities", "transfer_money", "access_other_account"]);
         let mut approvals = ApprovalStore::new();
         for tool in ["trade_securities", "transfer_money", "access_other_account"] {
-            approvals.grant(tool, "k1", "zen");
-            let eval = evaluate_tool_call(&policy, &mut approvals, tool, "k1");
+            approvals.grant(tool, "k1", "zen", "s1");
+            let eval = evaluate_tool_call(&policy, &mut approvals, tool, "k1", "s1");
             assert_eq!(eval.tier, ApprovalTier::Never, "{tool}");
             assert_eq!(eval.decision, GateDecision::Deny, "{tool}");
             assert!(eval.reason.contains("no approval path"), "{tool}");
@@ -682,19 +751,22 @@ mod tests {
     #[test]
     fn approval_store_grant_find_revoke_list() {
         let mut store = ApprovalStore::new();
-        assert_eq!(store.find("send_message", "k1"), None);
-        let approval = store.grant("send_message", "k1", "zen");
+        assert_eq!(store.find("send_message", "k1", "s1"), None);
+        let approval = store.grant("send_message", "k1", "zen", "s1");
         assert_eq!(approval.tool_name, "send_message");
         assert_eq!(approval.granted_by, "zen");
         assert!(!approval.granted_at.is_empty());
         // A grant expires APPROVAL_TTL_SECS after it is granted.
         assert!(approval.expires_at_secs > 0);
-        assert_eq!(store.find("send_message", "k1"), Some(approval.clone()));
-        assert_eq!(store.find("send_message", "k2"), None);
+        assert_eq!(
+            store.find("send_message", "k1", "s1"),
+            Some(approval.clone())
+        );
+        assert_eq!(store.find("send_message", "k2", "s1"), None);
         assert_eq!(store.list().len(), 1);
-        assert!(store.revoke("send_message", "k1"));
-        assert!(!store.revoke("send_message", "k1"));
-        assert_eq!(store.find("send_message", "k1"), None);
+        assert!(store.revoke("send_message", "k1", "s1"));
+        assert!(!store.revoke("send_message", "k1", "s1"));
+        assert_eq!(store.find("send_message", "k1", "s1"), None);
         assert!(store.list().is_empty());
     }
 
@@ -712,14 +784,14 @@ mod tests {
         assert_eq!(APPROVAL_TTL_SECS, 15 * 60);
         let mut store = ApprovalStore::new();
         let before = epoch_now();
-        let approval = store.grant("send_message", "k1", "zen");
+        let approval = store.grant("send_message", "k1", "zen", "s1");
         let after = epoch_now();
         // Expiry is granted-at + TTL, within the seconds this test took.
         assert!(approval.expires_at_secs >= before + APPROVAL_TTL_SECS);
         assert!(approval.expires_at_secs <= after + APPROVAL_TTL_SECS);
         // A custom TTL shifts the expiry by exactly that many seconds.
         let before_short = epoch_now();
-        let short = store.grant_with_ttl("send_message", "k2", "zen", 60);
+        let short = store.grant_with_ttl("send_message", "k2", "zen", "s1", 60);
         let after_short = epoch_now();
         assert!(short.expires_at_secs >= before_short + 60);
         assert!(short.expires_at_secs <= after_short + 60);
@@ -730,26 +802,66 @@ mod tests {
         let policy = policy_allowing(&["send_message"]);
         let mut approvals = ApprovalStore::new();
         // Granted with an expiry already in the past: dead on arrival.
-        approvals.grant_with_expiry("send_message", "k-exp", "boss", epoch_now() - 10);
-        assert_eq!(approvals.find("send_message", "k-exp"), None);
+        approvals.grant_with_expiry("send_message", "k-exp", "boss", "s1", epoch_now() - 10);
+        assert_eq!(approvals.find("send_message", "k-exp", "s1"), None);
         assert!(approvals.list().is_empty());
-        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k-exp");
+        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k-exp", "s1");
         assert_eq!(eval.decision, GateDecision::AskFirst);
+    }
+
+    // --- P1-4 Rust session (19/11, tin 16891): a grant belongs to
+    // one live session. Same tool + key in another session is a
+    // different grant; session A can never spend session B's grant.
+
+    #[test]
+    fn grant_in_one_session_cannot_authorize_another_session() {
+        let policy = policy_allowing(&["send_message"]);
+        let mut approvals = ApprovalStore::new();
+        let granted = approvals.grant("send_message", "k1", "zen", "s-A");
+        assert_eq!(granted.session_id, "s-A");
+        // Store level: the other session sees nothing, spends
+        // nothing, revokes nothing.
+        assert_eq!(approvals.find("send_message", "k1", "s-B"), None);
+        assert_eq!(approvals.consume("send_message", "k1", "s-B"), None);
+        assert!(!approvals.revoke("send_message", "k1", "s-B"));
+        assert!(approvals.find("send_message", "k1", "s-A").is_some());
+        // Gate level: session B waits, session A passes.
+        let eval_b = evaluate_tool_call(&policy, &mut approvals, "send_message", "k1", "s-B");
+        assert_eq!(eval_b.decision, GateDecision::AskFirst);
+        let eval_a = evaluate_tool_call(&policy, &mut approvals, "send_message", "k1", "s-A");
+        assert_eq!(eval_a.decision, GateDecision::Allow);
+        // Session B still waits after A was allowed (evaluate spends
+        // nothing); the grant is still A's until the gate spends it.
+        assert!(approvals.find("send_message", "k1", "s-A").is_some());
+    }
+
+    #[test]
+    fn same_tool_and_key_in_two_sessions_are_two_grants() {
+        let mut store = ApprovalStore::new();
+        let a = store.grant("send_message", "k1", "zen", "s-A");
+        let b = store.grant("send_message", "k1", "zen", "s-B");
+        assert_ne!(a.session_id, b.session_id);
+        assert_eq!(store.list().len(), 2);
+        // Spending A's grant leaves B's untouched.
+        assert!(store.consume("send_message", "k1", "s-A").is_some());
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].session_id, "s-B");
+        assert!(store.find("send_message", "k1", "s-B").is_some());
     }
 
     #[test]
     fn approval_is_single_use_through_consume_and_gate_tool_call() {
         let policy = policy_allowing(&["send_message"]);
         let mut approvals = ApprovalStore::new();
-        approvals.grant("send_message", "k1", "zen");
+        approvals.grant("send_message", "k1", "zen", "s1");
         // consume() spends the grant: the second consume finds nothing.
-        let spent = approvals.consume("send_message", "k1");
+        let spent = approvals.consume("send_message", "k1", "s1");
         assert!(spent.is_some());
         assert_eq!(spent.unwrap().granted_by, "zen");
-        assert_eq!(approvals.consume("send_message", "k1"), None);
+        assert_eq!(approvals.consume("send_message", "k1", "s1"), None);
         // gate_tool_call spends it too: first call allows, the same
         // tool + key again waits for a fresh approval.
-        approvals.grant("send_message", "k1", "zen");
+        approvals.grant("send_message", "k1", "zen", "s1");
         let mut log = ActivityLog::new();
         let first = gate_tool_call(
             &policy,
@@ -758,9 +870,10 @@ mod tests {
             "tester",
             "send_message",
             "k1",
+            "s1",
         );
         assert_eq!(first.decision, GateDecision::Allow);
-        assert_eq!(approvals.find("send_message", "k1"), None);
+        assert_eq!(approvals.find("send_message", "k1", "s1"), None);
         let second = gate_tool_call(
             &policy,
             &mut approvals,
@@ -768,6 +881,7 @@ mod tests {
             "tester",
             "send_message",
             "k1",
+            "s1",
         );
         assert_eq!(second.decision, GateDecision::AskFirst);
         assert_eq!(
@@ -785,10 +899,10 @@ mod tests {
         // the caller that acts on an allow (gate_tool_call) spends it.
         let policy = policy_allowing(&["send_message"]);
         let mut approvals = ApprovalStore::new();
-        approvals.grant("send_message", "k1", "zen");
-        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k1");
+        approvals.grant("send_message", "k1", "zen", "s1");
+        let eval = evaluate_tool_call(&policy, &mut approvals, "send_message", "k1", "s1");
         assert_eq!(eval.decision, GateDecision::Allow);
-        assert!(approvals.find("send_message", "k1").is_some());
+        assert!(approvals.find("send_message", "k1", "s1").is_some());
     }
 
     #[test]
@@ -804,6 +918,7 @@ mod tests {
             "tester",
             "read_file",
             "k1",
+            "s1",
         );
         assert_eq!(a.decision, GateDecision::Allow);
         let b = gate_tool_call(
@@ -813,6 +928,7 @@ mod tests {
             "tester",
             "send_message",
             "k1",
+            "s1",
         );
         assert_eq!(b.decision, GateDecision::AskFirst);
         let c = gate_tool_call(
@@ -822,6 +938,7 @@ mod tests {
             "tester",
             "trade_securities",
             "k1",
+            "s1",
         );
         assert_eq!(c.decision, GateDecision::Deny);
         assert_eq!(log.len(), 3);

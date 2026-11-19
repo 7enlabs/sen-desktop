@@ -21,6 +21,14 @@ export interface ActionContract {
   timeoutMs: number;
   approvalRequired: boolean;
   auditRequired: boolean;
+  /** The live session this contract acts for (P1-4 Rust session,
+   * 19/11): the SessionManager key / CLI --session-id UUID, set by
+   * the frontend contract builder from the session it created.
+   * Optional on the shared type because settings/memory reads have
+   * no session to scope to; the tool path (sen_tool_call /
+   * sen_tool_approve / sen_tool_revoke) rejects a contract without
+   * one, fail closed. */
+  sessionId?: string;
 }
 
 export interface SessionRequest {

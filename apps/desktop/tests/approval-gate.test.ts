@@ -52,6 +52,7 @@ function contract(): ActionContract {
     timeoutMs: 1000,
     approvalRequired: false,
     auditRequired: false,
+    sessionId: SESSION_ID,
   };
 }
 
@@ -705,18 +706,38 @@ test("tools-client approve: invokes sen_tool_approve with the grant under args",
       grantedBy: "zen",
       grantedAt: "epoch-1",
       expiresAtSecs: 1793123456,
+      sessionId: SESSION_ID,
     };
   });
   try {
     const approval = await approveTool(contract(), "send_message", "k1", "zen");
     assert.equal(approval.grantedBy, "zen");
     assert.equal(approval.expiresAtSecs, 1793123456);
+    assert.equal(approval.sessionId, SESSION_ID);
     assert.equal(seen[0]["command"], "sen_tool_approve");
     assert.deepEqual(seen[0]["args"], {
       toolName: "send_message",
       idempotencyKey: "k1",
       grantedBy: "zen",
     });
+  } finally {
+    setBridgeTransport(null);
+  }
+});
+
+test("tools-client approve: an approval without a session id fails loudly", async () => {
+  setBridgeTransport(async () => ({
+    toolName: "send_message",
+    idempotencyKey: "k1",
+    grantedBy: "zen",
+    grantedAt: "epoch-1",
+    expiresAtSecs: 1793123456,
+  }));
+  try {
+    await assert.rejects(
+      () => approveTool(contract(), "send_message", "k1", "zen"),
+      /malformed/,
+    );
   } finally {
     setBridgeTransport(null);
   }
@@ -907,6 +928,11 @@ test("tools-client approve: payload matches the Rust handler wire shape (CI P2-6
       grantedBy: "zen",
       grantedAt: "epoch-1",
       expiresAtSecs: 1793123456,
+      // TS4 (rebase2, 19/11): the real backend returns sessionId on
+      // every grant and asApproval rejects one without it, so the
+      // stub must model the post-TS4 backend. Wire-shape asserts
+      // below are untouched (CI P2-6).
+      sessionId: SESSION_ID,
     },
     () => approveTool(contract(), "send_message", "k1", "zen"),
   );

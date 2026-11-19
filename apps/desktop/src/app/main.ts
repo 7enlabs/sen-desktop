@@ -106,7 +106,9 @@ export interface StartedApp {
 
 // The one contract for the app session lifecycle. The id and the
 // idempotency key are unique per start, so a second app start never
-// reuses the first start's key.
+// reuses the first start's key. The session id rides the contract
+// (P1-4 Rust session, 19/11): the backend keys every approval by
+// it, so a grant from another session never authorizes a call here.
 function appLiveContract(sessionId: string): ActionContract {
   const nonce = sessionId + "-" + Date.now();
   return {
@@ -123,6 +125,7 @@ function appLiveContract(sessionId: string): ActionContract {
     timeoutMs: 120000,
     approvalRequired: false,
     auditRequired: false,
+    sessionId,
   };
 }
 
@@ -190,6 +193,7 @@ function chatContract(
     timeoutMs: 120000,
     approvalRequired: false,
     auditRequired: false,
+    sessionId,
   };
 }
 

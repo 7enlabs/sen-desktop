@@ -25,6 +25,10 @@ pub const SEN_SESSION_EVENT: &str = "sen-session-event";
 /// Wire contract, camelCase on the wire to match
 /// apps/desktop/src/ipc/types.ts exactly. The registry struct uses
 /// snake_case internally; this conversion is the only mapping here.
+/// session_id has a serde default ("" when an older frontend sends
+/// a contract without it): the tool path rejects an empty session
+/// id before any gate evaluation, so an old payload fails closed
+/// instead of failing to deserialize.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContractArgs {
@@ -41,6 +45,8 @@ pub struct ContractArgs {
     pub timeout_ms: u64,
     pub approval_required: bool,
     pub audit_required: bool,
+    #[serde(default)]
+    pub session_id: String,
 }
 
 impl ContractArgs {
@@ -59,6 +65,7 @@ impl ContractArgs {
             timeout_ms: self.timeout_ms,
             approval_required: self.approval_required,
             audit_required: self.audit_required,
+            session_id: self.session_id.clone(),
         }
     }
 }

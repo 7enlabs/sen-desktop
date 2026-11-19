@@ -7,9 +7,12 @@
 // passes, sen_tool_call still ends in TOOL_EXECUTION_NOT_WIRED, and
 // that is honest — permission granted is not execution.
 // sen_tool_approve grants one approval (one tool + one idempotency
-// key, by a named granter); sen_tool_revoke removes one approval
-// (one tool + one idempotency key, true when a live grant was
-// removed); sen_tool_activity_log reads the log back.
+// key in one session, by a named granter); sen_tool_revoke removes
+// one approval (one tool + one idempotency key in one session, true
+// when a live grant was removed); sen_tool_activity_log reads the
+// log back. The session id rides the ActionContract (the live
+// session's id, set by the frontend contract builder); a tool call,
+// grant, or revoke without one fails closed with INVALID_CONTRACT.
 // No key, token, or credential travels through any of these commands.
 use serde::Deserialize;
 use std::sync::Mutex;
@@ -44,9 +47,13 @@ pub struct ApproveToolArgs {
 }
 
 /// sen_tool_approve: grant one approval for one tool + one
-/// idempotency key. The contract is validated first (a bad contract
-/// grants nothing). A grant for a never-tier tool is recorded but
-/// never honored: the gate still refuses that tool.
+/// idempotency key in one session. The contract is validated first
+/// (a bad contract grants nothing), and the session id rides the
+/// contract (the live session's id, set by the frontend contract
+/// builder) — an empty session id grants nothing (fail closed,
+/// INVALID_CONTRACT from approve_tool). A grant for a never-tier
+/// tool is recorded but never honored: the gate still refuses that
+/// tool.
 #[tauri::command]
 pub fn sen_tool_approve(
     state: State<'_, Mutex<Registry>>,
@@ -65,7 +72,14 @@ pub fn sen_tool_approve(
         );
     }
     let mut registry = state.lock().map_err(|e| e.to_string())?;
-    Ok(registry.approve_tool(&args.tool_name, &args.idempotency_key, &args.granted_by))
+    registry
+        .approve_tool(
+            &args.tool_name,
+            &args.idempotency_key,
+            &args.granted_by,
+            &registry_contract.session_id,
+        )
+        .map_err(|e| e.to_wire())
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,13 +90,15 @@ pub struct RevokeToolArgs {
 }
 
 /// sen_tool_revoke: remove one approval (one tool + one
-/// idempotency key). The contract is validated first (a bad
-/// contract revokes nothing). Returns true when a live grant was
-/// removed, false when there was none (already spent, expired, or
-/// never granted). Revoking a grant never touches the activity log:
-/// the log has no delete path, and the removal itself is not a
-/// log entry — the next call with that tool + key is recorded as
-/// awaiting-approval like any other unapproved call.
+/// idempotency key in one session). The contract is validated first
+/// (a bad contract revokes nothing), and the session id rides the
+/// contract — revoking in the wrong session removes nothing.
+/// Returns true when a live grant was removed, false when there was
+/// none (already spent, expired, or never granted). Revoking a grant
+/// never touches the activity log: the log has no delete path, and
+/// the removal itself is not a log entry — the next call with that
+/// tool + key is recorded as awaiting-approval like any other
+/// unapproved call.
 #[tauri::command]
 pub fn sen_tool_revoke(
     state: State<'_, Mutex<Registry>>,
@@ -96,7 +112,9 @@ pub fn sen_tool_revoke(
         );
     }
     let mut registry = state.lock().map_err(|e| e.to_string())?;
-    Ok(registry.revoke_tool(&args.tool_name, &args.idempotency_key))
+    registry
+        .revoke_tool(&args.tool_name, &args.idempotency_key, &contract.session_id)
+        .map_err(|e| e.to_wire())
 }
 
 /// sen_tool_activity_log: read back the append-only activity log
