@@ -50,9 +50,13 @@ grants permission, execution is a later phase.
   `gateToolCall` from `approval-gate.ts`). Exported from
   `packages/core/src/index.ts`.
 - `apps/desktop/src/app/morning-brief-ui.ts` — render a brief as
-  an HTML string with every value escaped. NOT wired into
-  `apps/desktop/src/app/main.ts` in P0-4; wiring is a follow-up
-  after review.
+  an HTML string with every value escaped. Wired in CI P2-9:
+  `buildAndRenderMorningBrief` builds with `buildMorningBrief` and
+  renders; `ChatSession` runs it through `/brief` (or a
+  morning-brief skill match) and `main.ts` shows the HTML in the
+  chat UI panel. The email/calendar DATA source is still not wired:
+  there is no Gmail/calendar fetch in the app yet, so /brief says
+  so honestly until a real source exists.
 
 ### The brief
 

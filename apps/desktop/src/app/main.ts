@@ -222,6 +222,23 @@ async function bootChat(): Promise<void> {
     onTranscript: (entries) => ui?.render(entries),
     onBusy: (busy) => ui?.setBusy(busy),
     onRouterStatus: (text) => ui?.setRouterStatus(text),
+    // CI P2-9 (P0-4): the brief HTML lands in the chat UI panel.
+    // What main.ts deliberately does NOT pass, and why:
+    // - No briefSource: there is no Gmail/calendar fetch in the app
+    //   yet (P0-4: "a later phase"), so /brief reports that honestly
+    //   until a real source exists; no source is invented here.
+    // - No skillMatcher, delegateToolCall, or mcpServers:
+    //   SkillRegistry reads with node:fs and McpClient /
+    //   delegateToolCallToCliCore spawn with node:child_process, and
+    //   this webview entry has neither — importing them here breaks
+    //   vite build (probe 19/11: exit 1, "Module node:fs /
+    //   node:child_process has been externalized for browser
+    //   compatibility"). The seams exist on ChatSession (see
+    //   ../chat/chat.ts) with the node-side factory in
+    //   ../chat/skill-matcher.ts; the production instantiation point
+    //   is a future Rust Tauri command (which already spawns `zen`
+    //   in cli_spawn.rs) or a node side, not this entry.
+    onBrief: (html) => ui?.showBrief(html),
     sendTelegram: async (chatId, text) => {
       await sendTelegramMessage(
         makeContract("telegram", "telegram send"),

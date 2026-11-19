@@ -13,6 +13,12 @@ export interface ChatUI {
   setTelegramStatus(text: string): void;
   // P0-3: the active model route + cost, e.g. "Model: spark · ... · 0 đồng".
   setRouterStatus(text: string): void;
+  // CI P2-9: show a built morning brief in the panel below the
+  // transcript. The HTML comes only from renderMorningBriefHtml,
+  // which escapes every email/calendar value, so setting it as
+  // innerHTML cannot inject markup — this is the one innerHTML in
+  // the UI, and the wiring-p2-9 suite proves the escaping.
+  showBrief(html: string): void;
 }
 
 export function startChatUI(root: HTMLElement, chat: ChatSession): ChatUI {
@@ -29,6 +35,13 @@ export function startChatUI(root: HTMLElement, chat: ChatSession): ChatUI {
 
   const messages = document.createElement("div");
   messages.className = "messages";
+
+  // CI P2-9: the morning-brief panel, hidden until the first brief
+  // is built (showBrief). Its content is set only from
+  // renderMorningBriefHtml, which escapes every value.
+  const briefPanel = document.createElement("section");
+  briefPanel.className = "morning-brief";
+  briefPanel.hidden = true;
 
   const typing = document.createElement("div");
   typing.className = "typing";
@@ -55,7 +68,7 @@ export function startChatUI(root: HTMLElement, chat: ChatSession): ChatUI {
     void chat.send("desktop", text);
   });
 
-  root.append(header, messages, typing, form);
+  root.append(header, messages, briefPanel, typing, form);
 
   function render(entries: TranscriptEntry[]): void {
     while (messages.firstChild) {
@@ -92,6 +105,10 @@ export function startChatUI(root: HTMLElement, chat: ChatSession): ChatUI {
     },
     setRouterStatus(text: string): void {
       routerStatus.textContent = text;
+    },
+    showBrief(html: string): void {
+      briefPanel.innerHTML = html;
+      briefPanel.hidden = false;
     },
   };
 }
