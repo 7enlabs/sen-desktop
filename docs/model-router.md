@@ -1,7 +1,8 @@
 # Sen P0-3 — Model router (BYOK + free/local routes)
 
-Status: PRODUCER BUNDLE, 16/11/2026. Verification by a verifier
-other than the producer still pending. No merge, no push.
+Status: MERGED into dev/scaffold via PR #70 (Sen P0-3 rev2), latest
+update PR #71 (Sen P0-2 rev1 evidence touch), head 780d257. Verified
+ĐẠT by SD Leader on 16/11/2026.
 
 ## OBSERVABLE_SUCCESS
 

@@ -1,9 +1,9 @@
 # Sen P0-4 — Bản tin sáng + hộp thư chủ động
 
-Status: PRODUCER BUNDLE, 16/11/2026. Verified independently by
-the seat (not the producer subagent) on 16/11: `npm test` 165 pass,
-vite build green, plus an independent gate probe (see Evidence).
-No merge, no push, no PR.
+Status: MERGED into dev/scaffold via PR #72 (Sen P0-4), latest update
+PR #101 (CI P2-9), head 780d257. Verified independently by the seat
+(not the producer subagent) on 16/11: `npm test` 165 pass, vite build
+green, plus an independent gate probe (see Evidence).
 
 ## OBSERVABLE_SUCCESS
 
