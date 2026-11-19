@@ -122,13 +122,39 @@ test("router: nextRoute walks the chain and never restarts at the first route (P
   // model_router.rs (PR #95): an unknown failed id used to return
   // the first route, which may be the route that just failed — the
   // fallback loop then retried it forever when the config changed
-  // mid-turn.
+  // mid-turn. The caller snapshots the order once per turn with
+  // resolveAttemptOrder and walks the snapshot (L2 follow-up to
+  // PR #96); nextRoute itself takes no config.
+  const order = resolveAttemptOrder(defaultRouterConfig());
+  assert.equal(nextRoute(order, "spark")?.id, "openrouter-free");
+  assert.equal(nextRoute(order, "openrouter-free")?.id, "ollama");
+  assert.equal(nextRoute(order, "ollama"), undefined);
+  assert.equal(nextRoute(order, "no-such-route"), undefined);
+  assert.equal(nextRoute(order, ""), undefined);
+});
+
+test("router: nextRoute walks a snapshot order fixed at turn start (L2 follow-up to PR #96)", () => {
+  // Mirror of next_route_in_walks_a_snapshot_order in
+  // model_router.rs: the caller snapshots once with
+  // resolveAttemptOrder, and a config change after the snapshot
+  // (preferred route moved, a route dropped) cannot move routes
+  // under the walk.
   const config = defaultRouterConfig();
-  assert.equal(nextRoute(config, "spark")?.id, "openrouter-free");
-  assert.equal(nextRoute(config, "openrouter-free")?.id, "ollama");
-  assert.equal(nextRoute(config, "ollama"), undefined);
-  assert.equal(nextRoute(config, "no-such-route"), undefined);
-  assert.equal(nextRoute(config, ""), undefined);
+  const order = resolveAttemptOrder(config);
+  assert.equal(order.length, 3);
+  assert.equal(nextRoute(order, "spark")?.id, "openrouter-free");
+  assert.equal(nextRoute(order, "openrouter-free")?.id, "ollama");
+  assert.equal(nextRoute(order, "ollama"), undefined);
+  assert.equal(nextRoute(order, "no-such-route"), undefined);
+  // Mutating the config after the snapshot leaves the walk alone.
+  config.preferredRoute = "ollama";
+  config.routes = config.routes.filter((r) => r.id !== "ollama");
+  assert.equal(nextRoute(order, "spark")?.id, "openrouter-free");
+  assert.equal(nextRoute(order, "openrouter-free")?.id, "ollama");
+  // A reordered snapshot walks the reordered order: the caller,
+  // not nextRoute, owns the snapshot.
+  const reordered = [...order].reverse();
+  assert.equal(nextRoute(reordered, "ollama")?.id, "openrouter-free");
 });
 
 test("router: BYOK is skipped without approval or without a key", () => {

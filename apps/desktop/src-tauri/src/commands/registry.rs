@@ -312,8 +312,14 @@ pub fn assert_gate_order(steps: &[&str]) -> Result<(), CommandError> {
 /// steers, so no useful state of a normal session is lost. The
 /// activity log has its own cap, MAX_ACTIVITY_LOG_ENTRIES in
 /// approval_gate.rs (10,000, same as RawLog and the TS ActivityLog).
+/// The per-session log has its own cap too (L2 follow-up to PR #97):
+/// one line per completed steer, so MAX_SESSION_LOG_ENTRIES matches
+/// MAX_COMPLETED_STEERS_PER_SESSION — the log keeps exactly the
+/// history of the steers still replayable, plus the create/abort
+/// markers, oldest first out.
 pub const MAX_SESSIONS: usize = 100;
 pub const MAX_COMPLETED_STEERS_PER_SESSION: usize = 100;
+pub const MAX_SESSION_LOG_ENTRIES: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
@@ -324,6 +330,22 @@ pub struct SessionRecord {
     /// Active model-router route id for this session (P0-3). Changes
     /// when a turn falls back to the next route.
     pub route_id: String,
+}
+
+impl SessionRecord {
+    /// Append one log line, evicting the oldest lines while the log
+    /// holds more than MAX_SESSION_LOG_ENTRIES (L2 follow-up to
+    /// PR #97). FIFO, same policy as the other P2-5 caps: the only
+    /// way a line leaves is this push path, only the oldest goes,
+    /// only past the cap. Every log write goes through here, so no
+    /// push site can grow the log past the cap.
+    fn push_log(&mut self, entry: String) {
+        self.log.push(entry);
+        if self.log.len() > MAX_SESSION_LOG_ENTRIES {
+            let excess = self.log.len() - MAX_SESSION_LOG_ENTRIES;
+            self.log.drain(..excess);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -850,7 +872,7 @@ impl Registry {
                     ),
                 ));
             }
-            record.log.push(format!("steer:{}:{}", kind, turn.subtype));
+            record.push_log(format!("steer:{}:{}", kind, turn.subtype));
             // P2-9: move the state by the turn's outcome (see the doc
             // above). A successful turn always lands on Running, from
             // either entry state; an error turn steps one failure
@@ -1062,11 +1084,11 @@ impl Registry {
         // bypasses the frontend close path (which unsubscribes first).
         record.subscribers = 0;
         match outcome {
-            AbortOutcome::NoChild => record.log.push("session_abort".to_string()),
-            AbortOutcome::ExitedAfterSigint => record.log.push("session_abort:sigint".to_string()),
-            AbortOutcome::KilledAfterGrace => record
-                .log
-                .push("session_abort:kill-after-grace".to_string()),
+            AbortOutcome::NoChild => record.push_log("session_abort".to_string()),
+            AbortOutcome::ExitedAfterSigint => record.push_log("session_abort:sigint".to_string()),
+            AbortOutcome::KilledAfterGrace => {
+                record.push_log("session_abort:kill-after-grace".to_string())
+            }
         }
         Ok(record.state)
     }
@@ -2963,5 +2985,37 @@ exit 4"#;
             SteerStart::Duplicate { .. } => {}
             other => panic!("expected Duplicate for newest key, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_log_evicts_oldest_entry_over_the_cap() {
+        // L2 follow-up to PR #97: SessionRecord.log was the one
+        // per-session field PR #97 left uncapped — one line per
+        // completed steer (plus create/abort markers), so a long
+        // session grew it without bound while completed steers
+        // were already capped at the same 100.
+        assert_eq!(MAX_SESSION_LOG_ENTRIES, 100);
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        assert_eq!(
+            reg.get("s1").unwrap().log,
+            vec!["session_create".to_string()]
+        );
+        for i in 0..=MAX_SESSION_LOG_ENTRIES {
+            record_steer(&mut reg, "s1", &format!("{i:03}"));
+        }
+        let log = reg.get("s1").unwrap().log.clone();
+        assert_eq!(log.len(), MAX_SESSION_LOG_ENTRIES);
+        // FIFO: the oldest entries ("session_create", then the
+        // first steer lines) are gone; only the newest 100 lines
+        // survive, all steer lines.
+        assert!(!log.contains(&"session_create".to_string()));
+        assert!(log.iter().all(|e| e == "steer:steer:success"));
+        // An abort line still lands, pushing out the next oldest.
+        assert_eq!(reg.abort("s1", &contract()), Ok(SessionState::Cancelled));
+        let log = reg.get("s1").unwrap().log.clone();
+        assert_eq!(log.len(), MAX_SESSION_LOG_ENTRIES);
+        assert_eq!(log.last().unwrap(), "session_abort");
+        assert!(!log.contains(&"session_create".to_string()));
     }
 }

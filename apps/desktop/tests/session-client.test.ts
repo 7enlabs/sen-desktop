@@ -193,10 +193,37 @@ async function capturePayload(
     seen = args as Record<string, unknown>;
     return stubResult;
   });
-  await call();
-  setBridgeTransport(null);
+  try {
+    await call();
+  } finally {
+    setBridgeTransport(null);
+  }
   return seen;
 }
+
+test("session-client capturePayload: a failing call still restores the real transport (CI P2-6)", async () => {
+  // Same try/finally as approval-gate.test.ts: a call that throws
+  // after the stub answered must not leave the stub installed for
+  // the next test.
+  await assert.rejects(
+    capturePayload(
+      "sen_session_create",
+      sessionStubResult(),
+      async () => {
+        await createSession(new SessionManager(), contract(), "s1");
+        throw new Error("boom after call");
+      },
+    ),
+    /boom after call/,
+  );
+  // With the stub gone, the next call reaches the real Tauri invoke,
+  // which throws under node ("window is not defined") — not the
+  // stale stub's answer.
+  await assert.rejects(
+    () => createSession(new SessionManager(), contract(), "s1"),
+    /window is not defined/,
+  );
+});
 
 function sessionStubResult() {
   return {
