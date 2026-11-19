@@ -70,6 +70,9 @@ import {
   startTelegramLoop,
 } from "../chat/telegram.ts";
 import { startChatUI, type ChatUI } from "./chat-ui.ts";
+import { fetchBriefSource } from "../ipc/brief-client.ts";
+import { matchSkill } from "../ipc/skills-client.ts";
+import { delegateMcpTool } from "../ipc/mcp-delegate-client.ts";
 
 export interface StartAppOptions {
   // Session id for the one app session. Defaults to a freshly
@@ -223,21 +226,43 @@ async function bootChat(): Promise<void> {
     onBusy: (busy) => ui?.setBusy(busy),
     onRouterStatus: (text) => ui?.setRouterStatus(text),
     // CI P2-9 (P0-4): the brief HTML lands in the chat UI panel.
+    // Tauri follow-ups (19/11, ZC Leader tin 17093): the three
+    // seams ChatSession offers are now wired to Rust commands,
+    // because the webview itself has neither fs nor spawn:
+    // - briefSource: sen_brief_source fetches Gmail + Calendar on
+    //   the Rust side (SEN_GMAIL_ACCESS_TOKEN in the backend
+    //   environment). Without the token the command fails and
+    //   /brief keeps refusing honestly — no source is invented.
+    // - skillMatcher: sen_skill_match scans the skills dir on the
+    //   Rust side and returns metadata only; the webview never
+    //   reads a SKILL.md file itself.
+    // - delegateToolCall: sen_mcp_delegate spawns `zen` on a fresh
+    //   delegate bridge on the Rust side.
     // What main.ts deliberately does NOT pass, and why:
-    // - No briefSource: there is no Gmail/calendar fetch in the app
-    //   yet (P0-4: "a later phase"), so /brief reports that honestly
-    //   until a real source exists; no source is invented here.
-    // - No skillMatcher, delegateToolCall, or mcpServers:
-    //   SkillRegistry reads with node:fs and McpClient /
-    //   delegateToolCallToCliCore spawn with node:child_process, and
-    //   this webview entry has neither — importing them here breaks
-    //   vite build (probe 19/11: exit 1, "Module node:fs /
-    //   node:child_process has been externalized for browser
-    //   compatibility"). The seams exist on ChatSession (see
-    //   ../chat/chat.ts) with the node-side factory in
-    //   ../chat/skill-matcher.ts; the production instantiation point
-    //   is a future Rust Tauri command (which already spawns `zen`
-    //   in cli_spawn.rs) or a node side, not this entry.
+    // - No mcpServers: there is no MCP server config store yet
+    //   (no UI, no settings file for server configs), so /mcp
+    //   still refuses an unconfigured server honestly. The
+    //   delegate command itself is proven (Rust + client tests);
+    //   the config store is a separate follow-up for the Leader.
+    // The node-side factory in ../chat/skill-matcher.ts and the
+    // node delegate in packages/core/src/mcp-client.ts remain for
+    // tests and node-side use only; importing them here would
+    // break vite build (probe 19/11: exit 1, "Module node:fs /
+    // node:child_process has been externalized for browser
+    // compatibility").
+    briefSource: () =>
+      fetchBriefSource(makeContract("desktop", "brief source")),
+    skillMatcher: async (query) =>
+      (await matchSkill(makeContract("desktop", "skill match"), query)) ??
+      undefined,
+    delegateToolCall: (input) =>
+      delegateMcpTool(makeContract("desktop", "mcp delegate"), {
+        sessionId,
+        serverName: input.serverName,
+        serverConfig: input.serverConfig,
+        tool: input.tool,
+        arguments: input.arguments,
+      }),
     onBrief: (html) => ui?.showBrief(html),
     sendTelegram: async (chatId, text) => {
       await sendTelegramMessage(

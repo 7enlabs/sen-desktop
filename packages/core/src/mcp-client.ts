@@ -61,7 +61,10 @@ export const MCP_DELEGATE_TIMEOUT_MS = 120000;
  * server has command (+args/env); an HTTP server has url (+headers).
  * `type` may say "stdio" or "http"; when absent, a server with a
  * command is stdio and one with only a url is HTTP (same rule as
- * zen-mcp is_http).
+ * zen-mcp is_http) — but the CLI loader still skips a url server
+ * with no explicit type (`url_missing_type`), so validation
+ * requires `type: "http"` on a url server (see
+ * validateMcpServerConfig).
  */
 export interface McpServerConfig {
   type?: string | null;
@@ -172,6 +175,18 @@ export function validateMcpServerConfig(config: unknown): string[] {
   }
   if (kind === "http" && !hasUrl) {
     errors.push('MCP server type "http" needs a url');
+  }
+  // The CLI loader (zen-mcp manager.rs `validate`) skips a server
+  // with a url but no type (`url_missing_type`): `is_http()` would
+  // still classify it as HTTP, but the server never starts, so a
+  // delegate turn would run with no server and fail confusingly
+  // later. Require the explicit type here (live probe 19/11
+  // against the real `zen` 0.1.0: a typeless url config yields
+  // `mcp_servers: []` + `url_missing_type`, a typed one registers).
+  if (hasUrl && (raw.type === undefined || raw.type === null)) {
+    errors.push(
+      'MCP server with a url needs type "http" (the CLI skips a url without a type: url_missing_type)',
+    );
   }
   return errors;
 }
@@ -707,16 +722,26 @@ export async function connectHttpMcp(
   config: McpServerConfig,
   options: McpClientOptions = {},
 ): Promise<McpClient> {
-  const errors = validateMcpServerConfig(config);
+  // A url-only config is unambiguously HTTP on this path: the
+  // direct connect never goes through the CLI loader, so the D1
+  // rule (a url server needs an explicit type, else the CLI skips
+  // it as url_missing_type) does not apply here — it protects the
+  // mcp-servers.json file path (delegateToolCallToCliCore) only.
+  // Normalise the type before validating so { url } still connects.
+  const effective =
+    config.url && (config.type === undefined || config.type === null)
+      ? { ...config, type: "http" }
+      : config;
+  const errors = validateMcpServerConfig(effective);
   if (errors.length > 0) {
     throw new Error("MCP_CONFIG_INVALID: " + errors.join("; "));
   }
-  if (!config.url) {
+  if (!effective.url) {
     throw new Error("MCP_CONFIG_INVALID: HTTP server needs a url");
   }
   const client = new HttpMcpTransport(
-    config.url,
-    config.headers ?? {},
+    effective.url,
+    effective.headers ?? {},
   );
   const mcp = new McpClient(client, options);
   try {

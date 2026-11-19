@@ -54,9 +54,19 @@ grants permission, execution is a later phase.
   `buildAndRenderMorningBrief` builds with `buildMorningBrief` and
   renders; `ChatSession` runs it through `/brief` (or a
   morning-brief skill match) and `main.ts` shows the HTML in the
-  chat UI panel. The email/calendar DATA source is still not wired:
-  there is no Gmail/calendar fetch in the app yet, so /brief says
-  so honestly until a real source exists.
+  chat UI panel.
+- `apps/desktop/src-tauri/src/commands/brief_sources.rs` —
+  the email/calendar DATA source (Tauri follow-up 2, 19/11):
+  Gmail messages.list + messages.get and Calendar events.list
+  over HTTPS with a Google OAuth access token from the backend
+  environment (`SEN_GMAIL_ACCESS_TOKEN`), exposed as the
+  `sen_brief_source` command and wired in `main.ts` as the
+  chat's `briefSource` (client:
+  `apps/desktop/src/ipc/brief-client.ts`). Without the token the
+  command fails as `BRIEF_SOURCE_NOT_CONFIGURED` and /brief
+  keeps refusing honestly. Live Google fetch is NOT RUN yet
+  (no token on this box); the fetch path is proven against a
+  fake HTTP transport in the Rust harness, not against Google.
 
 ### The brief
 
@@ -222,8 +232,12 @@ escaped HTML.
   blocker (no Rust touched).
 - Test PC (Windows): NOT RUN — box is Linux only.
 - CI: NOT RUN — no PR opened (producer bundle, no push).
-- Live Gmail/calendar fetch: NOT RUN — no fetcher is wired yet;
-  the brief is proven only against explicit test fixtures.
+- Live Gmail/calendar fetch: PARTIAL — the fetcher is wired
+  (Rust `sen_brief_source`, fake-transport tests in the harness),
+  but no live Google call has run yet (no OAuth token on this
+  box); the brief is still proven only against explicit test
+  fixtures plus fake Google-shaped responses. Needs
+  `SEN_GMAIL_ACCESS_TOKEN` (Zen-side OAuth) before a live run.
 - Real tool execution (send/draft/archive/schedule): NOT RUN —
   a gate pass still ends in `EXECUTION_NOT_WIRED` by design.
 - Independent verification (producer ≠ verifier): DONE by the

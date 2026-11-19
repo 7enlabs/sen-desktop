@@ -135,7 +135,7 @@ function makeChat(options: {
     emails: EmailItem[];
     events: CalendarEvent[];
   }>;
-  skillMatcher?: (query: string) => Skill | undefined;
+  skillMatcher?: (query: string) => Promise<Skill | undefined>;
 } = {}): WiringHarness {
   const commands: string[] = [];
   const briefHtml: string[] = [];
@@ -277,11 +277,11 @@ test("wiring: /brief without a source says so honestly, no brief shown", async (
 test("wiring: a morning-brief request is routed by the real SkillRegistry, never reaches the model", async () => {
   const matcher = createSkillMatcher(join(REPO_ROOT, "skills"));
   // The shipped skill really matches the Vietnamese request.
-  assert.equal(matcher("cho tôi bản tin sáng hôm nay")?.name, "morning-brief");
-  assert.equal(matcher("kể chuyện cười")?.name, undefined);
+  assert.equal((await matcher("cho tôi bản tin sáng hôm nay"))?.name, "morning-brief");
+  assert.equal((await matcher("kể chuyện cười"))?.name, undefined);
   const h = makeChat({
     briefSource: async () => briefSourceData(),
-    skillMatcher: matcher,
+    skillMatcher: async (query) => matcher(query),
   });
   await h.chat.send("desktop", "cho tôi bản tin sáng hôm nay");
   assert.deepEqual(h.commands, []);
@@ -296,7 +296,7 @@ test("wiring: an unrelated message still runs a model turn with the matcher inje
   const matcher = createSkillMatcher(join(REPO_ROOT, "skills"));
   const h = makeChat({
     briefSource: async () => briefSourceData(),
-    skillMatcher: matcher,
+    skillMatcher: async (query) => matcher(query),
   });
   await h.chat.send("desktop", "kể chuyện cười");
   assert.deepEqual(h.commands, ["sen_session_steer"]);

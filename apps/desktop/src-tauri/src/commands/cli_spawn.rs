@@ -463,6 +463,56 @@ impl CliBridge {
         timeout: Duration,
         emit: &mut dyn FnMut(SenEvent),
     ) -> Result<TurnResult, BridgeError> {
+        self.run_turn_with_argv(
+            kind,
+            text,
+            timeout,
+            |bridge, resume| {
+                build_cli_argv(
+                    &bridge.model,
+                    bridge.base_url.as_deref(),
+                    &bridge.session_id,
+                    resume,
+                    text,
+                )
+            },
+            emit,
+        )
+    }
+
+    /// Run one turn with a caller-built argv (MCP delegate, Tauri
+    /// follow-up 1): the same spawn/read/wait loop as a model turn,
+    /// only the argv differs (--mcp-config + the delegate prompt, see
+    /// mcp_delegate.rs). `text` is the prompt (the last argv element)
+    /// and is only used for the empty check; the argv itself is used
+    /// verbatim, so a delegate turn never re-derives flags from the
+    /// bridge's session.
+    pub fn run_turn_with_custom_argv(
+        &self,
+        kind: &str,
+        text: &str,
+        timeout: Duration,
+        argv: Vec<String>,
+        emit: &mut dyn FnMut(SenEvent),
+    ) -> Result<TurnResult, BridgeError> {
+        self.run_turn_with_argv(kind, text, timeout, |_, _| argv, emit)
+    }
+
+    /// Shared turn loop for run_turn_with_timeout and
+    /// run_turn_with_custom_argv: the only difference is how the argv
+    /// is built, so the spawn, stream-json read, timeout, abort, and
+    /// exit-code handling stay in exactly one place. `build_argv`
+    /// receives the bridge and the resume flag (true once a result
+    /// record proved the CLI session exists on disk) and returns the
+    /// full argv, prompt last.
+    fn run_turn_with_argv(
+        &self,
+        kind: &str,
+        text: &str,
+        timeout: Duration,
+        build_argv: impl FnOnce(&CliBridge, bool) -> Vec<String>,
+        emit: &mut dyn FnMut(SenEvent),
+    ) -> Result<TurnResult, BridgeError> {
         if text.trim().is_empty() {
             return Err(BridgeError::new(
                 ERR_CLI_EMPTY_TEXT,
@@ -511,13 +561,7 @@ impl CliBridge {
             ));
         }
 
-        let argv = build_cli_argv(
-            &self.model,
-            self.base_url.as_deref(),
-            &self.session_id,
-            resume,
-            text,
-        );
+        let argv = build_argv(self, resume);
         let mut child = match Command::new(&bin)
             .args(&argv)
             .stdin(Stdio::null())

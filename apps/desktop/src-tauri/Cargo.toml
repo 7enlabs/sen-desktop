@@ -21,6 +21,10 @@ tauri = "=2.12.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+# Tauri follow-up 1 (19/11): fresh UUID per MCP delegate call.
+# Already in Cargo.lock as a transitive dependency (1.29.0, via
+# tauri); adding it direct keeps the lockfile's version.
+uuid = { version = "1", features = ["v4"] }
 # P0-1: Telegram Bot API client (blocking, rustls). Version 0.12, not
 # 0.13: 0.13 renamed the `rustls-tls` feature to `rustls` and needs
 # `aws-lc-rs`, which is not in the local cargo cache; 0.12 uses ring,
