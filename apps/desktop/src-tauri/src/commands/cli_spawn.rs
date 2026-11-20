@@ -71,6 +71,12 @@ use super::stream_json::{
 /// (decision 3: 5s).
 pub const ABORT_GRACE: Duration = Duration::from_secs(5);
 
+/// Bound on `zen sessions delete` after an end (Q5): the delete is
+/// a local file removal, so it finishes in milliseconds; a binary
+/// that stays alive past this long is killed and the delete
+/// reports failure (best effort: the end already succeeded).
+pub const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Cap on stderr kept for error detail (stderr holds warnings and hook
 /// diagnostics, never the stream; never log it whole).
 pub const STDERR_TAIL_LEN: usize = 8192;
@@ -163,6 +169,12 @@ pub const ERR_CLI_TRUNCATED: &str = "CLI_TRUNCATED";
 pub const ERR_CLI_TURN_ABORTED: &str = "CLI_TURN_ABORTED";
 pub const ERR_CLI_TURN_TIMEOUT: &str = "CLI_TURN_TIMEOUT";
 pub const ERR_CLI_EMPTY_TEXT: &str = "CLI_EMPTY_TEXT";
+/// `zen sessions delete` failed or never finished (Q5): the CLI
+/// session on disk may still exist — or never existed, since a
+/// session that never ran a turn has no file and the CLI exits 3.
+/// The end already succeeded, so the caller treats this as best
+/// effort and never fails the end because of it.
+pub const ERR_CLI_SESSION_DELETE_FAILED: &str = "CLI_SESSION_DELETE_FAILED";
 
 /// Map a no-result turn's CLI exit code to a typed error code
 /// (R2B-03). The exit-code table in cli_bin.rs is reporting-only, so
@@ -311,6 +323,10 @@ pub struct CliBridge {
     /// that produces no result record within this long is killed and
     /// reported as CLI_TURN_TIMEOUT.
     turn_timeout: Duration,
+    /// Bound on `zen sessions delete` after an end (Q5, default
+    /// DELETE_TIMEOUT): a delete that never finishes is killed and
+    /// reported as a failure instead of hanging the end call.
+    delete_timeout: Duration,
     /// Process-kill backstop (R2B-06, default 180s): bound on waiting
     /// for the child after the read loop ends (EOF) before SIGKILLing it.
     process_kill_backstop: Duration,
@@ -366,6 +382,7 @@ impl CliBridge {
             child_slot: Arc::new(Mutex::new(None)),
             abort_grace: ABORT_GRACE,
             turn_timeout: TURN_TIMEOUT,
+            delete_timeout: DELETE_TIMEOUT,
             process_kill_backstop: PROCESS_KILL_BACKSTOP,
         }
     }
@@ -391,6 +408,14 @@ impl CliBridge {
     #[cfg(test)]
     pub fn with_turn_timeout(mut self, timeout: Duration) -> CliBridge {
         self.turn_timeout = timeout;
+        self
+    }
+
+    /// Test-only: shorten the session-delete timeout so the kill path
+    /// can be proven without waiting the full DELETE_TIMEOUT.
+    #[cfg(test)]
+    pub fn with_delete_timeout(mut self, timeout: Duration) -> CliBridge {
+        self.delete_timeout = timeout;
         self
     }
 
@@ -1046,6 +1071,86 @@ impl CliBridge {
             }
         }
     }
+
+    /// Delete this session's on-disk CLI transcript (Q5): runs
+    /// `zen sessions delete <id> --yes` with the same binary the
+    /// turns use (resolve_bin: override, else ZEN_BIN then PATH),
+    /// stdin/stdout/stderr discarded, waited on for at most
+    /// delete_timeout (DELETE_TIMEOUT in production), then killed.
+    /// The CLI removes `~/.zen/projects/<cwd>/<id>.jsonl` plus the
+    /// `<id>` scratch dir and exits 3 when no such session exists
+    /// (zencore session_mgmt.rs delete_session, commit c87769a) —
+    /// so a session that never ran a turn has nothing to delete and
+    /// still reports an error here, which the caller must treat as
+    /// best effort: the end already succeeded and must never fail
+    /// because the disk cleanup did not. Never called while a turn
+    /// runs: the caller (sen_session_end) runs it after
+    /// Registry::end, with no registry lock held, like
+    /// bridge.abort() in sen_session_abort. The bridge handle stays
+    /// in the Registry map for diagnostics; only the on-disk
+    /// transcript goes. The session id is passed as one argv
+    /// element, never through a shell, so no id can inject flags.
+    pub fn delete_cli_session(&self) -> Result<(), BridgeError> {
+        let bin = self.resolve_bin()?;
+        let mut child = Command::new(&bin)
+            .args(["sessions", "delete", &self.session_id, "--yes"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                BridgeError::new(
+                    ERR_CLI_SESSION_DELETE_FAILED,
+                    &format!(
+                        "Failed to run zen sessions delete for {}: {}",
+                        self.session_id, e
+                    ),
+                )
+            })?;
+        let deadline = std::time::Instant::now() + self.delete_timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        return Ok(());
+                    }
+                    let code = status
+                        .code()
+                        .map_or("signal".to_string(), |c| c.to_string());
+                    return Err(BridgeError::new(
+                        ERR_CLI_SESSION_DELETE_FAILED,
+                        &format!(
+                            "zen sessions delete for {} exited with {}",
+                            self.session_id, code
+                        ),
+                    ));
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(BridgeError::new(
+                            ERR_CLI_SESSION_DELETE_FAILED,
+                            &format!(
+                                "zen sessions delete for {} timed out after {:?}",
+                                self.session_id, self.delete_timeout
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(BridgeError::new(
+                        ERR_CLI_SESSION_DELETE_FAILED,
+                        &format!(
+                            "Failed to wait for zen sessions delete for {}: {}",
+                            self.session_id, e
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1073,6 +1178,103 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    /// A fake `zen` binary running an arbitrary shell body (Q5): used
+    /// for delete_cli_session, where the behaviour under test is the
+    /// argv itself, not a turn. Returns the script path.
+    fn script_zen(tag: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sen_del_zen_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zen");
+        std::fs::write(&path, format!("#!/bin/sh\n{}\n", body)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// A fake `zen` binary that records its argv (one line per call)
+    /// to a marker file, then exits with the given code. Returns
+    /// (script, marker). Proves delete_cli_session invokes the exact
+    /// CLI delete command.
+    fn recording_zen(tag: &str, exit_code: i32) -> (PathBuf, PathBuf) {
+        let marker =
+            std::env::temp_dir().join(format!("sen_del_argv_{}_{}.txt", tag, std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let body = format!("echo \"$@\" >> '{}'\nexit {}", marker.display(), exit_code);
+        (script_zen(tag, &body), marker)
+    }
+
+    /// A session id in production form: the CLI validates
+    /// --session-id as a UUID, and `zen sessions delete` takes the
+    /// same id to find `<id>.jsonl` on disk.
+    const DELETE_SESSION_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    #[test]
+    fn delete_cli_session_runs_zen_sessions_delete_with_yes() {
+        // Q5: end deletes the on-disk CLI session by running exactly
+        // `zen sessions delete <id> --yes` — the subcommand the real
+        // CLI exposes (zencore cli.rs SessionSubcommand::Delete,
+        // c87769a). --yes skips the interactive confirm prompt, so
+        // the call never blocks on stdin.
+        let (bin, marker) = recording_zen("delsess", 0);
+        let bridge = CliBridge::new(Some(bin), DELETE_SESSION_ID, "m:free", None);
+        assert_eq!(bridge.delete_cli_session(), Ok(()));
+        let recorded = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            recorded.trim(),
+            format!("sessions delete {} --yes", DELETE_SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn delete_cli_session_reports_nonzero_exit() {
+        // Q5: the CLI exits 3 when no session file exists on disk
+        // (a session that never ran a turn). The helper reports it
+        // as an error; the sen_session_end wrapper treats it as best
+        // effort and never fails the end because of it.
+        let (bin, marker) = recording_zen("delsess3", 3);
+        let bridge = CliBridge::new(Some(bin), DELETE_SESSION_ID, "m:free", None);
+        let err = bridge.delete_cli_session().unwrap_err();
+        assert_eq!(err.code, ERR_CLI_SESSION_DELETE_FAILED);
+        assert!(err.message.contains("3"), "message: {}", err.message);
+        assert!(std::fs::read_to_string(&marker)
+            .unwrap()
+            .contains("sessions delete"));
+    }
+
+    #[test]
+    fn delete_cli_session_reports_missing_binary() {
+        // Q5: no binary at the resolved path is a delete failure,
+        // not a panic — the wrapper ignores it and the end stands.
+        let bridge = CliBridge::new(
+            Some(PathBuf::from("/nonexistent/zen")),
+            DELETE_SESSION_ID,
+            "m:free",
+            None,
+        );
+        let err = bridge.delete_cli_session().unwrap_err();
+        assert_eq!(err.code, ERR_CLI_SESSION_DELETE_FAILED);
+    }
+
+    #[test]
+    fn delete_cli_session_kills_a_hung_binary() {
+        // Q5: a delete that never finishes is killed after the
+        // (test-shortened) timeout instead of hanging the end call.
+        let bin = script_zen("delhang", "sleep 30");
+        let bridge = CliBridge::new(Some(bin), DELETE_SESSION_ID, "m:free", None)
+            .with_delete_timeout(Duration::from_millis(50));
+        let err = bridge.delete_cli_session().unwrap_err();
+        assert_eq!(err.code, ERR_CLI_SESSION_DELETE_FAILED);
+        assert!(
+            err.message.contains("timed out"),
+            "message: {}",
+            err.message
+        );
     }
 
     /// Run a turn against a fake binary and return (result, events).

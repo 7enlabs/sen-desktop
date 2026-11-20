@@ -431,18 +431,40 @@ pub struct SessionEndResult {
 /// but with no bridge step at all: the registry refuses while a
 /// turn runs (ERR_TURN_IN_FLIGHT) instead of killing it, and
 /// refuses an undecided approval (ERR_PENDING_APPROVAL) instead
-/// of ending around it. No transcript file, no CLI cleanup, no
-/// new session is created after the end (Q4, Q5, Q9).
+/// of ending around it. After the registry step, the wrapper
+/// deletes the CLI session on disk (Q5, Leader tin 18630):
+/// `zen sessions delete <id> --yes` removes the transcript and
+/// scratch dir, so a later `-r <id>` can no longer resume history
+/// of a Completed session. That delete runs with NO registry lock
+/// held (same split as sen_session_abort's bridge step), only on
+/// the first end — a replay returns the old receipt and deletes
+/// nothing — and best effort: the end already succeeded, so a
+/// delete failure (no file when the session never ran a turn,
+/// missing binary, timeout) never fails the end. No transcript
+/// file is written, no new session is created after the end
+/// (Q4, Q9). The bridge handle stays in the map for diagnostics.
 #[tauri::command]
 pub fn sen_session_end(
     state: State<'_, Mutex<Registry>>,
     session_id: String,
     contract: ContractArgs,
 ) -> Result<SessionEndResult, String> {
-    let mut registry = state.lock().map_err(|e| e.to_string())?;
-    let receipt = registry
-        .end(&session_id, &contract.to_registry())
-        .map_err(|e| e.to_wire())?;
+    let (receipt, bridge) = {
+        let mut registry = state.lock().map_err(|e| e.to_string())?;
+        let receipt = registry
+            .end(&session_id, &contract.to_registry())
+            .map_err(|e| e.to_wire())?;
+        let bridge = registry.bridge(&session_id);
+        (receipt, bridge)
+    };
+    // Q5: delete the CLI session on disk, best effort, lock-free.
+    // A replay already ended the session once, so it deletes
+    // nothing; a failed delete never un-completes the session.
+    if !receipt.already_ended {
+        if let Some(bridge) = bridge {
+            let _ = bridge.delete_cli_session();
+        }
+    }
     Ok(SessionEndResult {
         session_id: receipt.session_id,
         state: receipt.state.as_str().to_string(),

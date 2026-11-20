@@ -1132,37 +1132,51 @@ impl Registry {
     /// path so an errored session can still be closed), with the
     /// subscriber count reset to 0 and the log entry matching the
     /// AbortOutcome, exactly as the old one-call abort did. Terminal
-    /// states have no outgoing path at all.
+    /// states have no outgoing path at all. D6 (follow-up Q6, Leader
+    /// tin 18630): the abort also purges this session's unused
+    /// approvals with the same revoke_all_for_session mechanism
+    /// Registry::end uses, so a grant left over after abort no
+    /// longer shows in list_approvals until its TTL. The purge runs
+    /// after the state flip, once the record borrow ends, and never
+    /// fails the abort: the session is already Cancelled when it
+    /// runs. It writes no activity-log entry, same as revoke_tool.
     pub fn complete_abort(
         &mut self,
         session_id: &str,
         outcome: AbortOutcome,
     ) -> Result<SessionState, CommandError> {
-        let record = self.get_mut_or_unknown(session_id)?;
-        if !can_transition(record.state, SessionState::Cancelled) {
-            return Err(CommandError::new(
-                ERR_ILLEGAL_TRANSITION,
-                &format!(
-                    "Illegal state transition: {} to Cancelled",
-                    record.state.as_str()
-                ),
-            ));
-        }
-        record.state = SessionState::Cancelled;
-        // BUG-09 (#24): close drops the subscriber count. A cancelled
-        // session has no listeners left: whatever subscribers were
-        // attached are gone with the session, so the count resets to 0
-        // instead of leaking. This holds even for a direct abort that
-        // bypasses the frontend close path (which unsubscribes first).
-        record.subscribers = 0;
-        match outcome {
-            AbortOutcome::NoChild => record.push_log("session_abort".to_string()),
-            AbortOutcome::ExitedAfterSigint => record.push_log("session_abort:sigint".to_string()),
-            AbortOutcome::KilledAfterGrace => {
-                record.push_log("session_abort:kill-after-grace".to_string())
+        {
+            let record = self.get_mut_or_unknown(session_id)?;
+            if !can_transition(record.state, SessionState::Cancelled) {
+                return Err(CommandError::new(
+                    ERR_ILLEGAL_TRANSITION,
+                    &format!(
+                        "Illegal state transition: {} to Cancelled",
+                        record.state.as_str()
+                    ),
+                ));
+            }
+            record.state = SessionState::Cancelled;
+            // BUG-09 (#24): close drops the subscriber count. A cancelled
+            // session has no listeners left: whatever subscribers were
+            // attached are gone with the session, so the count resets to 0
+            // instead of leaking. This holds even for a direct abort that
+            // bypasses the frontend close path (which unsubscribes first).
+            record.subscribers = 0;
+            match outcome {
+                AbortOutcome::NoChild => record.push_log("session_abort".to_string()),
+                AbortOutcome::ExitedAfterSigint => {
+                    record.push_log("session_abort:sigint".to_string())
+                }
+                AbortOutcome::KilledAfterGrace => {
+                    record.push_log("session_abort:kill-after-grace".to_string())
+                }
             }
         }
-        Ok(record.state)
+        // D6: purge this session's unused approvals, same as
+        // Registry::end. Grants of other sessions are untouched.
+        self.approvals.revoke_all_for_session(session_id);
+        Ok(SessionState::Cancelled)
     }
 
     /// Run a whole abort in one call (tests only): begin, escalate,
@@ -3025,11 +3039,13 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
     }
 
     #[test]
-    fn q6_tool_call_on_cancelled_does_not_burn_leftover_grant() {
-        // T4: a grant left over after abort (abort does not purge,
-        // D6 follow-up) is NOT consumed by a refused tool_call —
-        // the gate stands before gate_tool_call, so the grant stays
-        // visible in list_approvals and find still sees it.
+    fn q6_tool_call_on_cancelled_after_abort_purge() {
+        // T4 (renamed + updated by D6; was
+        // q6_tool_call_on_cancelled_does_not_burn_leftover_grant):
+        // abort now purges the session's grants, so there is no
+        // leftover grant for a refused tool_call to burn. The gate
+        // still refuses with ILLEGAL_TRANSITION, writes no
+        // activity-log entry, and find/list show the grant is gone.
         let mut reg = Registry::new();
         reg.create("s1", &contract()).unwrap();
         reg.allow_tool("send_message");
@@ -3037,15 +3053,58 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         assert_eq!(reg.list_approvals().len(), 1);
         reg.abort("s1", &contract()).unwrap();
         assert_eq!(reg.get("s1").unwrap().state, SessionState::Cancelled);
+        // D6: the abort purged the grant — find misses, list is empty.
+        assert!(reg.approvals.find("send_message", "k1", "s1").is_none());
+        assert_eq!(reg.list_approvals().len(), 0);
         let err = reg.tool_call(&contract(), "send_message").unwrap_err();
         assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
         assert!(reg.activity_log().is_empty());
-        assert!(reg.approvals.find("send_message", "k1", "s1").is_some());
-        assert_eq!(reg.list_approvals().len(), 1);
-        // A second refusal is identical and still burns nothing.
+        // A second refusal is identical and still leaves no trace.
         let err = reg.tool_call(&contract(), "send_message").unwrap_err();
         assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
-        assert_eq!(reg.list_approvals().len(), 1);
+        assert_eq!(reg.list_approvals().len(), 0);
+    }
+
+    #[test]
+    fn d6_abort_purges_only_this_sessions_grants() {
+        // D6 (follow-up Q6, Leader tin 18630): complete_abort purges
+        // this session's unused approvals with the same
+        // revoke_all_for_session mechanism Registry::end uses (b.7)
+        // — a grant left over after abort no longer shows in
+        // list_approvals until its TTL. Another session's grants
+        // survive, the purge writes no extra log entry, and a second
+        // abort refuses ILLEGAL_TRANSITION with no further side
+        // effects (no extra log line, no purge of other sessions).
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        reg.create("s2", &contract()).unwrap();
+        reg.approve_tool("tool-a", "key-a", "tester", "s1").unwrap();
+        reg.approve_tool("tool-b", "key-b", "tester", "s1").unwrap();
+        reg.approve_tool("tool-a", "key-a", "tester", "s2").unwrap();
+        assert_eq!(reg.list_approvals().len(), 3);
+        reg.abort("s1", &contract()).unwrap();
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Cancelled);
+        assert!(reg.approvals.find("tool-a", "key-a", "s1").is_none());
+        assert!(reg.approvals.find("tool-b", "key-b", "s1").is_none());
+        let remaining = reg.list_approvals();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "s2");
+        // The purge writes no extra log entry: session_create plus
+        // the one session_abort line.
+        let log = reg.get("s1").unwrap().log.clone();
+        assert_eq!(
+            log,
+            vec!["session_create".to_string(), "session_abort".to_string()]
+        );
+        // A second abort is refused and changes nothing: the other
+        // session's grant is still there, the log does not grow.
+        let err = reg.abort("s1", &contract()).unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Cancelled);
+        assert_eq!(reg.get("s1").unwrap().log.len(), 2);
+        let remaining = reg.list_approvals();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "s2");
     }
 
     #[test]
