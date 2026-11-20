@@ -743,6 +743,25 @@ test("tools-client approve: an approval without a session id fails loudly", asyn
   }
 });
 
+// Q6 gate (20/11, Leader tin 17951, D1-D7): the backend refuses
+// approvals on a terminal session with ILLEGAL_TRANSITION, and the
+// frontend surfaces that wire error verbatim — never a fake Approval.
+test("tools-client approve: terminal session error surfaces verbatim, no fake approval", async () => {
+  setBridgeTransport(async () => {
+    throw new Error(
+      "ILLEGAL_TRANSITION: session in state Completed accepts no approvals, only a live session accepts approvals",
+    );
+  });
+  try {
+    await assert.rejects(
+      () => approveTool(contract(), "send_message", "k1", "zen"),
+      /ILLEGAL_TRANSITION: session in state Completed accepts no approvals/,
+    );
+  } finally {
+    setBridgeTransport(null);
+  }
+});
+
 test("tools-client revoke: invokes sen_tool_revoke and returns its boolean", async () => {
   const seen: Array<Record<string, unknown>> = [];
   setBridgeTransport(async (command, args) => {
@@ -765,6 +784,25 @@ test("tools-client revoke: a non-boolean answer fails loudly", async () => {
   setBridgeTransport(async () => "yes");
   try {
     await assert.rejects(() => revokeTool(contract(), "send_message", "k1"), /malformed/);
+  } finally {
+    setBridgeTransport(null);
+  }
+});
+
+// Q6 gate (20/11, Leader tin 17951, D1-D7): the backend refuses
+// tool calls on a terminal session with ILLEGAL_TRANSITION, and the
+// frontend surfaces that wire error verbatim — never a fake success.
+test("tools-client call: terminal session error surfaces verbatim, no fake success", async () => {
+  setBridgeTransport(async () => {
+    throw new Error(
+      "ILLEGAL_TRANSITION: session in state Completed runs no tools, only a live session runs tools",
+    );
+  });
+  try {
+    await assert.rejects(
+      () => callTool(contract(), "read_file"),
+      /ILLEGAL_TRANSITION: session in state Completed runs no tools/,
+    );
   } finally {
     setBridgeTransport(null);
   }

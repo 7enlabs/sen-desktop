@@ -592,6 +592,35 @@ impl Registry {
         })
     }
 
+    /// Q6 gate (20/11, Leader tin 17951, D1-D7): refuse approvals
+    /// and tool calls on a terminal session, before anything touches
+    /// the ApprovalStore or the activity log — so a refused call
+    /// leaves no trace: no grant is created, none is consumed, no
+    /// log entry is written, no state changes. Terminal is exactly
+    /// `is_terminal` (Completed, Cancelled, Failed). Error and
+    /// AwaitingApproval are live states and pass through: Error
+    /// still needs approvals and tool calls to recover, and approve
+    /// is the only way out of AwaitingApproval (G1: AwaitingApproval
+    /// has no live entry path, so it is pinned at the
+    /// `can_transition` table, not by a session here). A session id
+    /// with no record passes through unchanged (D1: pass-through in
+    /// this PR, fail-closed is a separate PR).
+    fn refuse_if_terminal(&self, session_id: &str, verb: &str) -> Result<(), CommandError> {
+        if let Some(record) = self.sessions.get(session_id) {
+            if record.state.is_terminal() {
+                return Err(CommandError::new(
+                    ERR_ILLEGAL_TRANSITION,
+                    &format!(
+                        "Illegal state transition: session in state {} {}",
+                        record.state.as_str(),
+                        verb
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// sen_session_create: backend record only, state Running, plus one
     /// CLI bridge handle for the session. P0-3: the bridge runs the
     /// router's active route (model and base URL from the resolved
@@ -1378,6 +1407,13 @@ impl Registry {
                 "Tool call missing session id, FAIL",
             ));
         }
+        // Q6 (D2): a terminal session accepts no approvals. The
+        // gate stands before grant, so no grant is ever created for
+        // a session that already ended.
+        self.refuse_if_terminal(
+            session_id,
+            "accepts no approvals, only a live session accepts approvals",
+        )?;
         Ok(self
             .approvals
             .grant(tool_name, idempotency_key, granted_by, session_id))
@@ -1429,6 +1465,14 @@ impl Registry {
                 "tool_name must be non-empty, FAIL",
             ));
         }
+        // Q6 (D2): a terminal session runs no tools. The gate
+        // stands before assert_gate_order and gate_tool_call, so a
+        // refused call burns no grant and writes no activity log
+        // entry — the refusal leaves no trace.
+        self.refuse_if_terminal(
+            &contract.session_id,
+            "runs no tools, only a live session runs tools",
+        )?;
         assert_gate_order(&GATE_ORDER)?;
         let evaluation = gate_tool_call(
             &self.tool_policy,
@@ -2854,6 +2898,251 @@ i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done"#;
         let mut reg = Registry::new();
         reg.create("s1", &contract()).unwrap();
         assert_eq!(reg.subscribe("s1", &contract()), Ok(1));
+    }
+
+    // Q6 gate (20/11, Leader tin 17951, D1-D7): approve_tool and
+    // tool_call refuse a terminal session with ILLEGAL_TRANSITION,
+    // before the ApprovalStore or the activity log is touched.
+    // Terminal is exactly is_terminal (Completed, Cancelled,
+    // Failed); Error and AwaitingApproval stay live.
+    fn registry_with_terminal_session(state: SessionState, tag: &str) -> Registry {
+        let mut reg = Registry::new();
+        match state {
+            SessionState::Completed => {
+                reg.create("s1", &contract()).unwrap();
+                reg.end("s1", &contract()).unwrap();
+            }
+            SessionState::Cancelled => {
+                reg.create("s1", &contract()).unwrap();
+                reg.abort("s1", &contract()).unwrap();
+            }
+            SessionState::Failed => {
+                reg.set_zen_bin(fake_zen(tag, ERROR_BODY));
+                reg.create("s1", &contract()).unwrap();
+                let mut emit = |_ev: SenEvent| {};
+                assert_eq!(
+                    reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+                    Ok(SessionState::Error)
+                );
+                let mut other = contract();
+                other.idempotency_key = "k2".to_string();
+                let mut emit = |_ev: SenEvent| {};
+                assert_eq!(
+                    reg.steer("s1", &other, "steer", "hi", &mut emit),
+                    Ok(SessionState::Failed)
+                );
+            }
+            _ => panic!("helper only builds terminal states"),
+        }
+        assert_eq!(reg.get("s1").unwrap().state, state);
+        reg
+    }
+
+    #[test]
+    fn q6_approve_refuses_terminal_sessions() {
+        // T1: approve on Completed, Cancelled and Failed refuses
+        // with ILLEGAL_TRANSITION, creates no grant, changes no
+        // state and writes no session log line.
+        for (state, tag) in [
+            (SessionState::Completed, "q6t1c"),
+            (SessionState::Cancelled, "q6t1x"),
+            (SessionState::Failed, "q6t1f"),
+        ] {
+            let mut reg = registry_with_terminal_session(state, tag);
+            let log_len = reg.get("s1").unwrap().log.len();
+            let err = reg
+                .approve_tool("send_message", "k1", "zen", "s1")
+                .unwrap_err();
+            assert_eq!(err.code, ERR_ILLEGAL_TRANSITION, "{state:?}");
+            assert!(
+                err.message.contains(state.as_str()),
+                "message names the real state: {}",
+                err.message
+            );
+            assert!(reg.list_approvals().is_empty());
+            assert_eq!(reg.get("s1").unwrap().state, state);
+            assert_eq!(reg.get("s1").unwrap().log.len(), log_len);
+        }
+    }
+
+    #[test]
+    fn q6_approve_allows_live_sessions() {
+        // T2: Running and Error still approve. AwaitingApproval has
+        // no live entry path (G1), so it is pinned at the table:
+        // it is not terminal and its only exits are Running and
+        // Cancelled.
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
+        assert_eq!(reg.list_approvals().len(), 1);
+
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("q6t2e", ERROR_BODY));
+        reg.create("s1", &contract()).unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Error)
+        );
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
+        assert_eq!(reg.list_approvals().len(), 1);
+
+        assert!(!SessionState::AwaitingApproval.is_terminal());
+        assert!(!SessionState::Error.is_terminal());
+        assert!(can_transition(
+            SessionState::AwaitingApproval,
+            SessionState::Running
+        ));
+        assert!(!can_transition(
+            SessionState::AwaitingApproval,
+            SessionState::Completed
+        ));
+    }
+
+    #[test]
+    fn q6_tool_call_refuses_terminal_sessions() {
+        // T3: tool_call on a terminal session refuses with
+        // ILLEGAL_TRANSITION — never TOOL_EXECUTION_NOT_WIRED —
+        // and writes no activity log entry.
+        for (state, tag) in [
+            (SessionState::Completed, "q6t3c"),
+            (SessionState::Cancelled, "q6t3x"),
+            (SessionState::Failed, "q6t3f"),
+        ] {
+            let mut reg = registry_with_terminal_session(state, tag);
+            reg.allow_tool("read_file");
+            let subscribers = reg.get("s1").unwrap().subscribers;
+            // end() itself records one activity-log entry
+            // ("sen.session.end"); the refused call must add none.
+            let activity_len = reg.activity_log().len();
+            let err = reg.tool_call(&contract(), "read_file").unwrap_err();
+            assert_eq!(err.code, ERR_ILLEGAL_TRANSITION, "{state:?}");
+            assert!(err.message.contains(state.as_str()));
+            assert_eq!(reg.activity_log().len(), activity_len);
+            assert_eq!(reg.get("s1").unwrap().state, state);
+            assert_eq!(reg.get("s1").unwrap().subscribers, subscribers);
+        }
+    }
+
+    #[test]
+    fn q6_tool_call_on_cancelled_does_not_burn_leftover_grant() {
+        // T4: a grant left over after abort (abort does not purge,
+        // D6 follow-up) is NOT consumed by a refused tool_call —
+        // the gate stands before gate_tool_call, so the grant stays
+        // visible in list_approvals and find still sees it.
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        reg.allow_tool("send_message");
+        reg.approve_tool("send_message", "k1", "zen", "s1").unwrap();
+        assert_eq!(reg.list_approvals().len(), 1);
+        reg.abort("s1", &contract()).unwrap();
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Cancelled);
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        assert!(reg.activity_log().is_empty());
+        assert!(reg.approvals.find("send_message", "k1", "s1").is_some());
+        assert_eq!(reg.list_approvals().len(), 1);
+        // A second refusal is identical and still burns nothing.
+        let err = reg.tool_call(&contract(), "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        assert_eq!(reg.list_approvals().len(), 1);
+    }
+
+    #[test]
+    fn q6_unknown_session_passes_through() {
+        // T5 (D1): a session id with no record keeps today's
+        // behaviour — approve creates the grant, tool_call reaches
+        // the gate — instead of failing closed in this PR.
+        let mut reg = Registry::new();
+        reg.allow_tool("read_file");
+        // send_message needs its own allow rule: without one the
+        // default-deny policy refuses it before the approval check.
+        reg.allow_tool("send_message");
+        reg.approve_tool("send_message", "k1", "zen", "ghost")
+            .unwrap();
+        assert_eq!(reg.list_approvals().len(), 1);
+        let mut ghost = contract();
+        ghost.session_id = "ghost".to_string();
+        let err = reg.tool_call(&ghost, "read_file").unwrap_err();
+        assert_eq!(err.code, ERR_TOOL_EXECUTION_NOT_WIRED);
+        // A different idempotency key has no grant: still waiting.
+        ghost.idempotency_key = "k2".to_string();
+        let err = reg.tool_call(&ghost, "send_message").unwrap_err();
+        assert_eq!(err.code, ERR_APPROVAL_REQUIRED);
+    }
+
+    #[test]
+    fn q6_terminal_refusal_leaves_no_trace() {
+        // T6: refusals after end leave nothing behind — the end
+        // receipt and key are untouched, the replay still returns
+        // the old receipt, the session log does not grow, completed
+        // steers are intact, and another session's grant is intact.
+        let mut reg = Registry::new();
+        reg.set_zen_bin(fake_zen("q6t6", HAPPY_BODY));
+        reg.create("s1", &contract()).unwrap();
+        reg.create("s2", &contract()).unwrap();
+        reg.allow_tool("send_message");
+        reg.approve_tool("send_message", "k1", "zen", "s2").unwrap();
+        let mut emit = |_ev: SenEvent| {};
+        assert_eq!(
+            reg.steer("s1", &contract(), "steer", "hi", &mut emit),
+            Ok(SessionState::Running)
+        );
+        let first = reg.end("s1", &contract()).unwrap();
+        assert!(!first.already_ended);
+        assert_eq!(first.turns_completed, 1);
+        let log_len = reg.get("s1").unwrap().log.len();
+        // end() itself records one activity-log entry
+        // ("sen.session.end"); the refused calls must add none.
+        let activity_len = reg.activity_log().len();
+        assert_eq!(activity_len, 1);
+        let receipt_before = reg.get("s1").unwrap().end_receipt.clone();
+        let key_before = reg.get("s1").unwrap().end_key.clone();
+        let steers_before = reg.completed_steers.get("s1").map(|m| m.len());
+        let err = reg
+            .approve_tool("send_message", "k1", "zen", "s1")
+            .unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        let err = reg.tool_call(&contract(), "read_file").unwrap_err();
+        assert_eq!(err.code, ERR_ILLEGAL_TRANSITION);
+        assert_eq!(reg.get("s1").unwrap().end_receipt, receipt_before);
+        assert_eq!(reg.get("s1").unwrap().end_key, key_before);
+        assert_eq!(reg.get("s1").unwrap().log.len(), log_len);
+        assert_eq!(
+            reg.completed_steers.get("s1").map(|m| m.len()),
+            steers_before
+        );
+        assert_eq!(reg.activity_log().len(), activity_len);
+        // End replay with the same key still returns the old receipt.
+        let replay = reg.end("s1", &contract()).unwrap();
+        assert!(replay.already_ended);
+        assert_eq!(replay.state, SessionState::Completed);
+        assert_eq!(replay.turns_completed, first.turns_completed);
+        assert_eq!(reg.get("s1").unwrap().log.len(), log_len);
+        // The other session's grant is untouched.
+        assert_eq!(reg.list_approvals().len(), 1);
+    }
+
+    #[test]
+    fn q6_revoke_tool_unchanged_on_terminal() {
+        // T8 (D3): revoke_tool is NOT gated — revoke is a cleanup
+        // path like unsubscribe, not a use of the session. On a
+        // terminal session there is no live grant to remove, so it
+        // returns false without error; a live session's grant still
+        // revokes normally.
+        let mut reg = Registry::new();
+        reg.create("s1", &contract()).unwrap();
+        reg.end("s1", &contract()).unwrap();
+        // end() itself records one activity-log entry
+        // ("sen.session.end"); the revoke must add none.
+        let activity_len = reg.activity_log().len();
+        assert_eq!(activity_len, 1);
+        assert_eq!(reg.revoke_tool("send_message", "k1", "s1"), Ok(false));
+        assert_eq!(reg.activity_log().len(), activity_len);
+        reg.create("s2", &contract()).unwrap();
+        reg.approve_tool("send_message", "k1", "zen", "s2").unwrap();
+        assert_eq!(reg.revoke_tool("send_message", "k1", "s2"), Ok(true));
+        assert!(reg.list_approvals().is_empty());
     }
 
     /// BUG-09 (#24): there was no unsubscribe at all. Unsubscribe drops
