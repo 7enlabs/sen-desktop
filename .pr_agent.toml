@@ -7,9 +7,8 @@
 # - fail-closed: if no free model answers, the run fails without spending
 # - output_run_details ON so the pilot comment shows which model actually ran
 [config]
-model = "openrouter/cohere/north-mini-code:free"
+model = "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
 fallback_models = [
-  "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
   "openrouter/google/gemma-4-31b-it:free",
   "openrouter/liquid/lfm-3-1.7b:free",
 ]
