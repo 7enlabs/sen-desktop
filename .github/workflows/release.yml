@@ -30,10 +30,12 @@
 #    globs below must be corrected to match.
 # 5. Version is 0.0.0 in Cargo.toml and package.json: bundles will be
 #    named 0.0.0 until a version is decided before the first v* tag.
-# 6. pnpm/action-setup and actions/setup-node are used at the @v4 tags
-#    exactly as CI uses them; their SHA pins are not resolved in this
-#    draft (other actions are pinned by SHA, copied from the template
-#    or from the versions CI already trusts). Resolve at PR review.
+# 6. pnpm/action-setup and actions/setup-node are pinned by SHA
+#    (resolved by Leader in tin 19489, verified against GitHub API
+#    21/11: pnpm v4 = f40ffcd9367d9f12939873eb1018b921a783ffaa,
+#    setup-node v4 = 49933ea5288caeca8642d1e84afbd3f7d6820020).
+#    The earlier draft used the @v4 tags and a fabricated SHA in
+#    review - both are fixed here, do not reintroduce them.
 # 7. The checks duplicated here (node tests, fmt, check, clippy,
 #    cargo test) are the CI checks, but they have never run inside
 #    this workflow; the first run proves them, it does not inherit
@@ -81,16 +83,16 @@ jobs:
           # (rust-windows). No macOS row: see header.
           - { os: windows-latest }
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
           version: 10.0.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm
@@ -204,7 +206,7 @@ jobs:
             apps/desktop/src-tauri/target/release/bundle/deb/*.deb
             apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
       - name: Upload bundles (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -214,7 +216,7 @@ jobs:
             apps/desktop/src-tauri/target/release/bundle/msi/*.msi
             apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
   release:
     # Attach the bundles to the tag's GitHub Release. Tag-only: a
