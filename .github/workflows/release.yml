@@ -1,0 +1,240 @@
+# DRAFT - Release workflow for Sen Desktop (not yet applied to the repo).
+# Assigned by Leader in tin 19461 (16:23 21/11), matrix decided in tin 19467:
+# first release ships Linux + Windows only, following the existing Sen CI
+# matrix. No macOS leg: Sen CI has no macOS job, so a macOS release leg
+# would ship a platform CI never builds. macOS comes later, after CI
+# proves it. Template: zencore PR #266 release.yml (103 lines, branch
+# dev/release-multiplatform, head 126e5599). Base measured: sen-desktop
+# dev/scaffold 04001c2 (ls-remote 16:53 21/11).
+#
+# How it differs from the zencore template: zencore ships a Rust CLI
+# binary (cargo build / zigbuild + zip). Sen is a Tauri 2 app, so the
+# build job runs the same checks CI runs (pnpm typecheck, vite build
+# via Tauri beforeBuildCommand) and then `cargo tauri build`, and the
+# artifacts are the Tauri bundles (.deb + .AppImage on Linux,
+# .msi + .exe on Windows), not a zipped binary.
+#
+# UNVERIFIED - must be proven on the first run before any real release:
+# 1. Windows leg: never run (Sen CI only proves cargo test on Windows,
+#    never a Tauri build or an installer).
+# 2. Release job: never run (no tag has been pushed through this file).
+# 3. Tauri CLI install step: `cargo install tauri-cli` compiles from
+#    source; first run will show the real time. The CLI is pinned to
+#    =2.12.5 to match the lib (tauri = "=2.12.5" in Cargo.toml, CLI
+#    2.12.5 confirmed to exist on crates.io 21/11). --locked is left
+#    off on purpose: cargo install --locked fails when the published
+#    crate ships no lockfile (see step comment).
+# 4. Bundle file names: tauri.conf.json has no "bundle" section, so
+#    the default targets apply (deb + AppImage on Linux, msi + nsis
+#    on Windows). If the first run produces other names, the upload
+#    globs below must be corrected to match.
+# 5. Version is 0.0.0 in Cargo.toml and package.json: bundles will be
+#    named 0.0.0 until a version is decided before the first v* tag.
+# 6. pnpm/action-setup and actions/setup-node are pinned by SHA
+#    (resolved by Leader in tin 19489, verified against GitHub API
+#    21/11: pnpm v4 = f40ffcd9367d9f12939873eb1018b921a783ffaa,
+#    setup-node v4 = 49933ea5288caeca8642d1e84afbd3f7d6820020).
+#    The earlier draft used the @v4 tags and a fabricated SHA in
+#    review - both are fixed here, do not reintroduce them.
+# 7. The checks duplicated here (node tests, fmt, check, clippy,
+#    cargo test) are the CI checks, but they have never run inside
+#    this workflow; the first run proves them, it does not inherit
+#    CI's green.
+name: Release
+
+# Build the release bundles for every platform CI builds and attach
+# them to the GitHub Release for the tag. The build matrix follows the
+# `runs-on` values of ci.yml (node-tests/rust/coverage on ubuntu-latest,
+# rust-windows on windows-latest) so a platform CI builds is a platform
+# the release ships. Tag pushes do NOT trigger CI (ci.yml only runs on
+# push to main/dev/scaffold and on pull_request), so this workflow runs
+# the same checks CI runs before building - otherwise a tag on a
+# commit CI never tested could ship untested.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# No workflow-level write: the build job only reads, the release job
+# is the only one that writes (creates the GitHub Release).
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux leg: mirrors the ubuntu-latest jobs in ci.yml
+          # (node-tests, rust, coverage).
+          - { os: ubuntu-latest }
+          # Windows leg: mirrors the windows-latest job in ci.yml
+          # (rust-windows). No macOS row: see header.
+          - { os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install Tauri system dependencies (Linux)
+        # Same set as the rust job in ci.yml: Tauri 2 on Linux needs
+        # the webview (webkit2gtk) and gtk stacks. Windows runners
+        # already carry WebView2, so this step is Linux-only, same
+        # as the rust-windows job in ci.yml.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Install Rust toolchain (Linux)
+        # Same as the rust job in ci.yml: fmt + clippy components,
+        # because this leg runs fmt/check/clippy below.
+        if: runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Rust toolchain (Windows)
+        # Same as the rust-windows job in ci.yml: no fmt/clippy
+        # components, this leg only runs cargo test.
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+      - name: Install dependencies
+        # Same as ci.yml: root script installs the whole workspace
+        # (packages/core + apps/desktop).
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck frontend + core
+        # Same as ci.yml: vite build does NOT typecheck, so a type
+        # error would otherwise ship in a release bundle.
+        run: pnpm typecheck
+      - name: Run node test suite
+        # Same as ci.yml (root script "test"): every suite
+        # (packages/core plus apps/desktop). A tag push does not
+        # trigger CI, so the release build runs the tests itself.
+        run: pnpm test
+      - name: Check Rust formatting
+        # Same as the rust job in ci.yml; Linux only, fmt is
+        # platform-independent and the rust job already covers it.
+        if: runner.os == 'Linux'
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+      - name: Check Rust code
+        # Same as the rust job in ci.yml; Linux only.
+        if: runner.os == 'Linux'
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+      - name: Lint Rust code with Clippy
+        # Same as the rust job in ci.yml (-D warnings, --all-targets);
+        # Linux only, clippy only compiles the skipped-on-Windows
+        # modules on Linux (see ci.yml).
+        if: runner.os == 'Linux'
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Run Rust test suite (Linux)
+        # Same crate tests as the rust/coverage jobs in ci.yml.
+        if: runner.os == 'Linux'
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+      - name: Run Rust test suite (Windows)
+        # Same as the rust-windows job in ci.yml: the two modules
+        # skipped here spawn a fake `zen` binary written as a
+        # #!/bin/sh script, which cannot execute on Windows.
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --skip commands::cli_spawn --skip commands::registry
+      - name: Install Tauri CLI
+        # The repo has no @tauri-apps/cli dependency, so the CLI
+        # comes from crates.io, pinned =2.12.5 to match the lib
+        # (tauri = "=2.12.5" in Cargo.toml; CLI 2.12.5 confirmed on
+        # crates.io 21/11). No --locked: cargo install --locked
+        # fails when the published crate ships no lockfile. This is
+        # the slowest step on first run; swapping it for the prebuilt
+        # tauri-apps/tauri-action is a PR-review option.
+        run: cargo install tauri-cli --version "=2.12.5"
+      - name: Build Tauri app
+        # Runs in apps/desktop: tauri.conf.json sets beforeBuildCommand
+        # to `pnpm build` (vite build, frontendDist ../dist), then
+        # builds the Tauri binary and the platform bundles.
+        working-directory: apps/desktop
+        run: cargo tauri build
+      - name: Assert all bundle types present (Linux)
+        # One missing bundle type must fail the leg: the upload step
+        # below only errors when NO file matches at all, so a leg
+        # shipping .deb without .AppImage would otherwise pass.
+        if: runner.os == 'Linux'
+        run: |
+          shopt -s nullglob
+          deb=(apps/desktop/src-tauri/target/release/bundle/deb/*.deb)
+          appimage=(apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage)
+          if [ ${#deb[@]} -lt 1 ] || [ ${#appimage[@]} -lt 1 ]; then
+            echo "missing bundle type: deb=${#deb[@]} appimage=${#appimage[@]}"
+            ls -R apps/desktop/src-tauri/target/release/bundle
+            exit 1
+          fi
+      - name: Assert all bundle types present (Windows)
+        # Same as the Linux assert: .msi and .exe (nsis) must both
+        # be present, not just one of them.
+        if: runner.os == 'Windows'
+        run: |
+          shopt -s nullglob
+          msi=(apps/desktop/src-tauri/target/release/bundle/msi/*.msi)
+          nsis=(apps/desktop/src-tauri/target/release/bundle/nsis/*.exe)
+          if [ ${#msi[@]} -lt 1 ] || [ ${#nsis[@]} -lt 1 ]; then
+            echo "missing bundle type: msi=${#msi[@]} nsis=${#nsis[@]}"
+            ls -R apps/desktop/src-tauri/target/release/bundle
+            exit 1
+          fi
+      - name: Upload bundles (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sen-desktop-linux
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/deb/*.deb
+            apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload bundles (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sen-desktop-windows
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/msi/*.msi
+            apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    # Attach the bundles to the tag's GitHub Release. Tag-only: a
+    # manual dispatch builds the legs without uploading, so the
+    # workflow can be smoke-tested without touching a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: sen-desktop-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
