@@ -1,0 +1,322 @@
+// App entry: the Tauri webview loads this module from index.html, so
+// loading it starts the app. The UI is a real chat UI now (P0-1):
+// startChatUI renders the shared transcript, and bootChat wires one
+// session, one ChatSession (desktop + Telegram share it), and the
+// Telegram poll loop when a token is configured.
+//
+// Wiring (SDK move, tin 9328/9459: the Pi SDK is out of the webview):
+// - One SessionManager owns the session, created here and shared by
+//   both steps below. Start and attach never use different managers.
+// - One ActionContract covers the session lifecycle, built here and
+//   closed over by both IPC calls.
+// - The session is created through the backend only: createSession
+//   (sen_session_create) makes the backend record first, then the local
+//   record in this manager, exactly the order the BUG-02 fix established.
+//   No SDK session is created anywhere in the webview: the Pi SDK
+//   (createAgentSession, ModelRuntime) cannot run in a browser, and the
+//   vite build failed on it (Rollup: "spawn" is not exported). The model
+//   runs in the backend through the CLI core + stream-json bridge
+//   (Phase 2, tin 9530): steer/followUp run the `zen` CLI for the
+//   session, and model events flow from the backend as Tauri events
+//   (sen-session-event) while a turn runs.
+// - subscribeSession records the subscriber on the backend. Model events
+//   flow from the backend (Tauri events) while a CLI turn runs; the
+//   listener is listenSessionEvents in ../ipc/session-events.ts, installed
+//   by attachLiveSession, which records every validated event in the
+//   session's raw log (kind session_event) and passes it to onEvent when
+//   given — so the app receives the CLI's system/assistant/user/result
+//   events (R2-16 / #65), instead of subscribing and never listening.
+// - No model id, no key, no network call is configured here: the entry
+//   names no model and holds no key. The model comes from local app
+//   settings (sen_settings_get_model, default free model when nothing is
+//   stored); the key reaches the CLI through the environment on the
+//   backend side, never through the webview.
+//
+// P0-1 (chat + Telegram + file memory):
+// - ChatSession (../chat/chat.ts) owns the shared transcript and the
+//   send queue. Desktop sends and Telegram sends go through the same
+//   session, the same queue, and the same transcript, so both channels
+//   see the same context. Memory commands (/nhớ, /quên, ...) run
+//   locally in the chat layer and never reach the model.
+// - The Telegram poll loop (../chat/telegram.ts) starts only when a
+//   token is configured (sen_telegram_status). Without one, the desktop
+//   chat still works and the status line says so; the boot never fails
+//   for a missing token.
+// - The backend prepends the memory context block to every turn prompt
+//   (MemoryStore::turn_prompt), so the model always sees the current
+//   memory, including a `quên` that just deleted a fact.
+//
+// Still open, NOT decided here:
+// - This wiring is proven under node (tests) and by a successful vite
+//   build after the SDK move, not yet in a real webview (no Rust
+//   toolchain on this box, so tauri dev/build is not run here).
+// - No UI supplies a model id at runtime yet; the model comes from local
+//   app settings (sen_settings_set_model), default free model when
+//   nothing is stored. There is no settings screen in this phase.
+import { attachLiveSession } from "../ipc/live-client.ts";
+import type { AttachedLiveSession } from "../ipc/live-client.ts";
+import type { ActionContract } from "../ipc/types.ts";
+import type { SenEvent } from "../ipc/session-events.ts";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { SessionManager } from "../../../../packages/core/src/session.ts";
+import { ChatSession, type ChatChannel } from "../chat/chat.ts";
+import {
+  getRouterSetting,
+  setRouterSetting,
+} from "../ipc/settings-client.ts";
+import {
+  getTelegramStatus,
+  sendTelegramMessage,
+  startTelegramLoop,
+} from "../chat/telegram.ts";
+import { startChatUI, type ChatUI } from "./chat-ui.ts";
+import { fetchBriefSource } from "../ipc/brief-client.ts";
+import { matchSkill } from "../ipc/skills-client.ts";
+import { delegateMcpTool } from "../ipc/mcp-delegate-client.ts";
+
+export interface StartAppOptions {
+  // Session id for the one app session. Defaults to a freshly
+  // generated UUID (crypto.randomUUID): the CLI rejects a
+  // non-UUID --session-id with exit 4 (R2B-01), so the fixed
+  // string "app-live-session" can never be the default. There is
+  // no UI yet to open a second one.
+  sessionId?: string;
+  // An existing manager to bind into. When omitted, the app creates one
+  // and owns it for the whole session lifecycle.
+  manager?: SessionManager;
+  // Optional extra sink for live events, in addition to the session
+  // record: every validated event is recorded in the session's raw log
+  // (kind session_event) with or without this callback (R2-16 / #65).
+  onEvent?: (event: SenEvent) => void;
+}
+
+export interface StartedApp {
+  manager: SessionManager;
+  sessionId: string;
+  state: string;
+  attached: AttachedLiveSession;
+  // Stops the frontend event listener installed by attach. The caller
+  // owns it: pass it to closeLiveSession when the session closes.
+  // V-04 (base 7158fe1): no production close path exists yet — no UI,
+  // no window-close handler, no closeApp — so nothing passes this in
+  // today. When the UI builds a close path, it passes this value as the
+  // 4th argument to closeLiveSession (manager, contract, sessionId,
+  // unlisten); closeLiveSession already stops the listener first, then
+  // unsubscribes, then aborts. Do not invent a closeApp here: the close
+  // path belongs to the UI work that owns the window lifecycle.
+  unlisten: UnlistenFn | null;
+}
+
+// The one contract for the app session lifecycle. The id and the
+// idempotency key are unique per start, so a second app start never
+// reuses the first start's key. The session id rides the contract
+// (P1-4 Rust session, 19/11): the backend keys every approval by
+// it, so a grant from another session never authorizes a call here.
+function appLiveContract(sessionId: string): ActionContract {
+  const nonce = sessionId + "-" + Date.now();
+  return {
+    id: "app-live-" + nonce,
+    capability: "sen.session",
+    capabilityVersion: "1",
+    actor: "app",
+    purpose: "app live session",
+    phase: "live",
+    toolKind: "registered-tool",
+    sideEffect: "no-side-effect",
+    risk: "low",
+    idempotencyKey: "app-live-" + nonce,
+    timeoutMs: 120000,
+    approvalRequired: false,
+    auditRequired: false,
+    sessionId,
+  };
+}
+
+// Starts the app: one session, wired through the backend registry
+// first, then attached on the same manager. A second start on the same
+// manager and session id refuses before any backend call
+// (DUPLICATE_SESSION). Returns the manager, the session id, its state,
+// and the attached session, so the caller (later: the UI) can steer,
+// follow up, and close it once the backend runs the model through the
+// CLI bridge.
+export async function startApp(
+  options: StartAppOptions = {},
+): Promise<StartedApp> {
+  const sessionId = options.sessionId ?? crypto.randomUUID();
+  const manager = options.manager ?? new SessionManager();
+  if (manager.hasSession(sessionId)) {
+    throw new Error("DUPLICATE_SESSION: Session already exists: " + sessionId);
+  }
+  const contract = appLiveContract(sessionId);
+  // attachLiveSession creates the session (backend ack, then the local
+  // record) and subscribes on the same manager; startApp does not create
+  // it separately, or the second create would hit DUPLICATE_SESSION.
+  // Attach also installs the session-event listener, so the CLI's
+  // system/assistant/user/result events reach the app (R2-16 / #65):
+  // every validated event is recorded in the session's raw log, and the
+  // caller's onEvent gets the same events when given.
+  const attached = await attachLiveSession(manager, contract, sessionId, {
+    onEvent: options.onEvent,
+  });
+  return {
+    manager,
+    sessionId,
+    state: attached.state,
+    attached,
+    unlisten: attached.unlisten,
+  };
+}
+
+// One contract per chat send (desktop or Telegram): fresh id and
+// idempotency key per send, so two sends never share a key even in the
+// same millisecond. The actor is the channel, so the backend record
+// says which channel a turn came from.
+function chatContract(
+  sessionId: string,
+  channel: ChatChannel,
+  purpose: string,
+): ActionContract {
+  const nonce =
+    sessionId +
+    "-" +
+    Date.now() +
+    "-" +
+    Math.random().toString(36).slice(2, 8);
+  return {
+    id: "chat-" + nonce,
+    capability: "sen.session",
+    capabilityVersion: "1",
+    actor: channel,
+    purpose,
+    phase: "live",
+    toolKind: "registered-tool",
+    sideEffect: "no-side-effect",
+    risk: "low",
+    idempotencyKey: "chat-" + nonce,
+    timeoutMs: 120000,
+    approvalRequired: false,
+    auditRequired: false,
+    sessionId,
+  };
+}
+
+// Boot the chat app (P0-1): one session, one shared ChatSession, the
+// chat UI, and the Telegram poll loop when a token is configured.
+// A missing Telegram token is not a boot failure: the desktop chat
+// still works and the status line says Telegram is not configured.
+async function bootChat(): Promise<void> {
+  const root = document.getElementById("app");
+  if (!root) {
+    throw new Error("No #app element, FAIL");
+  }
+  const sessionId = crypto.randomUUID();
+  const makeContract = (channel: ChatChannel, purpose: string) =>
+    chatContract(sessionId, channel, purpose);
+  let ui: ChatUI | null = null;
+  const chat = new ChatSession({
+    makeContract,
+    // P0-3: the router client is the real settings backend; /model
+    // reads and switches the preferred route through it.
+    router: {
+      getRouter: (contract) => getRouterSetting(contract),
+      setPreferredRoute: (contract, routeId) =>
+        setRouterSetting(contract, { preferredRoute: routeId }),
+    },
+    onTranscript: (entries) => ui?.render(entries),
+    onBusy: (busy) => ui?.setBusy(busy),
+    onRouterStatus: (text) => ui?.setRouterStatus(text),
+    // CI P2-9 (P0-4): the brief HTML lands in the chat UI panel.
+    // Tauri follow-ups (19/11, ZC Leader tin 17093): the three
+    // seams ChatSession offers are now wired to Rust commands,
+    // because the webview itself has neither fs nor spawn:
+    // - briefSource: sen_brief_source fetches Gmail + Calendar on
+    //   the Rust side (SEN_GMAIL_ACCESS_TOKEN in the backend
+    //   environment). Without the token the command fails and
+    //   /brief keeps refusing honestly — no source is invented.
+    // - skillMatcher: sen_skill_match scans the skills dir on the
+    //   Rust side and returns metadata only; the webview never
+    //   reads a SKILL.md file itself.
+    // - delegateToolCall: sen_mcp_delegate spawns `zen` on a fresh
+    //   delegate bridge on the Rust side.
+    // What main.ts deliberately does NOT pass, and why:
+    // - No mcpServers: there is no MCP server config store yet
+    //   (no UI, no settings file for server configs), so /mcp
+    //   still refuses an unconfigured server honestly. The
+    //   delegate command itself is proven (Rust + client tests);
+    //   the config store is a separate follow-up for the Leader.
+    // The node-side factory in ../chat/skill-matcher.ts and the
+    // node delegate in packages/core/src/mcp-client.ts remain for
+    // tests and node-side use only; importing them here would
+    // break vite build (probe 19/11: exit 1, "Module node:fs /
+    // node:child_process has been externalized for browser
+    // compatibility").
+    briefSource: () =>
+      fetchBriefSource(makeContract("desktop", "brief source")),
+    skillMatcher: async (query) =>
+      (await matchSkill(makeContract("desktop", "skill match"), query)) ??
+      undefined,
+    delegateToolCall: (input) =>
+      delegateMcpTool(makeContract("desktop", "mcp delegate"), {
+        sessionId,
+        serverName: input.serverName,
+        serverConfig: input.serverConfig,
+        tool: input.tool,
+        arguments: input.arguments,
+      }),
+    onBrief: (html) => ui?.showBrief(html),
+    sendTelegram: async (chatId, text) => {
+      await sendTelegramMessage(
+        makeContract("telegram", "telegram send"),
+        chatId,
+        text,
+      );
+    },
+  });
+  const app = await startApp({
+    sessionId,
+    onEvent: (event) => chat.handleEvent(event),
+  });
+  chat.bind(app.sessionId);
+  ui = startChatUI(root, chat);
+  ui.setSession(app.sessionId);
+  ui.setRouterStatus("Model: đang kiểm tra…");
+  void chat.refreshRouterStatus();
+  ui.setTelegramStatus("Telegram: đang kiểm tra…");
+  try {
+    const status = await getTelegramStatus(
+      makeContract("telegram", "telegram status"),
+    );
+    if (status.configured) {
+      const scope = status.allowedChatIdSet
+        ? " (giới hạn 1 chat)"
+        : status.allowAnyChat
+          ? " (mọi chat, đã cho phép rõ)"
+          : " (không chat nào được phép)";
+      ui.setTelegramStatus("Telegram: đã kết nối" + scope);
+      startTelegramLoop(chat, makeContract);
+    } else {
+      ui.setTelegramStatus("Telegram: chưa cấu hình (SEN_TELEGRAM_BOT_TOKEN)");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ui.setTelegramStatus("Telegram: không kiểm tra được (" + message + ")");
+  }
+}
+
+// Boot: this module IS the app entry (index.html loads it), so loading
+// it in a real webview starts the app. Under node (tests) there is no
+// window, so nothing auto-starts there; tests call startApp directly.
+// A boot failure is reported in the shell and on the console, never
+// swallowed and never replaced with fake content.
+if (typeof window !== "undefined") {
+  bootChat().catch((error: unknown) => {
+    const message =
+      error instanceof Error ? error.message : String(error);
+    // eslint-disable-next-line no-console
+    console.error("Sen failed to start: " + message);
+    const root = document.getElementById("app");
+    if (root) {
+      root.textContent = "Sen failed to start: " + message;
+    }
+  });
+}
