@@ -239,5 +239,10 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
-          files: dist/*
+          # Recursive glob: download-artifact preserves the bundle
+          # subdirectories (deb/, appimage/, msi/, nsis/) inside
+          # dist/, so dist/* only matches directories and the
+          # release job failed with "Pattern 'dist/*' does not
+          # match any files" on the first v0.1.0 run (45005980365).
+          files: dist/**/*
           fail_on_unmatched_files: true
