@@ -6,8 +6,8 @@ Pi SDK removed from the app in PR #33; the model runs in the backend
 through the CLI core + stream-json bridge; Tauri command handlers are real (commands/registry.rs plus
 the Builder in main.rs); the frontend bridge calls the real
 @tauri-apps/api invoke; the live session channel is wired
-(packages/core model-channel + live-session, OpenRouter free route, explicit
-model only, key only from OPENROUTER_API_KEY at runtime; live attach real
+(packages/core model-channel + live-session, free route, explicit
+model only, key only from MODEL_API_KEY at runtime; live attach real
 via apps/desktop ipc/live-client.ts; stream events flow through the
 stream-json bridge); tool execution is still refused; the frontend bundler
 is still missing, so the full app is not built; cargo check evidence for
@@ -31,7 +31,7 @@ structural level:
   no feature UI, no fake content.
 - Default model: NONE; packages/providers is only a channel-declaration
   shell, no model attached, no key, no network call. Live sessions name
-  their model explicitly at call time (OpenRouter free route, tin 4528/4542);
+  their model explicitly at call time (free route, tin 4528/4542);
   no default model id is stored anywhere in this bundle.
 
 Repo frame: pnpm workspace, ESM-only. `apps/desktop` holds no shared

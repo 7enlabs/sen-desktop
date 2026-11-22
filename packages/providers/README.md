@@ -19,7 +19,7 @@ packages/core may import the SDK.
 
 `src/router.ts` is real, tested logic (see `docs/model-router.md`):
 the router picks a (provider, model, base URL) route for each agent
-chat turn from the free-only chain spark → openrouter-free → ollama,
+chat turn from the free-only chain spark → free → ollama,
 with BYOK only on explicit user approval and a paid route never
 usable. It holds no key and makes no network call; the model call
 itself still runs through the CLI bridge. The Rust mirror lives in

@@ -168,7 +168,7 @@ session/settings commands. Multi-arg commands nest their own args under
   one number, written before the in-memory offset moves. Deleting it
   resets the poll to offset 0 (the next start re-fetches up to 100 recent
   updates; the in-process dedupe does not cover a restart).
-- Model: the CLI's free default (`google/gemini-4-argon:free`) unless the
+- Model: the CLI's free default (`deepseek-v4.1-flash`) unless the
   operator stored another model with `sen_settings_set_model`. No paid
   model is configured anywhere in this change.
 

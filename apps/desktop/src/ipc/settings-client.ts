@@ -94,14 +94,14 @@ export async function setBaseUrlSetting(
 
 // --- Model router (Sen P0-3) ---
 // The router picks a (provider, model, base URL) route per turn from
-// the free-only chain spark -> openrouter-free -> ollama, with BYOK
+// the free-only chain spark -> free -> ollama, with BYOK
 // only on explicit user approval. No key field ever travels here:
 // byokKeyPresent is a boolean the backend computes from the env var
 // name alone.
 
 export type RouterProvider =
   | "spark"
-  | "openrouter-free"
+  | "free"
   | "ollama"
   | "byok";
 

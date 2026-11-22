@@ -73,11 +73,11 @@ function contract(): ActionContract {
 
 // --- 1. Pure router ---
 
-test("router: default chain is spark, openrouter-free, ollama, all 0 dong", () => {
+test("router: default chain is spark, free, ollama, all 0 dong", () => {
   const config = defaultRouterConfig();
   assert.deepEqual(
     config.routes.map((r) => r.id),
-    ["spark", "openrouter-free", "ollama"],
+    ["spark", "free", "ollama"],
   );
   for (const route of config.routes) {
     assert.equal(routeCostLabel(route), "0 đồng");
@@ -86,14 +86,14 @@ test("router: default chain is spark, openrouter-free, ollama, all 0 dong", () =
   assert.equal(config.routes[0].baseUrl, undefined);
   assert.equal(
     config.routes[1].baseUrl,
-    "https://openrouter.ai/api/v1",
+    "https://api.experientiallabs.ai/api/v1",
   );
   assert.equal(config.routes[2].baseUrl, "http://127.0.0.1:11434/v1");
   assert.deepEqual(validateRouterConfig(config), []);
   assert.equal(selectRoute(config)?.id, "spark");
   assert.equal(
     describeRoute(config.routes[0]),
-    "spark · google/gemini-4-argon:free · 0 đồng",
+    "spark · deepseek-v4.1-flash · 0 đồng",
   );
 });
 
@@ -102,12 +102,12 @@ test("router: preferred route goes first, then the chain order", () => {
   config.preferredRoute = "ollama";
   assert.deepEqual(
     resolveAttemptOrder(config).map((r) => r.id),
-    ["ollama", "spark", "openrouter-free"],
+    ["ollama", "spark", "free"],
   );
   config.preferredRoute = "no-such-route";
   assert.deepEqual(
     resolveAttemptOrder(config).map((r) => r.id),
-    ["spark", "openrouter-free", "ollama"],
+    ["spark", "free", "ollama"],
   );
 });
 
@@ -126,8 +126,8 @@ test("router: nextRoute walks the chain and never restarts at the first route (P
   // resolveAttemptOrder and walks the snapshot (L2 follow-up to
   // PR #96); nextRoute itself takes no config.
   const order = resolveAttemptOrder(defaultRouterConfig());
-  assert.equal(nextRoute(order, "spark")?.id, "openrouter-free");
-  assert.equal(nextRoute(order, "openrouter-free")?.id, "ollama");
+  assert.equal(nextRoute(order, "spark")?.id, "free");
+  assert.equal(nextRoute(order, "free")?.id, "ollama");
   assert.equal(nextRoute(order, "ollama"), undefined);
   assert.equal(nextRoute(order, "no-such-route"), undefined);
   assert.equal(nextRoute(order, ""), undefined);
@@ -142,29 +142,29 @@ test("router: nextRoute walks a snapshot order fixed at turn start (L2 follow-up
   const config = defaultRouterConfig();
   const order = resolveAttemptOrder(config);
   assert.equal(order.length, 3);
-  assert.equal(nextRoute(order, "spark")?.id, "openrouter-free");
-  assert.equal(nextRoute(order, "openrouter-free")?.id, "ollama");
+  assert.equal(nextRoute(order, "spark")?.id, "free");
+  assert.equal(nextRoute(order, "free")?.id, "ollama");
   assert.equal(nextRoute(order, "ollama"), undefined);
   assert.equal(nextRoute(order, "no-such-route"), undefined);
   // Mutating the config after the snapshot leaves the walk alone.
   config.preferredRoute = "ollama";
   config.routes = config.routes.filter((r) => r.id !== "ollama");
-  assert.equal(nextRoute(order, "spark")?.id, "openrouter-free");
-  assert.equal(nextRoute(order, "openrouter-free")?.id, "ollama");
+  assert.equal(nextRoute(order, "spark")?.id, "free");
+  assert.equal(nextRoute(order, "free")?.id, "ollama");
   // A reordered snapshot walks the reordered order: the caller,
   // not nextRoute, owns the snapshot.
   const reordered = [...order].reverse();
-  assert.equal(nextRoute(reordered, "ollama")?.id, "openrouter-free");
+  assert.equal(nextRoute(reordered, "ollama")?.id, "free");
 });
 
 test("router: BYOK is skipped without approval or without a key", () => {
   const byok: Route = {
-    id: "byok-openrouter",
+    id: "byok",
     provider: "byok",
-    model: "anthropic/claude-sonnet-4",
-    baseUrl: "https://openrouter.ai/api/v1",
+    model: "deepseek-v4.1-flash",
+    baseUrl: "https://api.experientiallabs.ai/api/v1",
     byokApproved: true,
-    keyEnv: "OPENROUTER_API_KEY",
+    keyEnv: "MODEL_API_KEY",
   };
   const config: RouterConfig = {
     routes: [...defaultRouterConfig().routes, byok],
@@ -173,7 +173,7 @@ test("router: BYOK is skipped without approval or without a key", () => {
   // Key absent: BYOK never attempted, even approved.
   assert.deepEqual(
     resolveAttemptOrder(config, false).map((r) => r.id),
-    ["spark", "openrouter-free", "ollama"],
+    ["spark", "free", "ollama"],
   );
   // Key present: BYOK joins the order after the free routes (cap 3
   // keeps the first three, so it only runs when preferred or when a
@@ -181,9 +181,9 @@ test("router: BYOK is skipped without approval or without a key", () => {
   // accident).
   const preferred: RouterConfig = {
     ...config,
-    preferredRoute: "byok-openrouter",
+    preferredRoute: "byok",
   };
-  assert.equal(resolveAttemptOrder(preferred, true)[0].id, "byok-openrouter");
+  assert.equal(resolveAttemptOrder(preferred, true)[0].id, "byok");
   assert.equal(
     routeCostLabel(byok),
     "key của bạn (BYOK)",
@@ -385,7 +385,7 @@ test("chat /model: lists the chain with costs, never steers", async () => {
   const entries = chat.getTranscript();
   assert.equal(entries.length, 1);
   assert.equal(entries[0].role, "system");
-  assert.match(entries[0].text, /● spark · google\/gemini-4-argon:free · 0 đồng/);
+  assert.match(entries[0].text, /● spark · deepseek-v4.1-flash · 0 đồng/);
   assert.match(entries[0].text, /○ ollama · llama3\.1 · 0 đồng/);
   assert.match(entries[0].text, /Fallback|thử đường tiếp theo/);
   assert.deepEqual(router.sets, []);
@@ -414,7 +414,7 @@ test("chat /model <id>: switches the preferred route and updates the status line
 // P0-3 rev2 (F1): after a fallback the status line must show the
 // route that actually ran, not the preferred route that failed. The
 // fake backend steers on spark's preference but acks with
-// routeId openrouter-free (the fallback route); the line must follow
+// routeId free (the fallback route); the line must follow
 // the ack, enriched with that route's provider/model from the chain.
 test("chat turn: status line follows the route that actually ran after fallback", async () => {
   const router = new FakeRouter(routerResult());
@@ -440,7 +440,7 @@ test("chat turn: status line follows the route that actually ran after fallback"
       numTurns: 1,
       usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0 },
       durationMs: 5,
-      model: "google/gemini-4-argon:free",
+      model: "deepseek-v4.1-flash",
     };
     chat.handleEvent(event);
     return {
@@ -448,7 +448,7 @@ test("chat turn: status line follows the route that actually ran after fallback"
       state: "Running",
       unknownRecords: 0,
       versionMismatches: 0,
-      routeId: "openrouter-free",
+      routeId: "free",
       cost: "0 đồng",
     };
   });
@@ -458,9 +458,9 @@ test("chat turn: status line follows the route that actually ran after fallback"
     setBridgeTransport(null);
   }
   // The preferred/active route is still spark, but the turn ran on
-  // openrouter-free: the line must name the route that ran.
+  // free: the line must name the route that ran.
   assert.deepEqual(statuses, [
-    "Model: openrouter-free · google/gemini-4-argon:free · 0 đồng",
+    "Model: free · deepseek-v4.1-flash · 0 đồng",
   ]);
   const entries = chat.getTranscript();
   assert.equal(entries[1].role, "assistant");
@@ -479,7 +479,7 @@ test("chat /model <unknown>: lists valid ids and sets nothing", async () => {
   assert.deepEqual(router.sets, []);
   const entries = chat.getTranscript();
   assert.match(entries[0].text, /Không có đường "nope"/);
-  assert.match(entries[0].text, /spark, openrouter-free, ollama/);
+  assert.match(entries[0].text, /spark, free, ollama/);
 });
 
 test("chat /model without a router: reports the CLI free default, never fakes a list", async () => {

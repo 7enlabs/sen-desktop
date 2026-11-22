@@ -14,10 +14,10 @@
 // never read into a string we keep).
 use serde::{Deserialize, Serialize};
 
-pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub const DEFAULT_BASE_URL: &str = "https://api.experientiallabs.ai/api/v1";
 pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 /// The CLI's free default model (cli_settings.rs DEFAULT_MODEL).
-pub const FREE_DEFAULT_MODEL: &str = "google/gemini-4-argon:free";
+pub const FREE_DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
 /// Starting value only: change to a model actually pulled in Ollama.
 pub const OLLAMA_DEFAULT_MODEL: &str = "llama3.1";
 /// Max fallback attempts per turn.
@@ -27,8 +27,8 @@ pub const MAX_ATTEMPTS: usize = 3;
 pub enum ProviderKind {
     #[serde(rename = "spark")]
     Spark,
-    #[serde(rename = "openrouter-free")]
-    OpenRouterFree,
+    #[serde(rename = "free")]
+    Free,
     #[serde(rename = "ollama")]
     Ollama,
     #[serde(rename = "byok")]
@@ -39,7 +39,7 @@ impl ProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             ProviderKind::Spark => "spark",
-            ProviderKind::OpenRouterFree => "openrouter-free",
+            ProviderKind::Free => "free",
             ProviderKind::Ollama => "ollama",
             ProviderKind::Byok => "byok",
         }
@@ -51,7 +51,7 @@ impl ProviderKind {
     pub fn from_id(value: &str) -> Option<ProviderKind> {
         match value {
             "spark" => Some(ProviderKind::Spark),
-            "openrouter-free" => Some(ProviderKind::OpenRouterFree),
+            "free" => Some(ProviderKind::Free),
             "ollama" => Some(ProviderKind::Ollama),
             "byok" => Some(ProviderKind::Byok),
             _ => None,
@@ -121,7 +121,7 @@ impl Default for RouterConfig {
     }
 }
 
-/// Default chain, preference order: spark, openrouter-free, ollama.
+/// Default chain, preference order: spark, free, ollama.
 /// BYOK is NOT in the default chain.
 pub fn default_routes() -> Vec<Route> {
     vec![
@@ -135,10 +135,10 @@ pub fn default_routes() -> Vec<Route> {
             key_env: None,
         },
         Route {
-            id: "openrouter-free".to_string(),
-            provider: ProviderKind::OpenRouterFree,
+            id: "free".to_string(),
+            provider: ProviderKind::Free,
             model: FREE_DEFAULT_MODEL.to_string(),
-            base_url: Some(OPENROUTER_BASE_URL.to_string()),
+            base_url: Some(DEFAULT_BASE_URL.to_string()),
             paid: false,
             byok_approved: false,
             key_env: None,
@@ -342,10 +342,10 @@ mod tests {
 
     fn byok_route() -> Route {
         Route {
-            id: "byok-openrouter".to_string(),
+            id: "byok".to_string(),
             provider: ProviderKind::Byok,
-            model: "anthropic/claude-sonnet-4".to_string(),
-            base_url: Some(OPENROUTER_BASE_URL.to_string()),
+            model: "deepseek-v4.1-flash".to_string(),
+            base_url: Some(DEFAULT_BASE_URL.to_string()),
             paid: false,
             byok_approved: true,
             key_env: Some("SEN_TEST_BYOK_KEY_PRESENT".to_string()),
@@ -357,7 +357,7 @@ mod tests {
         let routes = default_routes();
         assert_eq!(
             routes.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            vec!["spark", "openrouter-free", "ollama"]
+            vec!["spark", "free", "ollama"]
         );
         for route in &routes {
             assert!(!route.paid);
@@ -365,7 +365,7 @@ mod tests {
             assert_eq!(route.cost_label(), "0 đồng");
         }
         assert_eq!(routes[0].base_url, None);
-        assert_eq!(routes[1].base_url.as_deref(), Some(OPENROUTER_BASE_URL));
+        assert_eq!(routes[1].base_url.as_deref(), Some(DEFAULT_BASE_URL));
         assert_eq!(routes[2].base_url.as_deref(), Some(OLLAMA_BASE_URL));
         assert!(validate_router_config(&RouterConfig::default()).is_empty());
     }
@@ -379,9 +379,9 @@ mod tests {
         let order = resolve_attempt_order(&config);
         assert_eq!(order[0].id, "ollama");
         assert_eq!(order[1].id, "spark");
-        assert_eq!(order[2].id, "openrouter-free");
+        assert_eq!(order[2].id, "free");
         assert_eq!(next_route(&config, "ollama").unwrap().id, "spark");
-        assert_eq!(next_route(&config, "openrouter-free"), None);
+        assert_eq!(next_route(&config, "free"), None);
     }
 
     #[test]
@@ -398,24 +398,15 @@ mod tests {
     fn next_route_in_walks_a_snapshot_order() {
         let order = resolve_attempt_order(&RouterConfig::default());
         assert_eq!(order.len(), 3);
-        assert_eq!(
-            next_route_in(&order, "spark").unwrap().id,
-            "openrouter-free"
-        );
-        assert_eq!(
-            next_route_in(&order, "openrouter-free").unwrap().id,
-            "ollama"
-        );
+        assert_eq!(next_route_in(&order, "spark").unwrap().id, "free");
+        assert_eq!(next_route_in(&order, "free").unwrap().id, "ollama");
         assert_eq!(next_route_in(&order, "ollama"), None);
         assert_eq!(next_route_in(&order, "no-such-route"), None);
         // A snapshot taken before a reorder still walks the old
         // order: the caller, not next_route_in, owns the snapshot.
         let mut reordered = order.clone();
         reordered.reverse();
-        assert_eq!(
-            next_route_in(&reordered, "ollama").unwrap().id,
-            "openrouter-free"
-        );
+        assert_eq!(next_route_in(&reordered, "ollama").unwrap().id, "free");
     }
 
     #[test]

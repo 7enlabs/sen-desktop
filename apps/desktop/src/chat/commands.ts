@@ -156,5 +156,5 @@ export const COMMAND_USAGE =
   "Lệnh không rõ. Các lệnh: /nhớ <nội dung>, /tôi <nội dung>, " +
   "/quên <số hoặc chữ>, /quên tôi <số hoặc chữ>, /sửa <số> <nội dung>, " +
   "/sửa tôi <số> <nội dung>, /sửa soul <nội dung>, /xem, /nhật ký, " +
-  "/model, /model <tên đường: spark, openrouter-free, ollama>, " +
+  "/model, /model <tên đường: spark, free, ollama>, " +
   "/brief, /mcp <server> <tool> [args-json].";

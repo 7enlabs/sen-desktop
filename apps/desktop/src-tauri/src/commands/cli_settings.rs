@@ -12,7 +12,7 @@
 //
 // What NEVER lives here: the API key. The key travels only through the
 // process environment as ZEN_API_KEY, which the CLI reads itself
-// (zen-cli settings.rs:290, then OPENAI_API_KEY, then apiKeyEnv). The
+// (zen-cli settings.rs:290, then the CLI key env var, then apiKeyEnv). The
 // bridge never reads, stores, logs, or passes the key on argv. There is
 // no key field in this struct, no key in the settings file, and no key in
 // any log line this module can produce.
@@ -20,10 +20,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::atomic_file::write_atomic;
-use super::model_router::{default_routes, validate_router_config, Route, RouterConfig};
+use super::model_router::{
+    default_routes, validate_router_config, Route, RouterConfig, DEFAULT_BASE_URL,
+};
 
 /// The CLI's own free default model (zen-cli settings.rs:6).
-pub const DEFAULT_MODEL: &str = "google/gemini-4-argon:free";
+pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
 
 /// Settings file name inside the app config dir.
 pub const SETTINGS_FILE_NAME: &str = "cli-settings.json";
@@ -53,6 +55,98 @@ impl Default for CliSettings {
     }
 }
 
+/// Migration for settings files written before the provider-hiding
+/// rename (22/11/2026, dev/hide-providers). The old build stored
+/// route id "openrouter-free", provider "openrouter-free", model
+/// "google/gemini-4-argon:free", base URL "https://openrouter.ai/api/v1",
+/// and BYOK route id "byok-openrouter" with model
+/// "anthropic/claude-sonnet-4" and key env "OPENROUTER_API_KEY".
+///
+/// Why normalize here instead of a serde alias on ProviderKind: an
+/// alias would only fix the enum variant parse. It cannot rename a
+/// route id, preferred_route, a model id, a base URL, or a key env
+/// name. One normalization pass on the raw JSON value in load covers
+/// all five fields, and load is the only entry point that reads the
+/// on-disk file (the Tauri settings handlers all go through it), so
+/// every consumer sees migrated values and the next save persists
+/// them, permanently upgrading the file. Only exact old values are
+/// rewritten; a user's own custom model / base URL / key env is left
+/// untouched.
+///
+/// Without this, an old router fails to parse (unknown provider
+/// variant) or fails validation (unknown preferred route), load drops
+/// it, and the next save overwrites the file without the router —
+/// the stored chain is lost for good. Worse, an old legacy
+/// model/base URL would keep running against the old endpoint, and
+/// an old BYOK route would keep running with the old model, base
+/// URL, and key env.
+fn migrate_legacy_settings(value: &mut serde_json::Value) {
+    fn migrate_string_field(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        map: fn(&str) -> Option<&'static str>,
+    ) {
+        if let Some(serde_json::Value::String(current)) = obj.get_mut(key) {
+            if let Some(new) = map(current) {
+                *current = new.to_string();
+            }
+        }
+    }
+    fn migrate_model(model: &str) -> Option<&'static str> {
+        match model {
+            "google/gemini-4-argon:free" | "anthropic/claude-sonnet-4" => Some(DEFAULT_MODEL),
+            _ => None,
+        }
+    }
+    fn migrate_base_url(url: &str) -> Option<&'static str> {
+        match url {
+            "https://openrouter.ai/api/v1" => Some(DEFAULT_BASE_URL),
+            _ => None,
+        }
+    }
+    fn migrate_route_id(id: &str) -> Option<&'static str> {
+        match id {
+            "openrouter-free" => Some("free"),
+            "byok-openrouter" => Some("byok"),
+            _ => None,
+        }
+    }
+    fn migrate_provider(provider: &str) -> Option<&'static str> {
+        match provider {
+            "openrouter-free" => Some("free"),
+            _ => None,
+        }
+    }
+    fn migrate_key_env(env: &str) -> Option<&'static str> {
+        match env {
+            "OPENROUTER_API_KEY" => Some("MODEL_API_KEY"),
+            _ => None,
+        }
+    }
+
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    migrate_string_field(obj, "model", migrate_model);
+    migrate_string_field(obj, "base_url", migrate_base_url);
+    let Some(router) = obj.get_mut("router").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    migrate_string_field(router, "preferredRoute", migrate_route_id);
+    if let Some(routes) = router.get_mut("routes").and_then(|v| v.as_array_mut()) {
+        for route in routes {
+            let Some(route) = route.as_object_mut() else {
+                continue;
+            };
+            migrate_string_field(route, "id", migrate_route_id);
+            migrate_string_field(route, "provider", migrate_provider);
+            migrate_string_field(route, "model", migrate_model);
+            migrate_string_field(route, "baseUrl", migrate_base_url);
+            migrate_string_field(route, "keyEnv", migrate_key_env);
+        }
+    }
+}
+
 impl CliSettings {
     /// Settings file path for a config dir.
     pub fn file_path(config_dir: &Path) -> PathBuf {
@@ -71,10 +165,15 @@ impl CliSettings {
             Ok(text) => text,
             Err(_) => return CliSettings::default(),
         };
-        let value: serde_json::Value = match serde_json::from_str(&text) {
+        let mut value: serde_json::Value = match serde_json::from_str(&text) {
             Ok(value) => value,
             Err(_) => return CliSettings::default(),
         };
+        // Provider-hiding migration (22/11/2026): rewrite exact old
+        // stored values to the new ones before parsing, so a file
+        // written by the old build loads as the new chain instead of
+        // being dropped. See migrate_legacy_settings.
+        migrate_legacy_settings(&mut value);
         let model = value
             .get("model")
             .and_then(|v| v.as_str())
@@ -247,7 +346,7 @@ mod tests {
 
     #[test]
     fn default_model_is_the_cli_free_default() {
-        assert_eq!(DEFAULT_MODEL, "google/gemini-4-argon:free");
+        assert_eq!(DEFAULT_MODEL, "deepseek-v4.1-flash");
         assert_eq!(CliSettings::default().model, DEFAULT_MODEL);
     }
 
@@ -436,6 +535,154 @@ mod tests {
         let loaded = CliSettings::load(&dir);
         assert_eq!(loaded.router, None);
         assert_eq!(loaded.active_route().id, "spark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Provider-hiding migration (22/11/2026): a file written by the
+    // old build — route id + provider "openrouter-free", model
+    // "google/gemini-4-argon:free", base URL "https://openrouter.ai/api/v1",
+    // preferredRoute "openrouter-free" — loads as the new chain
+    // instead of being dropped, and the next save keeps the router:
+    // the stored chain must not be lost on first save.
+    #[test]
+    fn load_old_openrouter_file_migrates_to_free_route() {
+        let dir = tmpdir("migrate-free");
+        std::fs::write(
+            CliSettings::file_path(&dir),
+            r#"{
+                "model": "google/gemini-4-argon:free",
+                "base_url": "https://openrouter.ai/api/v1",
+                "router": {
+                    "routes": [
+                        {"id": "spark", "provider": "spark", "model": "google/gemini-4-argon:free"},
+                        {"id": "openrouter-free", "provider": "openrouter-free", "model": "google/gemini-4-argon:free", "baseUrl": "https://openrouter.ai/api/v1"},
+                        {"id": "ollama", "provider": "ollama", "model": "llama3.1", "baseUrl": "http://127.0.0.1:11434/v1"}
+                    ],
+                    "preferredRoute": "openrouter-free",
+                    "fallbackEnabled": true,
+                    "byokApproved": false
+                }
+            }"#,
+        )
+        .unwrap();
+        let loaded = CliSettings::load(&dir);
+        assert_eq!(loaded.model, "deepseek-v4.1-flash");
+        assert_eq!(
+            loaded.base_url.as_deref(),
+            Some("https://api.experientiallabs.ai/api/v1")
+        );
+        let router = loaded
+            .router
+            .clone()
+            .expect("old router must survive migration, not be dropped");
+        assert_eq!(router.preferred_route.as_deref(), Some("free"));
+        assert_eq!(router.routes[1].id, "free");
+        assert_eq!(router.routes[1].provider.as_str(), "free");
+        assert_eq!(router.routes[1].model, "deepseek-v4.1-flash");
+        assert_eq!(
+            router.routes[1].base_url.as_deref(),
+            Some("https://api.experientiallabs.ai/api/v1")
+        );
+        assert_eq!(loaded.active_route().id, "free");
+        assert_eq!(loaded.active_route().model, "deepseek-v4.1-flash");
+        // Saving the migrated settings keeps the router and writes
+        // only new values: the old file is upgraded on disk.
+        loaded.save(&dir).unwrap();
+        let text = std::fs::read_to_string(CliSettings::file_path(&dir)).unwrap();
+        assert!(
+            !text.contains("openrouter"),
+            "migrated file must not keep old ids: {text}"
+        );
+        assert!(
+            !text.contains("google/gemini-4-argon"),
+            "migrated file must not keep old model: {text}"
+        );
+        let reloaded = CliSettings::load(&dir);
+        assert_eq!(reloaded, loaded);
+        assert!(reloaded.router.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Provider-hiding migration (22/11/2026): an old BYOK route
+    // (id "byok-openrouter", model "anthropic/claude-sonnet-4",
+    // base URL openrouter.ai, key env OPENROUTER_API_KEY) loads as
+    // the new BYOK route — without migration it parsed and validated
+    // fine and would keep running against the old provider.
+    #[test]
+    fn load_old_byok_route_migrates_to_new_model_and_key_env() {
+        let dir = tmpdir("migrate-byok");
+        std::fs::write(
+            CliSettings::file_path(&dir),
+            r#"{
+                "model": "deepseek-v4.1-flash",
+                "router": {
+                    "routes": [
+                        {"id": "spark", "provider": "spark", "model": "deepseek-v4.1-flash"},
+                        {"id": "byok-openrouter", "provider": "byok", "model": "anthropic/claude-sonnet-4", "baseUrl": "https://openrouter.ai/api/v1", "byokApproved": true, "keyEnv": "OPENROUTER_API_KEY"}
+                    ],
+                    "fallbackEnabled": true,
+                    "byokApproved": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let loaded = CliSettings::load(&dir);
+        let router = loaded
+            .router
+            .clone()
+            .expect("old BYOK router must survive migration");
+        assert!(validate_router_config(&router).is_empty());
+        let byok = router
+            .routes
+            .iter()
+            .find(|r| r.id == "byok")
+            .expect("byok-openrouter must migrate to id byok");
+        assert_eq!(byok.model, "deepseek-v4.1-flash");
+        assert_eq!(
+            byok.base_url.as_deref(),
+            Some("https://api.experientiallabs.ai/api/v1")
+        );
+        assert_eq!(byok.key_env.as_deref(), Some("MODEL_API_KEY"));
+        // The migrated BYOK route is usable when its key is present
+        // (pure check, no env var touched).
+        assert!(crate::commands::model_router::is_route_usable(
+            byok, &router, true
+        ));
+        assert!(!crate::commands::model_router::is_route_usable(
+            byok, &router, false
+        ));
+        // Saving writes only new values.
+        loaded.save(&dir).unwrap();
+        let text = std::fs::read_to_string(CliSettings::file_path(&dir)).unwrap();
+        assert!(!text.contains("openrouter"), "migrated file: {text}");
+        assert!(
+            !text.contains("anthropic/claude-sonnet-4"),
+            "migrated file: {text}"
+        );
+        assert!(
+            !text.contains("OPENROUTER_API_KEY"),
+            "migrated file: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Provider-hiding migration (22/11/2026): only exact old values
+    // are rewritten — a user's own custom model / base URL loads
+    // untouched.
+    #[test]
+    fn migration_leaves_custom_model_and_base_url_untouched() {
+        let dir = tmpdir("migrate-custom");
+        std::fs::write(
+            CliSettings::file_path(&dir),
+            "{\"model\":\"my/custom-model\",\"base_url\":\"https://custom.example/v1\"}",
+        )
+        .unwrap();
+        let loaded = CliSettings::load(&dir);
+        assert_eq!(loaded.model, "my/custom-model");
+        assert_eq!(
+            loaded.base_url.as_deref(),
+            Some("https://custom.example/v1")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

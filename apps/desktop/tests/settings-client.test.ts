@@ -37,10 +37,10 @@ test("settings-client get: invokes sen_settings_get_model, returns the model", a
   setBridgeTransport(async (command, args) => {
     calls.push(command);
     assert.ok(!("key" in args) && !("apiKey" in args));
-    return { model: "google/gemini-4-argon:free" };
+    return { model: "deepseek-v4.1-flash" };
   });
   const res = await getModelSetting(contract());
-  assert.deepEqual(res, { model: "google/gemini-4-argon:free" });
+  assert.deepEqual(res, { model: "deepseek-v4.1-flash" });
   assert.deepEqual(calls, ["sen_settings_get_model"]);
   setBridgeTransport(null);
 });

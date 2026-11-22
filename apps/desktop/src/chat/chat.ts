@@ -79,7 +79,7 @@ export interface RouterClient {
 }
 
 /// One-line router status for the UI status line, e.g.
-/// "Model: spark · google/gemini-4-argon:free · 0 đồng".
+/// "Model: spark · deepseek-v4.1-flash · 0 đồng".
 export function formatRouterStatus(status: RouterSettingResult): string {
   const active = status.routes.find((r) => r.id === status.activeRouteId);
   const text = active
