@@ -106,7 +106,7 @@ test("scan: real SKILL.md files load; bad and duplicate files fail", () => {
     assert.equal(registry.size, 2);
     assert.equal(registry.get("brief")?.description, "The brief.");
     assert.equal(report.failed.length, 2);
-    assert.ok(report.failed.some((f) => f.path.endsWith("bad/SKILL.md")));
+    assert.ok(report.failed.some((f) => f.path.replace(/\\/g, "/").endsWith("bad/SKILL.md")));
     assert.ok(
       report.failed.some((f) =>
         f.errors.some((e) => e.includes("duplicate skill name")),
