@@ -65,7 +65,9 @@ function walkGraph(entry: string): string[] {
       continue;
     }
     seen.add(file);
-    reached.push(file);
+    // Normalize to forward slashes: on Windows resolve() returns
+    // backslash paths, which never match the "/" endsWith checks below.
+    reached.push(file.replace(/\\/g, "/"));
     const source = readFileSync(file, "utf8");
     for (const specifier of staticImports(source)) {
       if (specifier.startsWith(".")) {
