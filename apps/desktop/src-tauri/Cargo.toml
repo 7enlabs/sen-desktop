@@ -13,7 +13,7 @@
 # versions, so the lockfile does not change.
 [package]
 name = "sen-desktop"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 
 [dependencies]

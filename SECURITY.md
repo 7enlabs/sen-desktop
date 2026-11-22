@@ -2,9 +2,8 @@
 
 ## Supported versions
 
-This scaffold is pre-release (version 0.0.0, not built, not shipped).
-Security fixes apply to the current development branch only until the first
-release is cut.
+Version 0.1.0 is the first release.
+Security fixes apply to the latest release only.
 
 ## Reporting a vulnerability
 
