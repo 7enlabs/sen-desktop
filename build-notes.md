@@ -552,22 +552,23 @@ Nội dung sau đây được chuyển nguyên văn từ khóa `tauri.note` tron
 > Decided parameters, message 4070: Tauri version 2; identifier dev.7enlab.sen-desktop (temporary, changeable before release); main window 1200x800, temporary title Pi Desktop until the 10/11 Sen-name verification per B-1, no feature UI, no fake content; minimum permissions: core Tauri only, no plugin added yet (no fs, shell, http, dialog, notification, updater); invoke + IPC bridge is the only gate. NAME DECISION PENDING 10/11: productName Sen Desktop, window title Pi Desktop, and identifier are all temporary pre-release names; their unification is NOT decided here and waits for the 10/11 decision. BRIDGE ROUND: Builder wired in main.rs and handlers real, but the frontend bundler is not added yet, so no distributable build exists yet.
 
 
-## Live session round 2026-11-04 (Free channel, tin 4528/4542)
+## Live session round 2026-11-04 (OpenRouter free channel, tin 4528/4542)
 
 Channel decision: ZC Leader tin 4528, SD Leader tin 4542 confirmed: the
-live session phase uses the free route as in the CLI, unless SD
+live session phase uses the OpenRouter free route as in the CLI, unless SD
 Leader proposes a separate channel with reasons. No separate channel was
-proposed, so this round uses the free route only. The Sen name decision stays
+proposed, so this round uses OpenRouter only. The Sen name decision stays
 on the 10/11 milestone: window title stays "Pi Desktop" (temporary) and
 productName stays "Sen Desktop", both untouched in this round.
 
 What was built (core owns the SDK, bridge owns transport, client owns
 order + guards; only packages/core imports the Pi SDK, per prep B-2
 section 3 point 4):
-- packages/core/src/model-channel.ts (new): Free channel. Model id always caller-supplied, exact catalog
+- packages/core/src/model-channel.ts (new): OpenRouter channel. Provider
+  always "openrouter". Model id always caller-supplied, exact catalog
   lookup, empty or unknown id refuses, no fuzzy match, no
   first-available, no default id stored anywhere. Key only from the
-  MODEL_API_KEY environment variable at runtime (or an explicit
+  OPENROUTER_API_KEY environment variable at runtime (or an explicit
   caller key in tests); credential store is in-memory, so the runtime
   never reads ~/.pi/agent/auth.json and never writes a credential file.
   Runtime creation makes no network call (builtin static catalog only,
@@ -577,7 +578,7 @@ section 3 point 4):
   requires BOTH an explicit model runtime AND an explicitly resolved
   model, then calls createAgentSession with model + noTools "all".
   Missing either refuses. The older createSenAgentSession is untouched.
-- packages/core/src/live-session.ts (new): startLiveSession.
+- packages/core/src/live-session.ts (new): startOpenRouterLiveSession.
   Local Running record first, then runtime + explicit model, then SDK
   session creation (no model call at creation), then bind, then a raw-log
   line carrying provider + model id only (key never logged). On failure
@@ -622,7 +623,7 @@ Evidence, producer-run (independent verification still owed):
   still refused).
 - live smoke: SKIPPED with reason (node --test
   packages/core/tests/live-smoke.test.ts prints the skip line and passes
-  1/1 as a skip marker): MODEL_API_KEY is not set in this
+  1/1 as a skip marker): OPENROUTER_API_KEY is not set in this
   environment and SEN_LIVE_SMOKE_MODEL is not set either, so no network
   call was made, no result was faked, no key was borrowed or created.
   This skip must be reported as skipped in the handover, never as a
@@ -634,7 +635,8 @@ Evidence, producer-run (independent verification still owed):
 - Before this round, a probe (not part of the bundle) verified against
   the installed SDK 1.5.0: ModelRuntime.create with an in-memory store
   + modelsPath null + refreshOnCreate false works with no network;
-  model catalog present with 388 models, 13 :free ids; unknown model id resolves to
+  openrouter provider present with 388 catalog models, 13 :free ids
+  including cohere/north-mini-code:free; unknown model id resolves to
   undefined (exact lookup, no fuzzy fallback); a real session creates
   headless with an explicit model + temp agentDir and disposes cleanly.
 
@@ -646,7 +648,7 @@ still needs cargo check --locked green on the Leader VM before merge.
 The tauri wrapper files are parse-checked only here, not
 compile-checked; the registry logic IS test-verified. Live smoke with a real free model is still unrun (no key
 in this environment) and belongs to the verification step on a box where
-the operator supplies MODEL_API_KEY + an explicit model id at
+the operator supplies OPENROUTER_API_KEY + an explicit model id at
 runtime. Frontend bundler still missing, so no distributable build
 exists yet. UI shell (main.ts, index.html) still a stub shell. Gate
 execute step and permission layer still stubs, so no tool runs for real
