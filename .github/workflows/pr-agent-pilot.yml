@@ -32,7 +32,7 @@ jobs:
       - name: PR Agent action step
         uses: docker://pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           github_action_config.pr_actions: '["opened", "reopened", "ready_for_review"]'
           # No config branch here on purpose: on main, repo settings are read

@@ -1,0 +1,154 @@
+# CI for Sen Desktop (BUG-17, #32).
+# The only workflow before this file was pr-agent-pilot.yml, which reviews
+# PRs with a free model but runs no test and no cargo check, so broken
+# code could merge unnoticed. This workflow runs the checks on every PR
+# and on pushes to main and dev/scaffold.
+# It does not review, approve, or merge anything; it only reports.
+name: CI
+
+on:
+  push:
+    branches: [main, dev/scaffold]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-tests:
+    name: Node tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck frontend + core
+        # tsc --noEmit over the workspace tsconfig. vite build alone
+        # does NOT typecheck (esbuild only strips types), and node
+        # --test erases type-only imports without resolving them, so
+        # without this step a type error or a wrong import path merges
+        # green. See CI P1-1 (bug hunt 2026-11-17).
+        run: pnpm typecheck
+      - name: Build frontend
+        # vite build must pass too: a broken vite.config.ts or a
+        # failed bundle is invisible to node --test.
+        run: pnpm build
+      - name: Run node test suite
+        # Root script "test" runs every suite (packages/core plus
+        # apps/desktop, 7 files); the test:* scripts are subsets for
+        # local runs only, so a single step covers them all.
+        run: pnpm test
+
+  rust:
+    name: Rust fmt + check + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri system dependencies
+        # Tauri 2 on Linux needs the webview (webkit2gtk) and gtk stacks;
+        # without them cargo check fails on gdk-3.0, as it does on the
+        # seat box where those libraries are missing.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+      - name: Check Rust code
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+      - name: Lint Rust code with Clippy
+        # -D warnings turns every clippy warning into a CI failure, so
+        # new lints cannot merge silently. --all-targets covers lib,
+        # bins, tests and benches, not just the default lib target.
+        # The two test modules skipped on Windows in rust-windows
+        # (commands::cli_spawn, commands::registry) are still linted
+        # here: clippy only compiles them on Linux, where their fake
+        # `zen` shell script runs fine, so no skip is needed.
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+
+  rust-windows:
+    name: Rust tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # No apt step: Windows runners already carry WebView2, which is
+      # what Tauri needs there; the webkit2gtk/gtk stacks are
+      # Linux-only. No rustfmt component and no fmt step: the rust job
+      # already checks formatting, and fmt is platform-independent.
+      - name: Run Rust test suite
+        # cargo test builds the crate and runs every test except the
+        # two modules skipped below. The skip is explicit, not silent:
+        # commands::cli_spawn and commands::registry spawn a fake `zen`
+        # binary written as a #!/bin/sh script, which cannot execute on
+        # Windows. Covering them on Windows needs a .bat/.exe fake
+        # first (follow-up, not this job). Everything else runs,
+        # including the memory_store caps (P2-4) and the atomic_file
+        # suite: the SIGKILL crash test itself is #[cfg(unix)] and is
+        # compiled out on Windows, and its Windows marker test
+        # (crash_mid_write_skipped_on_windows_no_sigkill) shows that
+        # skip in the test list. The crate compiles on Windows because
+        # local_now uses localtime_s there (P2-4); libc has no
+        # localtime_r on Windows.
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --skip commands::cli_spawn --skip commands::registry
+
+  coverage:
+    name: Tauri coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri system dependencies
+        # Same set as the rust job: cargo-llvm-cov builds and runs the
+        # full test suite, so it needs the webview/gtk stacks too.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-tools-preview provides llvm-profdata/llvm-cov, which
+          # cargo-llvm-cov needs. Stable toolchain is unchanged.
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        # Official install method from the cargo-llvm-cov docs: downloads
+        # the prebuilt binary, no compile step, free (MIT/Apache-2.0).
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Measure Tauri crate coverage
+        # Runs the crate test suite under source-based coverage, prints
+        # the summary table to the log, and writes lcov + text reports.
+        # The job fails if any test fails (cargo-llvm-cov propagates the
+        # test exit code) and if total line coverage falls below 60%
+        # (--fail-under-lines). 60% is a floor, not a target: measured
+        # 2026-11-17 at 92.13% lines on the 8 tested modules, whole
+        # crate estimated 69.8-76.8% (see CI P1-2 fix note), so 60%
+        # passes on current code with about 10 points of margin and
+        # still fails if the test suite is deleted (0%) or a whole
+        # module's tests are lost. Raise the floor, never lower it
+        # to force green.
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --lcov --output-path coverage/lcov.info --fail-under-lines 60
+          cargo llvm-cov report --manifest-path apps/desktop/src-tauri/Cargo.toml --summary-only > coverage/coverage.txt
+          cat coverage/coverage.txt
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-coverage
+          path: coverage/
+          if-no-files-found: error

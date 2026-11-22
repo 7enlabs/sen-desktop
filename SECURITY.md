@@ -1,35 +1,26 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| < 1.0   | :x: (pre-release) |
+This scaffold is pre-release (version 0.0.0, not built, not shipped).
+Security fixes apply to the current development branch only until the first
+release is cut.
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-**Do not open a public GitHub issue for security vulnerabilities.**
+Do NOT open a public issue for a vulnerability. Report it privately to the
+maintainers through the team's coordination channel, with:
 
-Instead, report privately via one of:
+- A description of the issue and its impact.
+- Steps to reproduce, if any.
+- Any suggested fix, if you have one.
 
-- GitHub Security Advisories on this repository
-  (Security tab → "Report a vulnerability"), or
-- Email the maintainers (see repository profile for contact).
+The maintainers will confirm receipt, assess the report, and agree on a
+fix and a disclosure plan with the reporter before any public mention.
 
-Please include:
+## Scope notes for this scaffold
 
-- Description of the vulnerability
-- Steps to reproduce
-- Affected versions / platforms
-- Your assessment of impact (optional)
-
-## What to Expect
-
-- Acknowledgment within **72 hours**.
-- A fix or mitigation plan for confirmed issues, prioritized by severity.
-- Public disclosure only after a fix is available, coordinated with the reporter.
-
-## Scope Notes
-
-Sen Desktop is pre-release software under active development.
-Do not use it with sensitive data or production credentials yet.
+- This scaffold holds no credentials, keys, or tokens; never add any.
+- The permission layer and the execution gate are stubs; do not treat them
+  as enforced security boundaries until they are filled in and reviewed.
+- No network-facing feature ships from this scaffold yet.
