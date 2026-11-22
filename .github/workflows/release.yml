@@ -111,12 +111,15 @@ jobs:
         if: runner.os == 'Linux'
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Install Rust toolchain (Windows)
         # Same as the rust-windows job in ci.yml: no fmt/clippy
         # components, this leg only runs cargo test.
         if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          toolchain: stable
       - name: Install dependencies
         # Same as ci.yml: root script installs the whole workspace
         # (packages/core + apps/desktop).
