@@ -22,15 +22,8 @@ import {
 } from "../src/mcp-client.ts";
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
-// Windows cannot execute a .mjs file by its node shebang, so the
-// delegate tests spawn a .cmd shim there that forwards to node.
-const FAKE_ZEN =
-  process.platform === "win32"
-    ? join(FIXTURES, "mcp-fake-zen.cmd")
-    : join(FIXTURES, "mcp-fake-zen.mjs");
-if (process.platform !== "win32") {
-  chmodSync(FAKE_ZEN, 0o755);
-}
+const FAKE_ZEN = join(FIXTURES, "mcp-fake-zen.mjs");
+chmodSync(FAKE_ZEN, 0o755);
 
 const SERVER: McpServerConfig = {
   command: "node",

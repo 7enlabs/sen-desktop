@@ -1002,8 +1002,14 @@ export async function delegateToolCallToCliCore(
   try {
     const argv = buildDelegateArgv(input, path, sessionId);
     const zenBin = input.zenBin ?? "zen";
+    // A JS file cannot be spawned directly on Windows (no shebang
+    // execution): run it through node. In production zenBin is always
+    // a real binary, so this branch only triggers for test fixtures.
+    const isJs = /\.(mjs|cjs|js)$/.test(zenBin);
+    const bin = isJs ? process.execPath : zenBin;
+    const args = isJs ? [zenBin, ...argv] : argv;
     return await new Promise<CliDelegateResult>((resolve, reject) => {
-      const child = spawn(zenBin, argv, { stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
       let buffer = "";
       let stderrTail = "";
       let resultText: string | null = null;
