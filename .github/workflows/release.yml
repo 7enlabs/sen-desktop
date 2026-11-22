@@ -28,8 +28,8 @@
 #    the default targets apply (deb + AppImage on Linux, msi + nsis
 #    on Windows). If the first run produces other names, the upload
 #    globs below must be corrected to match.
-# 5. Version is 0.0.0 in Cargo.toml and package.json: bundles will be
-#    named 0.0.0 until a version is decided before the first v* tag.
+# 5. Version is 0.1.0 in Cargo.toml and package.json (bumped from 0.0.0
+#    before the first v* tag, Leader decision 22/11/2026).
 # 6. pnpm/action-setup and actions/setup-node are pinned by SHA
 #    (resolved by Leader in tin 19489, verified against GitHub API
 #    21/11: pnpm v4 = f40ffcd9367d9f12939873eb1018b921a783ffaa,
@@ -78,7 +78,7 @@ jobs:
         include:
           # Linux leg: mirrors the ubuntu-latest jobs in ci.yml
           # (node-tests, rust, coverage).
-          - { os: ubuntu-latest }
+          - { os: ubuntu-24.04 }
           # Windows leg: mirrors the windows-latest job in ci.yml
           # (rust-windows). No macOS row: see header.
           - { os: windows-latest }
@@ -229,7 +229,7 @@ jobs:
     needs: [build]
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
