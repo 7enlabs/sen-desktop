@@ -2322,7 +2322,7 @@ exit 0; else touch '{marker}'; exit 1; fi"#,
             Ok(SessionState::Running)
         );
         assert_eq!(first_events.len(), 3, "fallback retry must run the model");
-        assert_eq!(reg.route_id("s1").as_deref(), Some("openrouter-free"));
+        assert_eq!(reg.route_id("s1").as_deref(), Some("free"));
         assert_eq!(reg.get("s1").unwrap().log.len(), 2);
         let mut events: Vec<SenEvent> = Vec::new();
         let mut emit = |ev: SenEvent| events.push(ev);
@@ -3373,7 +3373,7 @@ exit 2; fi"#,
             reg.steer("s1", &contract(), "steer", "hi", &mut emit),
             Ok(SessionState::Running)
         );
-        assert_eq!(reg.route_id("s1").as_deref(), Some("openrouter-free"));
+        assert_eq!(reg.route_id("s1").as_deref(), Some("free"));
         assert!(marker.exists(), "fake binary must have run twice");
         // The failed attempt emitted its init event; the retry ran
         // the full happy turn (3 events). The turn recorded is the
@@ -3428,22 +3428,22 @@ exit 2; fi"#,
             vdir
         };
         let no_spark = variant("nospark", "spark");
-        let no_openrouter = variant("noopenrouter", "openrouter-free");
+        let no_free = variant("nofree", "free");
         let no_ollama = variant("noollama", "ollama");
         // The bridge passes --model <model> [--base-url <url>], so the
         // route is told apart by its base URL: ollama on 11434,
-        // openrouter-free on openrouter.ai, spark with no base URL.
+        // free on api.experientiallabs.ai, spark with no base URL.
         // The echo lines go to the counter file, never to stdout, so
         // the bridge only ever sees the init record below.
         let body = format!(
-            r#"case "$*" in *11434*) echo ollama >> '{counter}'; cp '{no_ollama}/cli-settings.json' '{dir}/cli-settings.json';; *openrouter.ai*) echo openrouter-free >> '{counter}'; cp '{no_openrouter}/cli-settings.json' '{dir}/cli-settings.json';; *) echo spark >> '{counter}'; cp '{no_spark}/cli-settings.json' '{dir}/cli-settings.json';; esac
+            r#"case "$*" in *11434*) echo ollama >> '{counter}'; cp '{no_ollama}/cli-settings.json' '{dir}/cli-settings.json';; *api.experientiallabs.ai*) echo free >> '{counter}'; cp '{no_free}/cli-settings.json' '{dir}/cli-settings.json';; *) echo spark >> '{counter}'; cp '{no_spark}/cli-settings.json' '{dir}/cli-settings.json';; esac
 cat <<'EOF'
 {{"type":"system","subtype":"init","session_id":"s1","model":"m:free","v":1}}
 EOF
 exit 2"#,
             counter = counter.display(),
             no_ollama = no_ollama.display(),
-            no_openrouter = no_openrouter.display(),
+            no_free = no_free.display(),
             no_spark = no_spark.display(),
             dir = dir.display(),
         );
@@ -3460,22 +3460,22 @@ exit 2"#,
         let tried: Vec<&str> = runs.lines().collect();
         assert_eq!(
             tried,
-            vec!["spark", "openrouter-free", "ollama"],
+            vec!["spark", "free", "ollama"],
             "at most MAX_ATTEMPTS=3 runs, one per route, no repeat; got: {tried:?}"
         );
         assert_eq!(reg.route_id("s1").as_deref(), Some("ollama"));
         let _ = std::fs::remove_file(&counter);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&no_spark);
-        let _ = std::fs::remove_dir_all(&no_openrouter);
+        let _ = std::fs::remove_dir_all(&no_free);
         let _ = std::fs::remove_dir_all(&no_ollama);
     }
 
     // P2-2: the turn walks the attempt order snapshotted at its start,
     // not the config re-read mid-turn. The fake binary fails once on
     // spark (exit 2) and rewrites the settings mid-turn to a chain
-    // that drops openrouter-free and prefers ollama; the retry must
-    // still run on openrouter-free — the second route of the snapshot
+    // that drops free and prefers ollama; the retry must
+    // still run on free — the second route of the snapshot
     // — and succeed there. On the old code the re-read chain had no
     // route after spark, so the turn failed outright.
     #[test]
@@ -3494,7 +3494,7 @@ exit 2"#,
         let _ = std::fs::remove_dir_all(&vdir);
         std::fs::create_dir_all(&vdir).unwrap();
         let mut changed = RouterConfig::default();
-        changed.routes.retain(|r| r.id != "openrouter-free");
+        changed.routes.retain(|r| r.id != "free");
         changed.preferred_route = Some("ollama".to_string());
         CliSettings {
             model: DEFAULT_MODEL.to_string(),
@@ -3532,7 +3532,7 @@ exit 2; fi"#,
         assert!(marker.exists(), "fake binary must have run twice");
         assert_eq!(
             reg.route_id("s1").as_deref(),
-            Some("openrouter-free"),
+            Some("free"),
             "retry must use the snapshot order, not the rewritten config"
         );
         assert_eq!(events.len(), 4);

@@ -11,8 +11,8 @@
 // Routes (default chain, preference order):
 // 1. spark — Pi/Muse Spark, i.e. the zen CLI's own default endpoint
 //    with the CLI's free default model. No base URL.
-// 2. openrouter-free — OpenRouter free models, explicit base URL
-//    https://openrouter.ai/api/v1, same free model id.
+// 2. free — free models, explicit base URL
+//    https://api.experientiallabs.ai/api/v1, same free model id.
 // 3. ollama — local Ollama, http://127.0.0.1:11434/v1. The default
 //    model id ("llama3.1") is only a starting value: the user changes
 //    it to a model actually pulled in their Ollama.
@@ -24,7 +24,7 @@
 
 export type ProviderKind =
   | "spark"
-  | "openrouter-free"
+  | "free"
   | "ollama"
   | "byok";
 
@@ -52,10 +52,10 @@ export interface RouterConfig {
   byokApproved?: boolean;
 }
 
-export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+export const DEFAULT_BASE_URL = "https://api.experientiallabs.ai/api/v1";
 export const OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1";
 /** The CLI's free default model (cli_settings.rs DEFAULT_MODEL). */
-export const FREE_DEFAULT_MODEL = "google/gemini-4-argon:free";
+export const FREE_DEFAULT_MODEL = "deepseek-v4.1-flash";
 /** Starting value only: change to a model actually pulled in Ollama. */
 export const OLLAMA_DEFAULT_MODEL = "llama3.1";
 /** Max fallback attempts per turn (routes are at most this many). */
@@ -65,10 +65,10 @@ export function defaultRoutes(): Route[] {
   return [
     { id: "spark", provider: "spark", model: FREE_DEFAULT_MODEL },
     {
-      id: "openrouter-free",
-      provider: "openrouter-free",
+      id: "free",
+      provider: "free",
       model: FREE_DEFAULT_MODEL,
-      baseUrl: OPENROUTER_BASE_URL,
+      baseUrl: DEFAULT_BASE_URL,
     },
     {
       id: "ollama",
@@ -94,7 +94,7 @@ export function describeRoute(route: Route): string {
 
 const PROVIDERS: ProviderKind[] = [
   "spark",
-  "openrouter-free",
+  "free",
   "ollama",
   "byok",
 ];

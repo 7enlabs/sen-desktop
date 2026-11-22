@@ -37,8 +37,8 @@ same retryable codes):
 
 | Route | Provider | Model | Base URL | Cost |
 | --- | --- | --- | --- | --- |
-| `spark` | spark (Pi/Muse Spark = zen CLI default) | `google/gemini-4-argon:free` | (CLI default) | 0 đồng |
-| `openrouter-free` | OpenRouter free models | `google/gemini-4-argon:free` | `https://openrouter.ai/api/v1` | 0 đồng |
+| `spark` | spark (Pi/Muse Spark = zen CLI default) | `deepseek-v4.1-flash` | (CLI default) | 0 đồng |
+| `free` | Free models | `deepseek-v4.1-flash` | `https://api.experientiallabs.ai/api/v1` | 0 đồng |
 | `ollama` | local Ollama | `llama3.1` (starting value: change to a model actually pulled) | `http://127.0.0.1:11434/v1` | 0 đồng |
 
 BYOK is NOT in the default chain. A `byok` route needs
@@ -197,7 +197,7 @@ non-retryable codes.
   — `gdk-3.0` system library missing. Run on the Leader VM.
 - `cargo clippy --workspace --all-targets`: same blocker.
 - Windows/macOS runs (box is Linux only).
-- Live model turn on a real provider (OpenRouter free / Ollama /
+- Live model turn on a real provider (free / Ollama /
   Spark): no live call was made; the fallback path is proven only
   against fake `zen` binaries in the Rust tests.
 - Independent verification (producer ≠ verifier): this bundle is

@@ -13,7 +13,7 @@ fallback_models = [
   "openrouter/liquid/lfm-3-1.7b:free",
 ]
 # Conservative cap equal to PR Agent's own max_model_tokens default.
-# Refine from the OpenRouter catalog context lengths before any main merge;
+# Refine from the model catalog context lengths before any main merge;
 # the pilot diff is small, so this cap is not binding for the pilot run.
 custom_model_max_tokens = 32000
 enable_auto_approval = false
