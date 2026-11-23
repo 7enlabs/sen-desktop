@@ -51,7 +51,7 @@ export async function delegateMcpTool(
 ): Promise<McpDelegateResult> {
   const raw = await invoke("sen_mcp_delegate", {
     contract,
-    session_id: call.sessionId,
+    sessionId: call.sessionId,
     args: {
       serverName: call.serverName,
       serverConfig: call.serverConfig,

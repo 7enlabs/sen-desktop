@@ -163,7 +163,7 @@ function makeChat(options: {
   setBridgeTransport(async (command, args) => {
     commands.push(command);
     if (command === "sen_session_steer" || command === "sen_session_follow_up") {
-      const { text } = args as unknown as { session_id: string; text: string };
+      const { text } = args as unknown as { sessionId: string; text: string };
       chat.handleEvent(resultEvent("reply to " + text));
       return {
         sessionId: UUID_SESSION,
