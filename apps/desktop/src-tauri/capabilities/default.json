@@ -1,0 +1,11 @@
+{
+  "description": "Core event permissions for the Sen Desktop frontend: listen/unlisten to sen-session-event (Phase 2 CLI bridge). Least privilege: no emit, no other plugin.",
+  "identifier": "default",
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ],
+  "windows": [
+    "main"
+  ]
+}
