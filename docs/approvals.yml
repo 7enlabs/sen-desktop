@@ -1,0 +1,41 @@
+# Approval policy for Sen Desktop pull requests.
+# Machine-readable mirror of the merge policy in CONTRIBUTING.md.
+# Modelled on Claude Ship's `.claude/approvals.yml` (policy-as-code):
+# version, mode (observe/enforce), rules with purpose, paths, verdict,
+# override. Adapted to this team: the approving agent is the Leader, not
+# Claude, so verdict uses `leader` instead of `claude`.
+# Extra key: `requires` lists the gates a rule needs beyond the verdict
+# (node-tests, rust-tests, typecheck, vite-build). A future merge-gate
+# script can read this file and check them.
+# If this file drifts from CONTRIBUTING.md, CONTRIBUTING.md wins and this
+# file is the bug.
+# Mode is observe: this file records what the policy WOULD decide. It does
+# not block merges; the Leader still decides every merge (work on a branch,
+# never self-merge; the reviewer verifies independently). Switching to
+# enforce needs a Zen decision (and branch protection on main, which the
+# repo deliberately does not have today).
+# Note: this file is the PULL REQUEST approval policy. It is not the
+# runtime tool approval gate in docs/approval-gate.md (P0-2, 3-tier tool
+# approval for the Sen agent) — different concept, same word.
+version: 1
+mode: observe
+rules:
+  - purpose: "Every change goes through a pull request and an independent review: CI green, and the reviewer verifies the change independently. The PR description lists its claims per file path."
+    paths: ["**"]
+    verdict: { leader: comments, seats: 1 }
+    requires: [node-tests, rust-tests, typecheck, vite-build]
+    override:
+      - { if: "ci = pass and review = pass", verdict: { leader: approves, seats: 1 } }
+
+  - purpose: "Sensitive changes need a person (Zen): workflows, release or signing scripts, secrets, auto-update, network calls to a new host, and the Tauri permission surface (tauri.conf.json and capabilities/)."
+    paths: [".github/workflows/**", "apps/desktop/src-tauri/tauri.conf.json", "apps/desktop/src-tauri/capabilities/**"]
+    verdict: { leader: comments, seats: 2 }
+    requires: [human-zen]
+
+  - purpose: "Changes to skills/ (skill definitions set what the agent may do, under the 3-tier trust plan) need the same care as permissions: two seats."
+    paths: ["skills/**"]
+    verdict: { leader: comments, seats: 2 }
+
+  - purpose: "Changes to this policy file, CONTRIBUTING.md, or the runtime approval gate design (docs/approval-gate.md) need two seats: the policy itself is protected."
+    paths: ["docs/approvals.yml", "CONTRIBUTING.md", "docs/approval-gate.md"]
+    verdict: { leader: comments, seats: 2 }
