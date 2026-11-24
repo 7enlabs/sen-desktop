@@ -248,7 +248,8 @@ test("followups: delegateMcpTool calls sen_mcp_delegate with the chat session id
     args: Record<string, unknown>;
   };
   assert.equal(call.command, "sen_mcp_delegate");
-  assert.equal(call.args.session_id, UUID_SESSION);
+  assert.equal(call.args.sessionId, UUID_SESSION);
+  assert.ok(!("session_id" in call.args), "delegate payload must use the Tauri v2 wire key sessionId, not the Rust identifier session_id");
   const wireArgs = call.args.args as Record<string, unknown>;
   assert.equal(wireArgs.serverName, "calc");
   assert.equal(wireArgs.tool, "echo");
@@ -300,7 +301,7 @@ test("followups: /brief through the Rust source builds a real brief, no model tu
       return briefSourceData();
     }
     if (command === "sen_session_steer" || command === "sen_session_follow_up") {
-      const { text } = args as unknown as { session_id: string; text: string };
+      const { text } = args as unknown as { sessionId: string; text: string };
       chat.handleEvent(resultEvent("reply to " + text));
       return {
         sessionId: UUID_SESSION,
@@ -361,7 +362,7 @@ test("followups: a morning-brief message is routed by the Rust matcher, never re
       return briefSourceData();
     }
     if (command === "sen_session_steer" || command === "sen_session_follow_up") {
-      const { text } = args as unknown as { session_id: string; text: string };
+      const { text } = args as unknown as { sessionId: string; text: string };
       chat.handleEvent(resultEvent("reply to " + text));
       return {
         sessionId: UUID_SESSION,

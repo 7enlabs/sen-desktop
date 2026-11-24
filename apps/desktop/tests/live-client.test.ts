@@ -89,20 +89,20 @@ function liveTransport() {
   const calls: string[] = [];
   setBridgeTransport(async (command, args) => {
     calls.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
-      return { sessionId: a.session_id, subscriberId: 7 };
+      return { sessionId: a.sessionId, subscriberId: 7 };
     }
     if (command === "sen_events_unsubscribe") {
-      return { sessionId: a.session_id, subscriberCount: 0 };
+      return { sessionId: a.sessionId, subscriberCount: 0 };
     }
     if (command === "sen_session_abort") {
-      return { sessionId: a.session_id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   return calls;
 }
@@ -151,20 +151,20 @@ test("live-client attach (P1-3): subscribe failure after a successful create rol
   const transportCalls: string[] = [];
   setBridgeTransport(async (command, args) => {
     transportCalls.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
-      if (a.session_id === "s1") {
+      if (a.sessionId === "s1") {
         throw new Error("subscribe down");
       }
-      return { sessionId: a.session_id, subscriberId: 7 };
+      return { sessionId: a.sessionId, subscriberId: 7 };
     }
     if (command === "sen_session_abort") {
-      return { sessionId: a.session_id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   await assert.rejects(
@@ -214,8 +214,8 @@ test("live-client attach (P1-3): same-id retry still hits DUPLICATE_SESSION — 
   const transportCalls: string[] = [];
   setBridgeTransport(async (command, args) => {
     transportCalls.push(command);
-    const a = args as { session_id?: string };
-    const id = a.session_id as string;
+    const a = args as { sessionId?: string };
+    const id = a.sessionId as string;
     if (command === "sen_session_create") {
       if (backend.has(id)) {
         throw new Error("DUPLICATE_SESSION: Session already exists: " + id);
@@ -268,9 +268,9 @@ test("live-client attach (P1-3): a failed rollback does not mask the subscribe e
   const transportCalls: string[] = [];
   setBridgeTransport(async (command, args) => {
     transportCalls.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
       throw new Error("subscribe down");
@@ -278,7 +278,7 @@ test("live-client attach (P1-3): a failed rollback does not mask the subscribe e
     if (command === "sen_session_abort") {
       throw new Error("abort down");
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   await assert.rejects(
@@ -368,13 +368,13 @@ test("live-client steer: backend CLI failure surfaces, local stays Running", asy
   // result, so no Failed transition is recorded.
   setBridgeTransport(async (command, args) => {
     transportCalls.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_steer") {
       throw new Error(
         "CLI_NO_RESULT: CLI turn ended with no result record (exited general error (1)).",
       );
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   await assert.rejects(
     () => steerSession(contract(), "s1", "hi"),
@@ -431,11 +431,11 @@ test("live-client abort: backend refusal surfaces, local stays Running", async (
   await attachLiveSession(manager, contract(), "s1");
   setBridgeTransport(async (command, args) => {
     transportCalls.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_abort") {
       throw new Error("backend down");
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   await assert.rejects(
     () => abortSession(manager, contract(), "s1"),
@@ -585,20 +585,20 @@ test("live-client close (V-04): unlisten runs BEFORE backend unsubscribe and abo
   const order: string[] = [];
   setBridgeTransport(async (command, args) => {
     order.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
-      return { sessionId: a.session_id, subscriberId: 7 };
+      return { sessionId: a.sessionId, subscriberId: 7 };
     }
     if (command === "sen_events_unsubscribe") {
-      return { sessionId: a.session_id, subscriberCount: 0 };
+      return { sessionId: a.sessionId, subscriberCount: 0 };
     }
     if (command === "sen_session_abort") {
-      return { sessionId: a.session_id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   const attached = await attachLiveSession(manager, contract(), "s1");
@@ -626,19 +626,19 @@ function endLiveTransport() {
   const calls: string[] = [];
   setBridgeTransport(async (command, args) => {
     calls.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
-      return { sessionId: a.session_id, subscriberId: 7 };
+      return { sessionId: a.sessionId, subscriberId: 7 };
     }
     if (command === "sen_events_unsubscribe") {
-      return { sessionId: a.session_id, subscriberCount: 0 };
+      return { sessionId: a.sessionId, subscriberCount: 0 };
     }
     if (command === "sen_session_end") {
       return {
-        sessionId: a.session_id,
+        sessionId: a.sessionId,
         state: "Completed",
         alreadyEnded: false,
         endedFrom: "Running",
@@ -646,7 +646,7 @@ function endLiveTransport() {
         approvalsRevoked: 0,
       };
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   return calls;
 }
@@ -710,19 +710,19 @@ test("live-client end (V-04): unlisten runs BEFORE backend unsubscribe and end",
   const order: string[] = [];
   setBridgeTransport(async (command, args) => {
     order.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
-      return { sessionId: a.session_id, subscriberId: 7 };
+      return { sessionId: a.sessionId, subscriberId: 7 };
     }
     if (command === "sen_events_unsubscribe") {
-      return { sessionId: a.session_id, subscriberCount: 0 };
+      return { sessionId: a.sessionId, subscriberCount: 0 };
     }
     if (command === "sen_session_end") {
       return {
-        sessionId: a.session_id,
+        sessionId: a.sessionId,
         state: "Completed",
         alreadyEnded: false,
         endedFrom: "Running",
@@ -730,7 +730,7 @@ test("live-client end (V-04): unlisten runs BEFORE backend unsubscribe and end",
         approvalsRevoked: 0,
       };
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   const attached = await attachLiveSession(manager, contract(), "s1");
@@ -765,14 +765,14 @@ test("live-client end: an end failure leaves the listener stopped and the subscr
   assert.equal(capturedEvents.unlistened, false);
   setBridgeTransport(async (command, args) => {
     transportCalls.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_events_unsubscribe") {
-      return { sessionId: a.session_id, subscriberCount: 0 };
+      return { sessionId: a.sessionId, subscriberCount: 0 };
     }
     if (command === "sen_session_end") {
       throw new Error("ERR_TURN_IN_FLIGHT: A turn is still running on this session");
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   await assert.rejects(
     () => endLiveSession(manager, contract(), "s1", attached.unlisten),

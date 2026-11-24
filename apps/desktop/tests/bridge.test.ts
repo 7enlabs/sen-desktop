@@ -118,7 +118,7 @@ test("bridge: valid call passes command and args through, returns result", async
     calls.push([command, args]);
     return { ok: true };
   });
-  const args = { contract: contract(), session_id: "s1" };
+  const args = { contract: contract(), sessionId: "s1" };
   assert.deepEqual(await invoke("sen_session_create", args), { ok: true });
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0], "sen_session_create");
@@ -131,7 +131,7 @@ test("bridge: transport error propagates with code intact", async () => {
     throw new Error("TOOL_EXECUTION_NOT_WIRED: no tool ran");
   });
   await assert.rejects(
-    () => invoke("sen_tool_call", { contract: contract(), tool_name: "t" }),
+    () => invoke("sen_tool_call", { contract: contract(), toolName: "t" }),
     /TOOL_EXECUTION_NOT_WIRED: no tool ran/,
   );
   setBridgeTransport(null);
@@ -140,7 +140,7 @@ test("bridge: transport error propagates with code intact", async () => {
 test("bridge: default transport is the real Tauri invoke, not a stub", async () => {
   setBridgeTransport(null);
   await assert.rejects(
-    () => invoke("sen_session_create", { contract: contract(), session_id: "s1" }),
+    () => invoke("sen_session_create", { contract: contract(), sessionId: "s1" }),
     (err: unknown) => {
       assert.ok(err instanceof Error);
       assert.match(err.message, /window is not defined/);
@@ -152,9 +152,9 @@ test("bridge: default transport is the real Tauri invoke, not a stub", async () 
 
 test("session-client create: backend ack + local Running, mismatch refused", async () => {
   setBridgeTransport(async (command, args) => {
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     assert.equal(command, "sen_session_create");
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   const manager = new SessionManager();
   const res = await createSession(manager, contract(), "s1");
@@ -202,7 +202,7 @@ test("session-client steer/followUp: pure IPC calls in order, args passed throug
     ["sen_session_create", "sen_session_steer", "sen_session_follow_up"],
   );
   const steerArgs = calls[1][1] as Record<string, unknown>;
-  assert.equal(steerArgs["session_id"], "s1");
+  assert.equal(steerArgs["sessionId"], "s1");
   assert.equal(steerArgs["text"], "hi");
   setBridgeTransport(null);
 });
@@ -289,7 +289,7 @@ test("bridge P1-2: invoke rejects with IPC_TIMEOUT when the transport hangs", as
   c.timeoutMs = 50;
   const started = Date.now();
   await assert.rejects(
-    () => invoke("sen_session_steer", { contract: c, session_id: "s1", text: "hi" }),
+    () => invoke("sen_session_steer", { contract: c, sessionId: "s1", text: "hi" }),
     /IPC_TIMEOUT: sen_session_steer did not respond within 50ms/,
   );
   // Rejected promptly at the contract timeout, not after an unbounded wait.
@@ -302,13 +302,13 @@ test("bridge P1-2: timeout uses the contract timeoutMs, not a fixed value", asyn
   const slow = contract();
   slow.timeoutMs = 200;
   assert.deepEqual(
-    await invoke("sen_session_create", { contract: slow, session_id: "s1" }),
+    await invoke("sen_session_create", { contract: slow, sessionId: "s1" }),
     { ok: true },
   );
   const fast = contract();
   fast.timeoutMs = 30;
   await assert.rejects(
-    () => invoke("sen_session_create", { contract: fast, session_id: "s1" }),
+    () => invoke("sen_session_create", { contract: fast, sessionId: "s1" }),
     /IPC_TIMEOUT/,
   );
   setBridgeTransport(null);
@@ -319,7 +319,7 @@ test("bridge P1-2: a fast transport resolves and the timer never fires late", as
   const c = contract();
   c.timeoutMs = 30;
   assert.deepEqual(
-    await invoke("sen_session_create", { contract: c, session_id: "s1" }),
+    await invoke("sen_session_create", { contract: c, sessionId: "s1" }),
     { ok: true },
   );
   // If the timer were not cleared, its rejection would surface as an
@@ -337,7 +337,7 @@ test("bridge P1-2: a late transport rejection after timeout is swallowed", async
   const c = contract();
   c.timeoutMs = 20;
   await assert.rejects(
-    () => invoke("sen_session_steer", { contract: c, session_id: "s1", text: "hi" }),
+    () => invoke("sen_session_steer", { contract: c, sessionId: "s1", text: "hi" }),
     /IPC_TIMEOUT/,
   );
   // The transport rejects 80ms after the timeout won the race. If that

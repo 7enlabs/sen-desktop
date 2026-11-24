@@ -428,7 +428,7 @@ test("chat turn: status line follows the route that actually ran after fallback"
   chat.bind("s1");
   setBridgeTransport(async (command, args) => {
     assert.equal(command, "sen_session_steer");
-    const { text } = args as unknown as { session_id: string; text: string };
+    const { text } = args as unknown as { sessionId: string; text: string };
     // Deliver the Result event synchronously, mid-turn, like the
     // backend streaming a result record before the ack.
     const event: SenEvent = {

@@ -52,17 +52,17 @@ function liveTransport() {
   const calls: string[] = [];
   setBridgeTransport(async (command, args) => {
     calls.push(command);
-    const a = args as { session_id?: string };
+    const a = args as { sessionId?: string };
     if (command === "sen_session_create") {
-      return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
     }
     if (command === "sen_events_subscribe") {
-      return { sessionId: a.session_id, subscriberId: 7 };
+      return { sessionId: a.sessionId, subscriberId: 7 };
     }
     if (command === "sen_session_abort") {
-      return { sessionId: a.session_id, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
+      return { sessionId: a.sessionId, state: "Cancelled", unknownRecords: 0, versionMismatches: 0 };
     }
-    return { sessionId: a.session_id, state: "Running", unknownRecords: 0, versionMismatches: 0 };
+    return { sessionId: a.sessionId, state: "Running", unknownRecords: 0, versionMismatches: 0 };
   });
   return calls;
 }

@@ -200,7 +200,7 @@ function makeChat(): ChatHarness {
       if (fail.steer) {
         throw new Error("boom");
       }
-      const { text } = args as unknown as { session_id: string; text: string };
+      const { text } = args as unknown as { sessionId: string; text: string };
       texts.push(text);
       // Deliver the Result event synchronously, mid-turn, like the
       // backend streaming a result record before the ack.

@@ -857,9 +857,9 @@ test("tools-client activity log: a malformed entry fails loudly", async () => {
 // Same lesson as settings-client R2B-05 rev2: the v1 mock-transport
 // tests only assert what the client sends, so a client that sends a
 // flat payload while the handler waits for `args: <Args>` (or a
-// nested `args` while the handler waits for a flat `tool_name`)
+// nested `args` while the handler waits for a flat `toolName`)
 // passes under node and fails on every real call ("missing required
-// key args" / "missing required key tool_name"). These tests read
+// key args" / "missing required key toolName"). These tests read
 // each handler signature out of tools.rs and assert the client
 // payload against it, so they FAIL on a wrong payload and PASS only
 // when the client sends the shape the handler waits for. They do NOT
@@ -906,8 +906,11 @@ function expectedWireShape(
 
 /// Flat wire params for a command, derived from the Rust handler
 /// signature: every declared parameter except the Tauri-managed
-/// `state` slot and the `contract`. Param names are asserted as
-/// declared (snake_case, e.g. `tool_name`).
+/// `state` slot and the `contract`. Declared names are mapped to
+/// Tauri v2 wire keys with toCamelCase (lowerCamelCase, e.g.
+/// `tool_name` -> `toolName`); the payload is asserted against the
+/// wire keys, never the Rust identifiers. `toCamelCase` is defined
+/// above (shared with expectedWireShape).
 function expectedFlatParams(src: string, command: string): string[] {
   const fnMatch = src.match(new RegExp(`pub fn ${command}\\(([\\s\\S]*?)\\) ->`));
   assert.ok(fnMatch, `Rust handler ${command} not found in tools.rs`);
@@ -932,7 +935,7 @@ function expectedFlatParams(src: string, command: string): string[] {
     .filter((n): n is string => !!n);
   const wire = names.filter((n) => !["state", "contract"].includes(n));
   assert.ok(wire.length > 0, `${command} declares no wire params in tools.rs`);
-  return wire;
+  return wire.map(toCamelCase);
 }
 
 async function capturePayload(
@@ -1002,16 +1005,16 @@ test("tools-client revoke: payload matches the Rust handler wire shape (CI P2-6)
   assert.ok("contract" in payload, "payload must still carry the contract");
 });
 
-test("tools-client call: flat tool_name param matches the Rust handler (CI P2-6)", async () => {
-  assert.deepEqual(expectedFlatParams(rustToolsSource(), "sen_tool_call"), ["tool_name"]);
+test("tools-client call: flat toolName param matches the Rust handler (CI P2-6)", async () => {
+  assert.deepEqual(expectedFlatParams(rustToolsSource(), "sen_tool_call"), ["toolName"]);
   const payload = await capturePayload(
     "sen_tool_call",
     undefined,
     () => callTool(contract(), "read_file"),
   );
-  assert.deepEqual(payload, { contract: contract(), tool_name: "read_file" });
-  assert.ok(!("args" in payload), "call takes a flat tool_name, so the payload must not carry an args key");
-  assert.ok(!("toolName" in payload), "payload must use the declared snake_case tool_name, not camelCase toolName");
+  assert.deepEqual(payload, { contract: contract(), toolName: "read_file" });
+  assert.ok(!("args" in payload), "call takes a flat toolName, so the payload must not carry an args key");
+  assert.ok(!("tool_name" in payload), "payload must use the Tauri v2 wire key toolName, not the Rust identifier tool_name");
 });
 
 test("tools-client activity log: no args key, contract only (CI P2-6)", async () => {

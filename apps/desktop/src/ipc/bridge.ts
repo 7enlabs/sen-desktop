@@ -60,9 +60,14 @@ export function requireRawLog(rawLogRef: string): void {
 }
 
 // Args for one Tauri command: the full action contract plus the command's
-// own parameters. Wire names are snake_case for the Rust parameters
-// (session_id, text, tool_name); the contract object itself stays camelCase
-// and the Rust side renames it with serde rename_all camelCase.
+// own parameters. Wire names are camelCase: Tauri v2 maps each Rust
+// parameter to its lowerCamelCase wire key (session_id -> sessionId,
+// tool_name -> toolName, text -> text), so the frontend must send
+// sessionId / toolName, never the Rust identifiers. The contract object
+// itself is camelCase too, and the Rust side renames it with serde
+// rename_all camelCase (ContractArgs). Sending session_id was the Sen
+// v0.1.0 bug: Tauri waited for sessionId and failed every session call
+// with "missing required key sessionId".
 export interface BridgeArgs {
   contract: ActionContract;
   [key: string]: unknown;

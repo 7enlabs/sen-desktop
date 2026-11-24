@@ -134,7 +134,7 @@ export async function createSession(
 ): Promise<BackendSessionResult> {
   const raw = await invoke("sen_session_create", {
     contract,
-    session_id: sessionId,
+    sessionId,
   });
   const res = asSessionResult(raw, sessionId);
   const local = manager.create(sessionId);
@@ -156,7 +156,7 @@ export async function steerSession(
 ): Promise<BackendSessionResult> {
   const raw = await invoke("sen_session_steer", {
     contract,
-    session_id: sessionId,
+    sessionId,
     text,
   });
   const res = asSessionResult(raw, sessionId);
@@ -173,7 +173,7 @@ export async function followUpSession(
 ): Promise<BackendSessionResult> {
   const raw = await invoke("sen_session_follow_up", {
     contract,
-    session_id: sessionId,
+    sessionId,
     text,
   });
   const res = asSessionResult(raw, sessionId);
@@ -200,7 +200,7 @@ export async function abortSession(
   }
   const raw = await invoke("sen_session_abort", {
     contract,
-    session_id: sessionId,
+    sessionId,
   });
   const res = asSessionResult(raw, sessionId);
   // Backend Cancelled first, then the local transition. No SDK abort or
@@ -268,7 +268,7 @@ export async function endSession(
   }
   const raw = await invoke("sen_session_end", {
     contract,
-    session_id: sessionId,
+    sessionId,
   });
   const res = asSessionEndResult(raw, sessionId);
   const local = manager.transition(sessionId, "Completed");
@@ -299,7 +299,7 @@ export async function subscribeSession(
 ): Promise<BackendSubscribeResult> {
   const raw = await invoke("sen_events_subscribe", {
     contract,
-    session_id: sessionId,
+    sessionId,
   });
   return asSubscribeResult(raw, sessionId);
 }
@@ -338,7 +338,7 @@ export async function unsubscribeSession(
 ): Promise<BackendUnsubscribeResult> {
   const raw = await invoke("sen_events_unsubscribe", {
     contract,
-    session_id: sessionId,
+    sessionId,
   });
   return asUnsubscribeResult(raw, sessionId);
 }
@@ -347,5 +347,5 @@ export async function callTool(
   contract: ActionContract,
   toolName: string,
 ): Promise<unknown> {
-  return invoke("sen_tool_call", { contract, tool_name: toolName });
+  return invoke("sen_tool_call", { contract, toolName });
 }
